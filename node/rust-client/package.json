@@ -1,0 +1,24 @@
+{
+    "name": "speedkey",
+    "version": "0.1.0",
+    "description": "node binary for speedkey",
+    "license": "Apache-2.0",
+    "scripts": {
+        "build:dev": "npm install && napi build --features testing_utilities --platform --js ../build-ts/native.js --dts ../build-ts/native.d.ts --js-package-name speedkey && npm run postbuild:copy-node",
+        "build:benchmark": "npm install && napi build --release --features testing_utilities --platform --js ../build-ts/native.js --dts ../build-ts/native.d.ts --js-package-name speedkey && npm run postbuild:copy-node",
+        "build:release": "npm install && napi build --release --strip --platform --js ../build-ts/native.js --dts ../build-ts/native.d.ts --js-package-name speedkey && npm run postbuild:copy-node",
+        "build:release:gnu": "npm install && napi build --release --strip --platform --use-napi-cross --js ../build-ts/native.js --dts ../build-ts/native.d.ts --js-package-name speedkey",
+        "postbuild:copy-node": "shx cp speedkey.*.node ../build-ts/",
+        "format": "npm run format:prettier && npm run format:rs",
+        "format:prettier": "prettier . -w",
+        "format:rs": "cargo fmt"
+    },
+    "devDependencies": {
+        "@napi-rs/cli": "^3.5.1",
+        "prettier": "3",
+        "shx": "0.3"
+    },
+    "napi": {
+        "binaryName": "speedkey"
+    }
+}

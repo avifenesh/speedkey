@@ -1,0 +1,49 @@
+{
+    "name": "speedkey-linux-x64-gnu",
+    "description": "Native bindings for speedkey on linux-x64-gnu",
+    "version": "0.0.0",
+    "repository": {
+        "type": "git",
+        "url": "git+https://github.com/avifenesh/speedkey.git"
+    },
+    "homepage": "https://github.com/avifenesh/speedkey",
+    "author": "Valkey GLIDE Maintainers",
+    "publishConfig": {
+        "access": "public"
+    },
+    "main": "speedkey.linux-x64-gnu.node",
+    "files": [
+        "speedkey.linux-x64-gnu.node"
+    ],
+    "os": [
+        "linux"
+    ],
+    "cpu": [
+        "x64"
+    ],
+    "libc": [
+        "glibc"
+    ],
+    "license": "Apache-2.0",
+    "keywords": [
+        "valkey",
+        "redis",
+        "client",
+        "driver",
+        "database",
+        "napi",
+        "typescript",
+        "rust",
+        "cross-platform",
+        "cluster",
+        "standalone",
+        "high-availability",
+        "performance",
+        "open-source",
+        "fault-tolerant",
+        "distributed",
+        "scalable",
+        "resilient",
+        "speedkey"
+    ]
+}

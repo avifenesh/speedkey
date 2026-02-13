@@ -1,0 +1,46 @@
+{
+    "name": "speedkey-darwin-x64",
+    "description": "Native bindings for speedkey on darwin-x64",
+    "version": "0.0.0",
+    "repository": {
+        "type": "git",
+        "url": "git+https://github.com/avifenesh/speedkey.git"
+    },
+    "homepage": "https://github.com/avifenesh/speedkey",
+    "author": "Valkey GLIDE Maintainers",
+    "publishConfig": {
+        "access": "public"
+    },
+    "main": "speedkey.darwin-x64.node",
+    "files": [
+        "speedkey.darwin-x64.node"
+    ],
+    "os": [
+        "darwin"
+    ],
+    "cpu": [
+        "x64"
+    ],
+    "license": "Apache-2.0",
+    "keywords": [
+        "valkey",
+        "redis",
+        "client",
+        "driver",
+        "database",
+        "napi",
+        "typescript",
+        "rust",
+        "cross-platform",
+        "cluster",
+        "standalone",
+        "high-availability",
+        "performance",
+        "open-source",
+        "fault-tolerant",
+        "distributed",
+        "scalable",
+        "resilient",
+        "speedkey"
+    ]
+}

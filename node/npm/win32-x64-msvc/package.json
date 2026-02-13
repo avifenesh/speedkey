@@ -1,0 +1,32 @@
+{
+    "name": "speedkey-win32-x64-msvc",
+    "version": "0.0.0",
+    "description": "Native bindings for speedkey on win32-x64-msvc",
+    "main": "speedkey.win32-x64-msvc.node",
+    "files": [
+        "speedkey.win32-x64-msvc.node"
+    ],
+    "os": [
+        "win32"
+    ],
+    "cpu": [
+        "x64"
+    ],
+    "repository": {
+        "type": "git",
+        "url": "git+https://github.com/avifenesh/speedkey.git"
+    },
+    "homepage": "https://github.com/avifenesh/speedkey",
+    "author": "Avi Fenesh",
+    "publishConfig": {
+        "access": "public"
+    },
+    "license": "Apache-2.0",
+    "keywords": [
+        "valkey",
+        "redis",
+        "client",
+        "napi",
+        "speedkey"
+    ]
+}
