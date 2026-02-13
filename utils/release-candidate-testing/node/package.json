@@ -13,7 +13,7 @@
     "author": "",
     "license": "Apache-2.0",
     "dependencies": {
-        "@valkey/valkey-glide": "latest",
+        "speedkey": "latest",
         "typescript": "^5"
     },
     "devDependencies": {

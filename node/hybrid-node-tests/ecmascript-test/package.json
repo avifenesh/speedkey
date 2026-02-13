@@ -14,7 +14,7 @@
         "prettier:format": "./node_modules/.bin/prettier --write . "
     },
     "dependencies": {
-        "@valkey/valkey-glide": "file:../..",
+        "speedkey": "file:../..",
         "find-free-ports": "^3.1.1"
     },
     "devDependencies": {

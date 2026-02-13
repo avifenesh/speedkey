@@ -1,7 +1,7 @@
 /**
  * Copyright Valkey GLIDE Project Contributors - SPDX Identifier: Apache-2.0
  */
-import { GlideClient, GlideClusterClient } from "@valkey/valkey-glide";
+import { GlideClient, GlideClusterClient } from "speedkey";
 import { ValkeyCluster } from "../../TestUtils.js";
 
 async function runCommands(client) {

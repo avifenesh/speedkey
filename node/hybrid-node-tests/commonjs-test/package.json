@@ -14,7 +14,7 @@
     "author": "Amazon Web Services",
     "license": "Apache-2.0",
     "dependencies": {
-        "@valkey/valkey-glide": "file:../..",
+        "speedkey": "file:../..",
         "find-free-port": "^2.0.0"
     },
     "devDependencies": {

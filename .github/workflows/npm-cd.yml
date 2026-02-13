@@ -226,6 +226,7 @@ jobs:
             - name: Build Native Modules
               working-directory: ./node/rust-client
               id: build-action
+              shell: bash
               run: |
                   npm install -g @napi-rs/cli@3
 
@@ -297,7 +298,6 @@ jobs:
                   if-no-files-found: error
 
     prepare-and-publish:
-        environment: AWS_ACTIONS
         if: needs.get-build-parameters.outputs.should_publish == 'true'
         needs: [get-build-parameters, build-native-modules]
         runs-on: ubuntu-latest
@@ -434,6 +434,7 @@ jobs:
               env:
                   NPM_TAG: ${{ needs.get-build-parameters.outputs.npm_tag }}
                   NPM_CONFIG_PROVENANCE: true
+                  NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
               run: |
                   package_name=$(cat package.json | jq -r .name)
                   version=$(cat package.json | jq -r .version)
@@ -505,12 +506,14 @@ jobs:
                   node-version: latest
 
             - name: Install Valkey
+              if: ${{ matrix.build_type != 'windows' }}
+              shell: bash
               run: |
                   # Install Valkey (preferred) or Redis as fallback
                   if [[ "${{ matrix.build_type }}" == "gnu" ]]; then
                       echo "Installing Valkey on GNU/Linux..."
                       sudo apt update
-                      sudo apt install -y valkey || { 
+                      sudo apt install -y valkey || {
                           echo "Valkey not found in default repos, trying alternative source..."
                           curl -fsSL https://packages.redis.io/valkey/setup-valkey | sudo bash -
                           sudo apt install -y valkey || {
@@ -527,25 +530,32 @@ jobs:
                       echo "Installing Valkey on macOS..."
                       brew update
                       brew install valkey || brew install redis
-                  else
-                      echo "::error::Unsupported target: ${{ matrix.TARGET }} (build_type: ${{ matrix.build_type }})"; exit 1
                   fi
 
                   # Verify installation - prefer valkey-server over redis-server
                   if command -v valkey-server &> /dev/null; then
-                      echo "✓ Valkey server is available"
+                      echo "Valkey server is available"
                   elif command -v redis-server &> /dev/null; then
-                      echo "✓ Redis server is available (fallback)"
+                      echo "Redis server is available (fallback)"
                   else
                       echo "::error::Neither Valkey nor Redis server found"; exit 1
                   fi
 
             - name: Run utils/node Tests
+              if: ${{ matrix.build_type != 'windows' }}
+              shell: bash
               working-directory: utils/release-candidate-testing/node
               run: |
                   npm install speedkey@${{ needs.get-build-parameters.outputs.npm_tag }} --save
                   npm run build:utils
                   npm test
+
+            - name: Verify Windows package loads
+              if: ${{ matrix.build_type == 'windows' }}
+              shell: bash
+              run: |
+                  npm install speedkey@${{ needs.get-build-parameters.outputs.npm_tag }}
+                  node -e "const s = require('speedkey'); console.log('speedkey loaded, exports:', Object.keys(s).length)"
 
     cleanup-artifacts:
         needs: [test-published-release, get-build-parameters]

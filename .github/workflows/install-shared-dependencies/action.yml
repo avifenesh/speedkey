@@ -14,7 +14,7 @@ inputs:
         description: "Specified target for rust toolchain, ex. x86_64-apple-darwin"
         type: string
         required: false
-        defalt: "x86_64-unknown-linux-gnu"
+        default: "x86_64-unknown-linux-gnu"
         options:
             - x86_64-unknown-linux-gnu
             - aarch64-unknown-linux-gnu
@@ -25,10 +25,6 @@ inputs:
             - x86_64-pc-windows-msvc
     engine-version:
         description: "Engine version to install"
-        required: false
-        type: string
-    language:
-        description: "The language being built (optional, for language-specific setup)"
         required: false
         type: string
     github-token:
@@ -68,37 +64,50 @@ runs:
           run: |
               yum install -y gcc pkgconfig openssl openssl-devel which curl gettext libasan tar --allowerasing
 
-        - name: Setup WSL (Windows only)
-          if: "${{ inputs.os == 'windows' && inputs.engine-version }}"
-          uses: Vampire/setup-wsl@v6
-          with:
-              distribution: Ubuntu-22.04
-              use-cache: true
-              update: true
-              additional-packages: python3 python3-pip build-essential git pkg-config libssl-dev
-
         - name: Setup Python for Windows
           if: "${{ inputs.os == 'windows' }}"
           uses: actions/setup-python@v5
           with:
               python-version: "3.x"
 
-        - name: Install Rust toolchain and protoc
+        # Install Rust toolchain (non-musl only, musl installs via rustup above)
+        - name: Install Rust toolchain
           if: "${{ !contains(inputs.target, 'musl') }}"
-          uses: ./.github/workflows/install-rust-and-protoc
+          uses: dtolnay/rust-toolchain@stable
           with:
-              target: ${{ inputs.target }}
-              github-token: ${{ inputs.github-token }}
+              targets: ${{ inputs.target }}
 
+        # Install protoc (non-musl only, musl installs via apk above)
+        - name: Install protoc
+          if: "${{ !contains(inputs.target, 'musl') }}"
+          uses: arduino/setup-protoc@v3
+          with:
+              version: "25.1"
+              repo-token: ${{ inputs.github-token }}
+
+        # Install engine for testing (non-Windows only)
         - name: Install engine
-          if: "${{ inputs.engine-version }}"
-          uses: ./.github/workflows/install-engine
-          with:
-              engine-version: ${{ inputs.engine-version }}
-              target: ${{ inputs.target }}
+          if: "${{ inputs.engine-version && inputs.os != 'windows' }}"
+          shell: bash
+          run: |
+              ENGINE_VERSION="${{ inputs.engine-version }}"
+              echo "Installing Valkey/Redis ${ENGINE_VERSION}..."
 
-        - name: Install zig
-          if: ${{ contains(inputs.target, 'linux-gnu') }}
-          uses: ./.github/workflows/install-zig
-          with:
-              target: ${{ inputs.target }}
+              if [[ "${{ inputs.os }}" == "macos" ]]; then
+                  brew install valkey || brew install redis
+              elif [[ "${{ inputs.os }}" == "amazon-linux" ]]; then
+                  yum install -y valkey || yum install -y redis
+              elif [[ "${{ contains(inputs.target, 'musl') }}" == "true" ]]; then
+                  apk add --no-cache valkey || apk add --no-cache redis
+              else
+                  sudo apt update
+                  sudo apt install -y valkey || sudo apt install -y redis-server || {
+                      echo "Installing from source..."
+                      curl -fsSL https://github.com/valkey-io/valkey/archive/refs/tags/${ENGINE_VERSION}.tar.gz -o valkey.tar.gz
+                      tar xzf valkey.tar.gz
+                      cd valkey-${ENGINE_VERSION} && make -j$(nproc) && sudo make install
+                  }
+              fi
+
+              # Verify
+              command -v valkey-server || command -v redis-server || echo "Warning: No server binary found in PATH"
