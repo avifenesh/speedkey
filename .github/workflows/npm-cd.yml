@@ -429,8 +429,69 @@ jobs:
               shell: bash
               run: npm install -g @napi-rs/cli@3
 
-            # Use prepublishOnly, which call to napi prepublish -t npm to set up everything properly, versions of native modules reflecting the base package version, and optional dependencies base on triples are added to the base package.
-            - name: Publish packages
+            # Step 1: Set version in all platform packages
+            - name: Set platform package versions
+              shell: bash
+              working-directory: ./node
+              env:
+                  VERSION: ${{ needs.get-build-parameters.outputs.release_version }}
+              run: |
+                  for dir in ./npm/*/; do
+                    if [[ "$dir" != "./npm/glide/" ]]; then
+                      platform=$(basename "$dir")
+                      echo "Setting version ${VERSION} in ${platform}"
+                      cd "$dir"
+                      sed -i 's/"version": "0\.0\.0"/"version": "'"${VERSION}"'"/' package.json
+                      echo "  Version: $(jq -r .version package.json)"
+                      cd ../..
+                    fi
+                  done
+
+            # Step 2: Publish platform packages first
+            - name: Publish platform packages
+              if: ${{ needs.get-build-parameters.outputs.should_publish == 'true' }}
+              shell: bash
+              working-directory: ./node
+              env:
+                  NPM_TAG: ${{ needs.get-build-parameters.outputs.npm_tag }}
+                  NPM_CONFIG_PROVENANCE: true
+                  NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+              run: |
+                  for dir in ./npm/*/; do
+                    if [[ "$dir" != "./npm/glide/" ]]; then
+                      platform=$(basename "$dir")
+                      echo "Publishing ${platform}..."
+                      cd "$dir"
+                      npm publish --tag ${NPM_TAG} --access public --provenance || echo "Warning: Failed to publish ${platform}"
+                      cd ../..
+                    fi
+                  done
+                  echo "Platform packages published"
+
+            # Step 3: Add optionalDependencies to base package
+            - name: Add optionalDependencies to base package
+              shell: bash
+              working-directory: ./node
+              env:
+                  VERSION: ${{ needs.get-build-parameters.outputs.release_version }}
+              run: |
+                  # Build optionalDependencies from platform package directories
+                  OPT_DEPS="{}"
+                  for dir in ./npm/*/; do
+                    if [[ "$dir" != "./npm/glide/" ]]; then
+                      pkg_name=$(jq -r .name "$dir/package.json")
+                      OPT_DEPS=$(echo "$OPT_DEPS" | jq --arg name "$pkg_name" --arg ver "$VERSION" '. + {($name): $ver}')
+                    fi
+                  done
+                  echo "optionalDependencies: $OPT_DEPS"
+                  # Inject into base package.json
+                  jq --argjson deps "$OPT_DEPS" '.optionalDependencies = $deps' ./npm/glide/package.json > ./npm/glide/package.json.tmp
+                  mv ./npm/glide/package.json.tmp ./npm/glide/package.json
+                  echo "Base package.json updated:"
+                  jq '.optionalDependencies' ./npm/glide/package.json
+
+            # Step 4: Publish base package
+            - name: Publish base package
               if: ${{ needs.get-build-parameters.outputs.should_publish == 'true' }}
               shell: bash
               working-directory: ./node/npm/glide
@@ -444,12 +505,10 @@ jobs:
                   echo "Publishing base package ${package_name}@${version} with tag ${NPM_TAG}"
                   npm publish --tag ${NPM_TAG} --access public --provenance
 
-                  # Check if the publish was successful
                   if [ $? -ne 0 ]; then
                       echo "::error::Base package publish failed"; exit 1
                   fi
-
-                  echo "Packages published successfully"
+                  echo "All packages published successfully"
 
               # Delete artifacts if not published
             - name: Delete artifacts
