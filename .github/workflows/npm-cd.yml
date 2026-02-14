@@ -208,16 +208,11 @@ jobs:
             - name: Install Rust with the required target
               shell: bash
               run: |
-                  if command -v rustup &> /dev/null; then
-                    rustup default stable
-                    rustup target add ${{ matrix.TARGET }}
-                  else
-                    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable --target ${{ matrix.TARGET }}
-                    source "$HOME/.cargo/env"
-                    echo "$HOME/.cargo/bin" >> $GITHUB_PATH
-                  fi
+                  export PATH="$HOME/.cargo/bin:$PATH"
+                  rustup default stable
+                  rustup target add ${{ matrix.TARGET }}
                   rustc --version
-                  rustup target list --installed
+                  echo "$HOME/.cargo/bin" >> $GITHUB_PATH
 
             - name: Install protoc (protobuf)
               uses: arduino/setup-protoc@v3
