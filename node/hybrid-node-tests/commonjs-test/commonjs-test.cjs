@@ -1,7 +1,7 @@
 /* eslint no-undef: off */
 /* eslint @typescript-eslint/no-require-imports: off */
 "use strict";
-const { GlideClient } = require("speedkey");
+const { GlideClient } = require("@glidemq/speedkey");
 const FreePort = require("find-free-port");
 const { startServer, checkWhichCommandAvailable } = require("../utils.js");
 

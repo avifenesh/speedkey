@@ -1,5 +1,5 @@
 {
-    "name": "speedkey-win32-x64-msvc",
+    "name": "@glidemq/speedkey-win32-x64-msvc",
     "version": "0.0.0",
     "description": "Platform-specific native binary for speedkey (Valkey/Redis client) on Windows x64 MSVC. This package is installed automatically as an optional dependency.",
     "main": "speedkey.win32-x64-msvc.node",

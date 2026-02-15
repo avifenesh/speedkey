@@ -1,5 +1,5 @@
 {
-    "name": "speedkey-linux-arm64-gnu",
+    "name": "@glidemq/speedkey-linux-arm64-gnu",
     "description": "Native bindings for speedkey on linux-arm64-gnu",
     "version": "0.0.0",
     "repository": {

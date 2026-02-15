@@ -3,7 +3,7 @@ import {
     GlideClient,
     GlideClientConfiguration,
     Script,
-} from "speedkey";
+} from "@glidemq/speedkey";
 import winston from "winston";
 
 /**

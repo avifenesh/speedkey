@@ -1,5 +1,5 @@
 {
-    "name": "speedkey-darwin-arm64",
+    "name": "@glidemq/speedkey-darwin-arm64",
     "version": "0.0.0",
     "repository": {
         "type": "git",

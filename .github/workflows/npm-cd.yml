@@ -258,15 +258,15 @@ jobs:
 
                   # For darwin arm we just build native
                   elif [[ "${{ matrix.TARGET }}" == "aarch64-apple-darwin" ]]; then
-                    napi build --release --strip --platform --js ../build-ts/native.js --dts ../build-ts/native.d.ts --js-package-name speedkey $npm_config_build_flags
+                    napi build --release --strip --platform --js ../build-ts/native.js --dts ../build-ts/native.d.ts --js-package-name @glidemq/speedkey $npm_config_build_flags
 
                   # For Windows MSVC builds
                   elif [[ "${{ matrix.TARGET }}" == *"windows"* ]]; then
-                    napi build --platform --release --strip --target "${{ matrix.TARGET }}" --js ../build-ts/native.js --dts ../build-ts/native.d.ts --js-package-name speedkey $npm_config_build_flags
+                    napi build --platform --release --strip --target "${{ matrix.TARGET }}" --js ../build-ts/native.js --dts ../build-ts/native.d.ts --js-package-name @glidemq/speedkey $npm_config_build_flags
 
                   # For macos x86 we build on mac darwin, since mac allow that easily, for musl we use zig
                   else
-                    napi build --platform --release $additional_param --strip --target "${{ matrix.TARGET }}" --js ../build-ts/native.js --dts ../build-ts/native.d.ts --js-package-name speedkey $npm_config_build_flags
+                    napi build --platform --release $additional_param --strip --target "${{ matrix.TARGET }}" --js ../build-ts/native.js --dts ../build-ts/native.d.ts --js-package-name @glidemq/speedkey $npm_config_build_flags
                   fi
 
                   # Create directory for this target's node file
@@ -336,6 +336,7 @@ jobs:
               with:
                   node-version: latest
                   registry-url: "https://registry.npmjs.org"
+                  scope: "@glidemq"
                   cache: "npm"
                   cache-dependency-path: node/package.json
 
@@ -608,7 +609,7 @@ jobs:
               shell: bash
               working-directory: utils/release-candidate-testing/node
               run: |
-                  npm install speedkey@${{ needs.get-build-parameters.outputs.npm_tag }} --save
+                  npm install @glidemq/speedkey@${{ needs.get-build-parameters.outputs.npm_tag }} --save
                   npm run build:utils
                   npm test
 
@@ -616,8 +617,8 @@ jobs:
               if: ${{ matrix.build_type == 'windows' }}
               shell: bash
               run: |
-                  npm install speedkey@${{ needs.get-build-parameters.outputs.npm_tag }}
-                  node -e "const s = require('speedkey'); console.log('speedkey loaded, exports:', Object.keys(s).length)"
+                  npm install @glidemq/speedkey@${{ needs.get-build-parameters.outputs.npm_tag }}
+                  node -e "const s = require('@glidemq/speedkey'); console.log('speedkey loaded, exports:', Object.keys(s).length)"
 
     cleanup-artifacts:
         needs: [test-published-release, get-build-parameters]
@@ -671,7 +672,7 @@ jobs:
                   }
 
                   # Main package
-                  attempt_deprecate "speedkey@${VERSION}" "${DEPRECATION_MESSAGE}"
+                  attempt_deprecate "@glidemq/speedkey@${VERSION}" "${DEPRECATION_MESSAGE}"
 
                   # Platform packages
                   MATRIX_JSON='${{ needs.get-build-parameters.outputs.platform_matrix }}'
@@ -704,7 +705,7 @@ jobs:
                         additional_suffix="-gnu"
                       fi
                       
-                      package_name="speedkey-${os}-${arch}${additional_suffix}"
+                      package_name="@glidemq/speedkey-${os}-${arch}${additional_suffix}"
                       attempt_deprecate "${package_name}@${VERSION}" "${DEPRECATION_MESSAGE}"
                     else
                       echo "Warning: Incomplete data in matrix object, cannot form package name. Object: $target_json_line"

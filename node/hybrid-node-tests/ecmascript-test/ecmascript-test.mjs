@@ -1,5 +1,5 @@
 /* eslint no-undef: off */
-import { GlideClient } from "speedkey";
+import { GlideClient } from "@glidemq/speedkey";
 import { spawn } from "child_process";
 import findFreePorts from "find-free-ports";
 import { checkWhichCommandAvailable } from "../utils.js";

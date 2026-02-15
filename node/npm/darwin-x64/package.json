@@ -1,5 +1,5 @@
 {
-    "name": "speedkey-darwin-x64",
+    "name": "@glidemq/speedkey-darwin-x64",
     "description": "Native bindings for speedkey on darwin-x64",
     "version": "0.0.0",
     "repository": {
