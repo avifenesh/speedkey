@@ -1,6 +1,6 @@
 {
     "name": "@glidemq/speedkey",
-    "description": "Experimental Valkey/Redis client based on valkey-glide core (testing only)",
+    "description": "Valkey/Redis client with direct NAPI bindings based on valkey-glide core",
     "main": "build-ts/index.js",
     "module": "build-ts/index.js",
     "types": "build-ts/index.d.ts",
