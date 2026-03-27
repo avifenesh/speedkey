@@ -10,6 +10,8 @@ interface BaseField {
     name: GlideString;
     /** An alias for field. */
     alias?: GlideString;
+    /** If set, the field is sortable. Allows using the field in `SORTBY` clauses of {@link GlideFt.search | FT.SEARCH}. */
+    sortable?: boolean;
 }
 
 /**
@@ -18,6 +20,14 @@ interface BaseField {
 export type TextField = BaseField & {
     /** Field identifier */
     type: "TEXT";
+    /** If set, disables stemming when indexing this field. */
+    nostem?: boolean;
+    /** The weight of this field in scoring. Default is `1.0`. */
+    weight?: number;
+    /** If set, keeps a suffix trie with all terms which match the suffix. Used to optimize `*foo*` queries. */
+    withsuffixtrie?: boolean;
+    /** If set, removes an existing suffix trie from the field. */
+    nosuffixtrie?: boolean;
 };
 
 /**
@@ -118,113 +128,24 @@ export interface FtCreateOptions {
     dataType: "JSON" | "HASH";
     /** The prefix of the key to be indexed. */
     prefixes?: GlideString[];
-}
-
-/** Additional parameters for {@link GlideFt.aggregate | FT.AGGREGATE} command. */
-export type FtAggregateOptions = {
-    /** Query timeout in milliseconds. */
-    timeout?: number;
-    /**
-     * {@link FtAggregateFilter | FILTER}, {@link FtAggregateLimit | LIMIT}, {@link FtAggregateGroupBy | GROUPBY},
-     * {@link FtAggregateSortBy | SORTBY} and {@link FtAggregateApply | APPLY} clauses, that can be repeated
-     * multiple times in any order and be freely intermixed. They are applied in the order specified,
-     * with the output of one clause feeding the input of the next clause.
-     */
-    clauses?: (
-        | FtAggregateLimit
-        | FtAggregateFilter
-        | FtAggregateGroupBy
-        | FtAggregateSortBy
-        | FtAggregateApply
-    )[];
-    /**
-     * Query parameters, which could be referenced in the query by `$` sign, followed by
-     * the parameter name.
-     */
-    params?: GlideRecord<GlideString>;
-} & (
-    | {
-          /** List of fields to load from the index. */
-          loadFields?: GlideString[];
-          /** `loadAll` and `loadFields` are mutually exclusive. */
-          loadAll?: never;
-      }
-    | {
-          /** Option to load all fields declared in the index */
-          loadAll?: boolean;
-          /** `loadAll` and `loadFields` are mutually exclusive. */
-          loadFields?: never;
-      }
-);
-
-/** A clause for limiting the number of retained records. */
-export interface FtAggregateLimit {
-    type: "LIMIT";
-    /** Starting point from which the records have to be retained. */
-    offset: number;
-    /** The total number of records to be retained. */
-    count: number;
-}
-
-/**
- * A clause for filtering the results using predicate expression relating to values in each result.
- * It is applied post query and relate to the current state of the pipeline.
- */
-export interface FtAggregateFilter {
-    type: "FILTER";
-    /** The expression to filter the results. */
-    expression: GlideString;
-}
-
-/** A clause for grouping the results in the pipeline based on one or more properties. */
-export interface FtAggregateGroupBy {
-    type: "GROUPBY";
-    /** The list of properties to be used for grouping the results in the pipeline. */
-    properties: GlideString[];
-    /** The list of functions that handles the group entries by performing multiple aggregate operations. */
-    reducers: FtAggregateReducer[];
-}
-
-/**
- * A clause for reducing the matching results in each group using a reduction function.
- * The matching results are reduced into a single record.
- */
-export interface FtAggregateReducer {
-    /** The reduction function name for the respective group. */
-    function: string;
-    /** The list of arguments for the reducer. */
-    args: GlideString[];
-    /** User defined property name for the reducer. */
-    name?: GlideString;
-}
-
-/** A clause for sorting the pipeline up until the point of SORTBY, using a list of properties. */
-export interface FtAggregateSortBy {
-    type: "SORTBY";
-    /** A list of sorting parameters for the sort operation. */
-    properties: FtAggregateSortProperty[];
-    /** The MAX value for optimizing the sorting, by sorting only for the n-largest elements. */
-    max?: number;
-}
-
-/** A single property for the {@link FtAggregateSortBy | SORTBY} clause. */
-export interface FtAggregateSortProperty {
-    /** The sorting parameter. */
-    property: GlideString;
-    /** The order for the sorting. */
-    order: SortOrder;
-}
-
-/**
- * A clause for applying a 1-to-1 transformation on one or more properties and stores the result
- * as a new property down the pipeline or replaces any property using this transformation.
- */
-export interface FtAggregateApply {
-    type: "APPLY";
-    /** The transformation expression. */
-    expression: GlideString;
-    /** The new property name to store the result of apply. This name can be referenced by further operations down the pipeline. */
-    name: GlideString;
+    /** Default score for documents in the index. Must be between 0.0 and 1.0. Default is `1.0`. */
+    score?: number;
+    /** Default language for documents in the index (e.g. `"english"`, `"spanish"`). Used for stemming during indexing and search. */
+    language?: string;
+    /** If set, skips the initial scan of existing keys when creating the index. */
+    skipInitialScan?: boolean;
+    /** Minimum stem length for stemming. */
+    minStemSize?: number;
+    /** If set, keeps term offsets in the index. Required for exact phrase matching. */
+    withOffsets?: boolean;
+    /** If set, does not store term offsets in the index. Saves memory but disables exact phrase matching. */
+    noOffsets?: boolean;
+    /** If set, does not use stop words for this index. */
+    noStopWords?: boolean;
+    /** A list of custom stop words. If provided, the default stop words are replaced by these. Use an empty array to disable stop words. */
+    stopWords?: GlideString[];
+    /** Custom punctuation characters for tokenization. */
+    punctuation?: GlideString;
 }
 
 /**
@@ -247,6 +168,21 @@ export type FtSearchOptions = {
      * the parameter name.
      */
     params?: GlideRecord<GlideString>;
+
+    /** If set, returns only the number of matching documents and their IDs, without the document content. */
+    nocontent?: boolean;
+    /** The query dialect version to use. See Valkey Search documentation for supported dialect versions. */
+    dialect?: number;
+    /** If set, the query terms are used as-is without stemming. */
+    verbatim?: boolean;
+    /** If set, requires all query terms to appear in the same order in the document. Usually used together with `slop`. */
+    inorder?: boolean;
+    /** The maximum number of intervening terms allowed between query terms for them to be considered a match. Used with `inorder`. */
+    slop?: number;
+    /** Sort the results by the given field. */
+    sortby?: { field: GlideString; order?: SortOrder };
+    /** Use a custom scoring function. See Valkey Search documentation for available scorers. */
+    scorer?: GlideString;
 } & (
     | {
           /**

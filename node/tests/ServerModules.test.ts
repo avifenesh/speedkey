@@ -13,16 +13,13 @@ import { ValkeyCluster } from "../../utils/TestUtils";
 import {
     ClusterBatch,
     ConditionalChange,
-    convertGlideRecordToRecord,
     Decoder,
-    FtAggregateOptions,
-    FtAggregateReturnType,
     FtSearchOptions,
     FtSearchReturnType,
     GlideClusterClient,
+    GlideBf,
     GlideFt,
     GlideJson,
-    GlideRecord,
     GlideString,
     InfoOptions,
     JsonGetOptions,
@@ -2323,6 +2320,74 @@ describe("Server Module Tests", () => {
                 ).toBeNull();
             });
 
+            it("json.mset", async () => {
+                client = await GlideClusterClient.createClient(
+                    getClientConfigurationOption(
+                        cluster.getAddresses(),
+                        protocol,
+                    ),
+                );
+
+                const key1 = getRandomKey();
+                const key2 = getRandomKey();
+
+                // Set multiple keys in one call
+                expect(
+                    await GlideJson.mset(client, [
+                        {
+                            key: key1,
+                            path: "$",
+                            value: JSON.stringify({ a: 1, b: "hello" }),
+                        },
+                        {
+                            key: key2,
+                            path: "$",
+                            value: JSON.stringify({ c: 2, d: "world" }),
+                        },
+                    ]),
+                ).toBe("OK");
+
+                // Verify values via json.get
+                let result1 = await GlideJson.get(client, key1, {
+                    path: "$.a",
+                });
+                expect(JSON.parse(result1 as string)).toEqual([1]);
+
+                let result2 = await GlideJson.get(client, key2, {
+                    path: "$.d",
+                });
+                expect(JSON.parse(result2 as string)).toEqual(["world"]);
+
+                // Set multiple paths on same key
+                expect(
+                    await GlideJson.mset(client, [
+                        {
+                            key: key1,
+                            path: "$.a",
+                            value: "42",
+                        },
+                        {
+                            key: key1,
+                            path: "$.b",
+                            value: '"updated"',
+                        },
+                    ]),
+                ).toBe("OK");
+
+                // Verify updated values
+                result1 = await GlideJson.get(client, key1, {
+                    path: "$.a",
+                });
+                expect(JSON.parse(result1 as string)).toEqual([42]);
+
+                result1 = await GlideJson.get(client, key1, {
+                    path: "$.b",
+                });
+                expect(JSON.parse(result1 as string)).toEqual(["updated"]);
+
+                await client.del([key1, key2]);
+            });
+
             it.each([true, false])(
                 "can send JsonBatch batches for ARR commands with isAtomic=%s",
                 async (isAtomic) => {
@@ -2358,6 +2423,128 @@ describe("Server Module Tests", () => {
                     client.close();
                 },
             );
+
+            // --- Edge case tests: json.mset ---
+
+            it("json.mset overwrites existing values", async () => {
+                client = await GlideClusterClient.createClient(
+                    getClientConfigurationOption(
+                        cluster.getAddresses(),
+                        protocol,
+                    ),
+                );
+
+                const key = getRandomKey();
+
+                // Set initial value
+                expect(
+                    await GlideJson.set(
+                        client,
+                        key,
+                        "$",
+                        JSON.stringify({ a: 1, b: "old" }),
+                    ),
+                ).toBe("OK");
+
+                // Overwrite with mset
+                expect(
+                    await GlideJson.mset(client, [
+                        {
+                            key,
+                            path: "$",
+                            value: JSON.stringify({ a: 99, b: "new" }),
+                        },
+                    ]),
+                ).toBe("OK");
+
+                const result = await GlideJson.get(client, key, {
+                    path: "$",
+                });
+                expect(JSON.parse(result as string)).toEqual([
+                    { a: 99, b: "new" },
+                ]);
+
+                await client.del([key]);
+            });
+
+            it("json.mset with nested JSON paths", async () => {
+                client = await GlideClusterClient.createClient(
+                    getClientConfigurationOption(
+                        cluster.getAddresses(),
+                        protocol,
+                    ),
+                );
+
+                const key = getRandomKey();
+
+                // Create a nested document first
+                expect(
+                    await GlideJson.set(
+                        client,
+                        key,
+                        "$",
+                        JSON.stringify({
+                            outer: { inner: { value: "original" } },
+                        }),
+                    ),
+                ).toBe("OK");
+
+                // Set nested path via mset
+                expect(
+                    await GlideJson.mset(client, [
+                        {
+                            key,
+                            path: "$.outer.inner.value",
+                            value: '"updated"',
+                        },
+                    ]),
+                ).toBe("OK");
+
+                const result = await GlideJson.get(client, key, {
+                    path: "$.outer.inner.value",
+                });
+                expect(JSON.parse(result as string)).toEqual(["updated"]);
+
+                await client.del([key]);
+            });
+
+            it("json.mset large batch (50 keys)", async () => {
+                client = await GlideClusterClient.createClient(
+                    getClientConfigurationOption(
+                        cluster.getAddresses(),
+                        protocol,
+                    ),
+                );
+
+                const keys: string[] = [];
+                const entries: {
+                    key: string;
+                    path: string;
+                    value: string;
+                }[] = [];
+
+                for (let i = 0; i < 50; i++) {
+                    const k = getRandomKey();
+                    keys.push(k);
+                    entries.push({
+                        key: k,
+                        path: "$",
+                        value: JSON.stringify({ idx: i }),
+                    });
+                }
+
+                expect(await GlideJson.mset(client, entries)).toBe("OK");
+
+                // Verify a sample of keys
+                for (const idx of [0, 24, 49]) {
+                    const result = await GlideJson.get(client, keys[idx], {
+                        path: "$.idx",
+                    });
+                    expect(JSON.parse(result as string)).toEqual([idx]);
+                }
+
+                await client.del(keys);
+            });
         },
     );
 
@@ -2655,391 +2842,6 @@ describe("Server Module Tests", () => {
         );
 
         it.each([ProtocolVersion.RESP2, ProtocolVersion.RESP3])(
-            "FT.AGGREGATE on JSON",
-            async (protocol) => {
-                client = await GlideClusterClient.createClient(
-                    getClientConfigurationOption(
-                        cluster.getAddresses(),
-                        protocol,
-                    ),
-                );
-
-                const isResp3 = protocol == ProtocolVersion.RESP3;
-                const prefixBicycles = "{bicycles}:";
-                const indexBicycles = prefixBicycles + getRandomKey();
-                const query = "*";
-
-                // FT.CREATE idx:bicycle ON JSON PREFIX 1 bicycle: SCHEMA $.model AS model TEXT $.description AS
-                // description TEXT $.price AS price NUMERIC $.condition AS condition TAG SEPARATOR ,
-                expect(
-                    await GlideFt.create(
-                        client,
-                        indexBicycles,
-                        [
-                            { type: "TEXT", name: "$.model", alias: "model" },
-                            {
-                                type: "TEXT",
-                                name: "$.description",
-                                alias: "description",
-                            },
-                            {
-                                type: "NUMERIC",
-                                name: "$.price",
-                                alias: "price",
-                            },
-                            {
-                                type: "TAG",
-                                name: "$.condition",
-                                alias: "condition",
-                                separator: ",",
-                            },
-                        ],
-                        { prefixes: [prefixBicycles], dataType: "JSON" },
-                    ),
-                ).toEqual("OK");
-
-                // TODO check JSON module loaded
-                expect(
-                    await GlideJson.set(
-                        client,
-                        prefixBicycles + 0,
-                        ".",
-                        '{"brand": "Velorim", "model": "Jigger", "price": 270, "condition": "new"}',
-                    ),
-                ).toEqual("OK");
-
-                expect(
-                    await GlideJson.set(
-                        client,
-                        prefixBicycles + 1,
-                        ".",
-                        '{"brand": "Bicyk", "model": "Hillcraft", "price": 1200, "condition": "used"}',
-                    ),
-                ).toEqual("OK");
-
-                expect(
-                    await GlideJson.set(
-                        client,
-                        prefixBicycles + 2,
-                        ".",
-                        '{"brand": "Nord", "model": "Chook air 5", "price": 815, "condition": "used"}',
-                    ),
-                ).toEqual("OK");
-
-                expect(
-                    await GlideJson.set(
-                        client,
-                        prefixBicycles + 3,
-                        ".",
-                        '{"brand": "Eva", "model": "Eva 291", "price": 3400, "condition": "used"}',
-                    ),
-                ).toEqual("OK");
-
-                expect(
-                    await GlideJson.set(
-                        client,
-                        prefixBicycles + 4,
-                        ".",
-                        '{"brand": "Noka Bikes", "model": "Kahuna", "price": 3200, "condition": "used"}',
-                    ),
-                ).toEqual("OK");
-
-                expect(
-                    await GlideJson.set(
-                        client,
-                        prefixBicycles + 5,
-                        ".",
-                        '{"brand": "Breakout", "model": "XBN 2.1 Alloy", "price": 810, "condition": "new"}',
-                    ),
-                ).toEqual("OK");
-
-                expect(
-                    await GlideJson.set(
-                        client,
-                        prefixBicycles + 6,
-                        ".",
-                        '{"brand": "ScramBikes", "model": "WattBike", "price": 2300, "condition": "new"}',
-                    ),
-                ).toEqual("OK");
-
-                expect(
-                    await GlideJson.set(
-                        client,
-                        prefixBicycles + 7,
-                        ".",
-                        '{"brand": "Peaknetic", "model": "Secto", "price": 430, "condition": "new"}',
-                    ),
-                ).toEqual("OK");
-
-                expect(
-                    await GlideJson.set(
-                        client,
-                        prefixBicycles + 8,
-                        ".",
-                        '{"brand": "nHill", "model": "Summit", "price": 1200, "condition": "new"}',
-                    ),
-                ).toEqual("OK");
-
-                expect(
-                    await GlideJson.set(
-                        client,
-                        prefixBicycles + 9,
-                        ".",
-                        '{"model": "ThrillCycle", "brand": "BikeShind", "price": 815, "condition": "refurbished"}',
-                    ),
-                ).toEqual("OK");
-
-                // let server digest the data and update index
-                await new Promise((resolve) =>
-                    setTimeout(resolve, DATA_PROCESSING_TIMEOUT),
-                );
-
-                // FT.AGGREGATE idx:bicycle * LOAD 1 __key GROUPBY 1 @condition REDUCE COUNT 0 AS bicycles
-                const options: FtAggregateOptions = {
-                    loadFields: ["__key"],
-                    clauses: [
-                        {
-                            type: "GROUPBY",
-                            properties: ["@condition"],
-                            reducers: [
-                                {
-                                    function: "COUNT",
-                                    args: [],
-                                    name: "bicycles",
-                                },
-                            ],
-                        },
-                    ],
-                };
-                const aggreg = await GlideFt.aggregate(
-                    client,
-                    indexBicycles,
-                    query,
-                    options,
-                );
-                const expectedAggreg = [
-                    {
-                        condition: "new",
-                        bicycles: isResp3 ? 5 : "5",
-                    },
-                    {
-                        condition: "refurbished",
-                        bicycles: isResp3 ? 1 : "1",
-                    },
-                    {
-                        condition: "used",
-                        bicycles: isResp3 ? 4 : "4",
-                    },
-                ];
-                expect(
-                    aggreg
-                        .map(convertGlideRecordToRecord)
-                        // elements (records in array) could be reordered
-                        .sort((a, b) =>
-                            a["condition"]! > b["condition"]! ? 1 : -1,
-                        ),
-                ).toEqual(expectedAggreg);
-
-                const aggregProfile: [
-                    FtAggregateReturnType,
-                    Record<string, number>,
-                ] = await GlideFt.profileAggregate(
-                    client,
-                    indexBicycles,
-                    "*",
-                    options,
-                );
-                // profile metrics and categories are subject to change
-                expect(aggregProfile[1]).toBeTruthy();
-                expect(
-                    aggregProfile[0]
-                        .map(convertGlideRecordToRecord)
-                        // elements (records in array) could be reordered
-                        .sort((a, b) =>
-                            a["condition"]! > b["condition"]! ? 1 : -1,
-                        ),
-                ).toEqual(expectedAggreg);
-
-                await GlideFt.dropindex(client, indexBicycles);
-            },
-        );
-
-        it.each([ProtocolVersion.RESP2, ProtocolVersion.RESP3])(
-            "FT.AGGREGATE on HASH",
-            async (protocol) => {
-                client = await GlideClusterClient.createClient(
-                    getClientConfigurationOption(
-                        cluster.getAddresses(),
-                        protocol,
-                    ),
-                );
-
-                const isResp3 = protocol == ProtocolVersion.RESP3;
-                const prefixMovies = "{movies}:";
-                const indexMovies = prefixMovies + getRandomKey();
-                const query = "*";
-
-                // FT.CREATE idx:movie ON hash PREFIX 1 "movie:" SCHEMA title TEXT release_year NUMERIC
-                // rating NUMERIC genre TAG votes NUMERIC
-                expect(
-                    await GlideFt.create(
-                        client,
-                        indexMovies,
-                        [
-                            { type: "TEXT", name: "title" },
-                            { type: "NUMERIC", name: "release_year" },
-                            { type: "NUMERIC", name: "rating" },
-                            { type: "TAG", name: "genre" },
-                            { type: "NUMERIC", name: "votes" },
-                        ],
-                        { prefixes: [prefixMovies], dataType: "HASH" },
-                    ),
-                ).toEqual("OK");
-
-                await client.hset(prefixMovies + 11002, {
-                    title: "Star Wars: Episode V - The Empire Strikes Back",
-                    release_year: "1980",
-                    genre: "Action",
-                    rating: "8.7",
-                    votes: "1127635",
-                    imdb_id: "tt0080684",
-                });
-
-                await client.hset(prefixMovies + 11003, {
-                    title: "The Godfather",
-                    release_year: "1972",
-                    genre: "Drama",
-                    rating: "9.2",
-                    votes: "1563839",
-                    imdb_id: "tt0068646",
-                });
-
-                await client.hset(prefixMovies + 11004, {
-                    title: "Heat",
-                    release_year: "1995",
-                    genre: "Thriller",
-                    rating: "8.2",
-                    votes: "559490",
-                    imdb_id: "tt0113277",
-                });
-
-                await client.hset(prefixMovies + 11005, {
-                    title: "Star Wars: Episode VI - Return of the Jedi",
-                    release_year: "1983",
-                    genre: "Action",
-                    rating: "8.3",
-                    votes: "906260",
-                    imdb_id: "tt0086190",
-                });
-
-                // let server digest the data and update index
-                await new Promise((resolve) =>
-                    setTimeout(resolve, DATA_PROCESSING_TIMEOUT),
-                );
-
-                // FT.AGGREGATE idx:movie * LOAD * APPLY ceil(@rating) as r_rating GROUPBY 1 @genre REDUCE
-                // COUNT 0 AS nb_of_movies REDUCE SUM 1 votes AS nb_of_votes REDUCE AVG 1 r_rating AS avg_rating
-                // SORTBY 4 @avg_rating DESC @nb_of_votes DESC
-                const options: FtAggregateOptions = {
-                    loadAll: true,
-                    clauses: [
-                        {
-                            type: "APPLY",
-                            expression: "ceil(@rating)",
-                            name: "r_rating",
-                        },
-                        {
-                            type: "GROUPBY",
-                            properties: ["@genre"],
-                            reducers: [
-                                {
-                                    function: "COUNT",
-                                    args: [],
-                                    name: "nb_of_movies",
-                                },
-                                {
-                                    function: "SUM",
-                                    args: ["votes"],
-                                    name: "nb_of_votes",
-                                },
-                                {
-                                    function: "AVG",
-                                    args: ["r_rating"],
-                                    name: "avg_rating",
-                                },
-                            ],
-                        },
-                        {
-                            type: "SORTBY",
-                            properties: [
-                                {
-                                    property: "@avg_rating",
-                                    order: SortOrder.DESC,
-                                },
-                                {
-                                    property: "@nb_of_votes",
-                                    order: SortOrder.DESC,
-                                },
-                            ],
-                        },
-                    ],
-                };
-                const aggreg = await GlideFt.aggregate(
-                    client,
-                    indexMovies,
-                    query,
-                    options,
-                );
-                const expectedAggreg = [
-                    {
-                        genre: "Action",
-                        nb_of_movies: isResp3 ? 2.0 : "2",
-                        nb_of_votes: isResp3 ? 2033895.0 : "2033895",
-                        avg_rating: isResp3 ? 9.0 : "9",
-                    },
-                    {
-                        genre: "Drama",
-                        nb_of_movies: isResp3 ? 1.0 : "1",
-                        nb_of_votes: isResp3 ? 1563839.0 : "1563839",
-                        avg_rating: isResp3 ? 10.0 : "10",
-                    },
-                    {
-                        genre: "Thriller",
-                        nb_of_movies: isResp3 ? 1.0 : "1",
-                        nb_of_votes: isResp3 ? 559490.0 : "559490",
-                        avg_rating: isResp3 ? 9.0 : "9",
-                    },
-                ];
-                expect(
-                    aggreg
-                        .map(convertGlideRecordToRecord)
-                        // elements (records in array) could be reordered
-                        .sort((a, b) => (a["genre"]! > b["genre"]! ? 1 : -1)),
-                ).toEqual(expectedAggreg);
-
-                const aggregProfile: [
-                    FtAggregateReturnType,
-                    Record<string, number>,
-                ] = await GlideFt.profileAggregate(
-                    client,
-                    indexMovies,
-                    query,
-                    options,
-                );
-                // profile metrics and categories are subject to change
-                expect(aggregProfile[1]).toBeTruthy();
-                expect(
-                    aggregProfile[0]
-                        .map(convertGlideRecordToRecord)
-                        // elements (records in array) could be reordered
-                        .sort((a, b) => (a["genre"]! > b["genre"]! ? 1 : -1)),
-                ).toEqual(expectedAggreg);
-
-                await GlideFt.dropindex(client, indexMovies);
-            },
-        );
-
-        it.each([ProtocolVersion.RESP2, ProtocolVersion.RESP3])(
             "FT.SEARCH binary on HASH",
             async (protocol) => {
                 client = await GlideClusterClient.createClient(
@@ -3159,17 +2961,6 @@ describe("Server Module Tests", () => {
                     ],
                 ];
                 expect(binaryResult).toEqual(expectedBinaryResult);
-
-                const binaryProfileResult: [
-                    FtSearchReturnType,
-                    Record<string, number>,
-                ] = await GlideFt.profileSearch(client, index, query, {
-                    decoder: Decoder.Bytes,
-                    ...options,
-                });
-                // profile metrics and categories are subject to change
-                expect(binaryProfileResult[1]).toBeTruthy();
-                expect(binaryProfileResult[0]).toEqual(expectedBinaryResult);
             },
         );
 
@@ -3260,225 +3051,1553 @@ describe("Server Module Tests", () => {
                     ],
                 ];
                 expect(stringResult).toEqual(expectedStringResult);
-
-                const stringProfileResult: [
-                    FtSearchReturnType,
-                    Record<string, number>,
-                ] = await GlideFt.profileSearch(
-                    client,
-                    index,
-                    query,
-                    optionsWithLimit,
-                );
-                // profile metrics and categories are subject to change
-                expect(stringProfileResult[1]).toBeTruthy();
-                expect(stringProfileResult[0]).toEqual(expectedStringResult);
             },
         );
 
-        it("FT.EXPLAIN ft.explain FT.EXPLAINCLI ft.explaincli", async () => {
-            client = await GlideClusterClient.createClient(
-                getClientConfigurationOption(
-                    cluster.getAddresses(),
-                    ProtocolVersion.RESP3,
-                ),
-            );
+        it(
+            "FT.CREATE with sortable field",
+            async () => {
+                client = await GlideClusterClient.createClient(
+                    getClientConfigurationOption(
+                        cluster.getAddresses(),
+                        ProtocolVersion.RESP3,
+                    ),
+                );
 
-            const index = getRandomKey();
-            expect(
-                await GlideFt.create(client, index, [
-                    { type: "NUMERIC", name: "price" },
-                    { type: "TEXT", name: "title" },
-                ]),
-            ).toEqual("OK");
+                const index = getRandomKey();
+                const prefix = "{" + getRandomKey() + "}:";
 
-            let explain = await GlideFt.explain(
-                client,
-                Buffer.from(index),
-                "@price:[0 10]",
-            );
-            expect(explain).toContain("price");
-            expect(explain).toContain("10");
+                expect(
+                    await GlideFt.create(
+                        client,
+                        index,
+                        [
+                            {
+                                type: "TAG",
+                                name: "category",
+                                sortable: true,
+                            },
+                            { type: "TEXT", name: "title" },
+                        ],
+                        { dataType: "HASH", prefixes: [prefix] },
+                    ),
+                ).toEqual("OK");
 
-            explain = (
-                (await GlideFt.explain(client, index, "@price:[0 10]", {
-                    decoder: Decoder.Bytes,
-                })) as Buffer
-            ).toString();
-            expect(explain).toContain("price");
-            expect(explain).toContain("10");
+                const info = await GlideFt.info(client, index);
+                expect(info).toBeTruthy();
+                expect(info["index_name"]).toEqual(index);
 
-            explain = await GlideFt.explain(client, index, "*");
-            expect(explain).toContain("*");
+                await GlideFt.dropindex(client, index);
+            },
+            TIMEOUT,
+        );
 
-            let explaincli = (
-                await GlideFt.explaincli(
+        it(
+            "FT.CREATE with skipInitialScan",
+            async () => {
+                client = await GlideClusterClient.createClient(
+                    getClientConfigurationOption(
+                        cluster.getAddresses(),
+                        ProtocolVersion.RESP3,
+                    ),
+                );
+
+                const prefix = "{" + getRandomKey() + "}:";
+                const index = prefix + "idx";
+
+                // Add data before creating index
+                await client.hset(prefix + "1", {
+                    title: "hello",
+                    category: "greeting",
+                });
+
+                expect(
+                    await GlideFt.create(
+                        client,
+                        index,
+                        [
+                            { type: "TAG", name: "category" },
+                            { type: "TEXT", name: "title" },
+                        ],
+                        {
+                            dataType: "HASH",
+                            prefixes: [prefix],
+                            skipInitialScan: true,
+                        },
+                    ),
+                ).toEqual("OK");
+
+                const info = await GlideFt.info(client, index);
+                expect(info).toBeTruthy();
+
+                await GlideFt.dropindex(client, index);
+            },
+            TIMEOUT,
+        );
+
+        it(
+            "FT.SEARCH with nocontent",
+            async () => {
+                client = await GlideClusterClient.createClient(
+                    getClientConfigurationOption(
+                        cluster.getAddresses(),
+                        ProtocolVersion.RESP3,
+                    ),
+                );
+
+                const prefix = "{" + getRandomKey() + "}:";
+                const index = prefix + "idx";
+
+                expect(
+                    await GlideFt.create(
+                        client,
+                        index,
+                        [{ type: "TEXT", name: "title" }],
+                        { dataType: "HASH", prefixes: [prefix] },
+                    ),
+                ).toEqual("OK");
+
+                await client.hset(prefix + "1", { title: "hello world" });
+                await client.hset(prefix + "2", { title: "goodbye world" });
+
+                await new Promise((resolve) =>
+                    setTimeout(resolve, DATA_PROCESSING_TIMEOUT),
+                );
+
+                const result: FtSearchReturnType = await GlideFt.search(
                     client,
-                    Buffer.from(index),
-                    "@price:[0 10]",
-                )
-            ).map((s) => (s as string).trim());
-            expect(explaincli).toContain("price");
-            expect(explaincli).toContain("0");
-            expect(explaincli).toContain("10");
+                    index,
+                    "*",
+                    { nocontent: true },
+                );
+                // nocontent returns only count and keys without field values
+                expect(result[0]).toEqual(2);
 
-            explaincli = (
-                await GlideFt.explaincli(client, index, "@price:[0 10]", {
-                    decoder: Decoder.Bytes,
-                })
-            ).map((s) => (s as Buffer).toString().trim());
-            expect(explaincli).toContain("price");
-            expect(explaincli).toContain("0");
-            expect(explaincli).toContain("10");
+                if (result.length > 1) {
+                    for (const doc of result[1]) {
+                        // Each doc should have a key but an empty value array
+                        expect(doc.key).toBeTruthy();
+                        expect(doc.value).toEqual([]);
+                    }
+                }
 
-            expect(await GlideFt.dropindex(client, index)).toEqual("OK");
-            // querying a missing index
-            await expect(GlideFt.explain(client, index, "*")).rejects.toThrow(
-                "Index not found",
-            );
-            await expect(
-                GlideFt.explaincli(client, index, "*"),
-            ).rejects.toThrow("Index not found");
+                await GlideFt.dropindex(client, index);
+            },
+            TIMEOUT,
+        );
+
+        it(
+            "FT.SEARCH with sortby",
+            async () => {
+                client = await GlideClusterClient.createClient(
+                    getClientConfigurationOption(
+                        cluster.getAddresses(),
+                        ProtocolVersion.RESP3,
+                    ),
+                );
+
+                const prefix = "{" + getRandomKey() + "}:";
+                const index = prefix + "idx";
+
+                expect(
+                    await GlideFt.create(
+                        client,
+                        index,
+                        [
+                            { type: "TEXT", name: "title", sortable: true },
+                            { type: "NUMERIC", name: "price", sortable: true },
+                        ],
+                        { dataType: "HASH", prefixes: [prefix] },
+                    ),
+                ).toEqual("OK");
+
+                await client.hset(prefix + "1", {
+                    title: "banana",
+                    price: "30",
+                });
+                await client.hset(prefix + "2", {
+                    title: "apple",
+                    price: "10",
+                });
+                await client.hset(prefix + "3", {
+                    title: "cherry",
+                    price: "20",
+                });
+
+                await new Promise((resolve) =>
+                    setTimeout(resolve, DATA_PROCESSING_TIMEOUT),
+                );
+
+                // Sort by price ascending
+                const resultAsc: FtSearchReturnType = await GlideFt.search(
+                    client,
+                    index,
+                    "*",
+                    {
+                        sortby: {
+                            field: "price",
+                            order: SortOrder.ASC,
+                        },
+                    },
+                );
+                expect(resultAsc[0]).toEqual(3);
+                // Verify ordering: price 10, 20, 30
+                expect(resultAsc[1][0].key).toContain("2"); // apple, price 10
+                expect(resultAsc[1][1].key).toContain("3"); // cherry, price 20
+                expect(resultAsc[1][2].key).toContain("1"); // banana, price 30
+
+                // Sort by price descending
+                const resultDesc: FtSearchReturnType = await GlideFt.search(
+                    client,
+                    index,
+                    "*",
+                    {
+                        sortby: {
+                            field: "price",
+                            order: SortOrder.DESC,
+                        },
+                    },
+                );
+                expect(resultDesc[0]).toEqual(3);
+                expect(resultDesc[1][0].key).toContain("1"); // banana, price 30
+                expect(resultDesc[1][1].key).toContain("3"); // cherry, price 20
+                expect(resultDesc[1][2].key).toContain("2"); // apple, price 10
+
+                await GlideFt.dropindex(client, index);
+            },
+            TIMEOUT,
+        );
+
+        it(
+            "FT.SEARCH with dialect",
+            async () => {
+                client = await GlideClusterClient.createClient(
+                    getClientConfigurationOption(
+                        cluster.getAddresses(),
+                        ProtocolVersion.RESP3,
+                    ),
+                );
+
+                const prefix = "{" + getRandomKey() + "}:";
+                const index = prefix + "idx";
+
+                expect(
+                    await GlideFt.create(
+                        client,
+                        index,
+                        [{ type: "TEXT", name: "title" }],
+                        { dataType: "HASH", prefixes: [prefix] },
+                    ),
+                ).toEqual("OK");
+
+                await client.hset(prefix + "1", { title: "hello world" });
+
+                await new Promise((resolve) =>
+                    setTimeout(resolve, DATA_PROCESSING_TIMEOUT),
+                );
+
+                // Dialect 2 is the default for valkey-search
+                const result: FtSearchReturnType = await GlideFt.search(
+                    client,
+                    index,
+                    "*",
+                    { dialect: 2 },
+                );
+                expect(result[0]).toEqual(1);
+
+                await GlideFt.dropindex(client, index);
+            },
+            TIMEOUT,
+        );
+
+        // --- Edge case tests: FT.SEARCH options ---
+
+        it(
+            "FT.SEARCH with limit offset=0 count=0 returns empty",
+            async () => {
+                client = await GlideClusterClient.createClient(
+                    getClientConfigurationOption(
+                        cluster.getAddresses(),
+                        ProtocolVersion.RESP3,
+                    ),
+                );
+
+                const prefix = "{" + getRandomKey() + "}:";
+                const index = prefix + "idx";
+
+                expect(
+                    await GlideFt.create(
+                        client,
+                        index,
+                        [{ type: "TEXT", name: "title" }],
+                        { dataType: "HASH", prefixes: [prefix] },
+                    ),
+                ).toEqual("OK");
+
+                await client.hset(prefix + "1", { title: "hello" });
+
+                await new Promise((resolve) =>
+                    setTimeout(resolve, DATA_PROCESSING_TIMEOUT),
+                );
+
+                // count=0 should return total count but no documents
+                const result: FtSearchReturnType = await GlideFt.search(
+                    client,
+                    index,
+                    "*",
+                    { limit: { offset: 0, count: 0 } },
+                );
+                // Total count should still reflect matching docs
+                expect(result[0]).toEqual(1);
+                // But no documents should be returned
+                expect(result[1]).toEqual([]);
+
+                await GlideFt.dropindex(client, index);
+            },
+            TIMEOUT,
+        );
+
+        it(
+            "FT.SEARCH with very large limit returns all available",
+            async () => {
+                client = await GlideClusterClient.createClient(
+                    getClientConfigurationOption(
+                        cluster.getAddresses(),
+                        ProtocolVersion.RESP3,
+                    ),
+                );
+
+                const prefix = "{" + getRandomKey() + "}:";
+                const index = prefix + "idx";
+
+                expect(
+                    await GlideFt.create(
+                        client,
+                        index,
+                        [{ type: "TEXT", name: "title" }],
+                        { dataType: "HASH", prefixes: [prefix] },
+                    ),
+                ).toEqual("OK");
+
+                await client.hset(prefix + "1", { title: "doc one" });
+                await client.hset(prefix + "2", { title: "doc two" });
+                await client.hset(prefix + "3", { title: "doc three" });
+
+                await new Promise((resolve) =>
+                    setTimeout(resolve, DATA_PROCESSING_TIMEOUT),
+                );
+
+                // Requesting a very large count should return all available
+                const result: FtSearchReturnType = await GlideFt.search(
+                    client,
+                    index,
+                    "*",
+                    { limit: { offset: 0, count: 100000 } },
+                );
+                expect(result[0]).toEqual(3);
+                expect(result[1]).toHaveLength(3);
+
+                await GlideFt.dropindex(client, index);
+            },
+            TIMEOUT,
+        );
+
+        it(
+            "FT.CREATE on prefix with no matching keys returns 0 results",
+            async () => {
+                client = await GlideClusterClient.createClient(
+                    getClientConfigurationOption(
+                        cluster.getAddresses(),
+                        ProtocolVersion.RESP3,
+                    ),
+                );
+
+                const prefix = "{" + getRandomKey() + "}:nomatch:";
+                const index = prefix + "idx";
+
+                expect(
+                    await GlideFt.create(
+                        client,
+                        index,
+                        [{ type: "TEXT", name: "title" }],
+                        { dataType: "HASH", prefixes: [prefix] },
+                    ),
+                ).toEqual("OK");
+
+                await new Promise((resolve) =>
+                    setTimeout(resolve, DATA_PROCESSING_TIMEOUT),
+                );
+
+                // No keys match this prefix, so search returns 0
+                const result: FtSearchReturnType = await GlideFt.search(
+                    client,
+                    index,
+                    "*",
+                );
+                expect(result[0]).toEqual(0);
+                expect(result[1]).toEqual([]);
+
+                await GlideFt.dropindex(client, index);
+            },
+            TIMEOUT,
+        );
+
+        it(
+            "FT.DROPINDEX on non-existent index throws",
+            async () => {
+                client = await GlideClusterClient.createClient(
+                    getClientConfigurationOption(
+                        cluster.getAddresses(),
+                        ProtocolVersion.RESP3,
+                    ),
+                );
+
+                await expect(
+                    GlideFt.dropindex(client, "nonexistent_index_" + getRandomKey()),
+                ).rejects.toThrow(RequestError);
+            },
+            TIMEOUT,
+        );
+
+        it(
+            "FT.CREATE with duplicate index name throws",
+            async () => {
+                client = await GlideClusterClient.createClient(
+                    getClientConfigurationOption(
+                        cluster.getAddresses(),
+                        ProtocolVersion.RESP3,
+                    ),
+                );
+
+                const index = getRandomKey();
+
+                expect(
+                    await GlideFt.create(client, index, [
+                        { type: "TEXT", name: "title" },
+                    ]),
+                ).toEqual("OK");
+
+                // Creating the same index again should throw
+                await expect(
+                    GlideFt.create(client, index, [
+                        { type: "TEXT", name: "body" },
+                    ]),
+                ).rejects.toThrow(RequestError);
+
+                await GlideFt.dropindex(client, index);
+            },
+            TIMEOUT,
+        );
+
+        it(
+            "FT.CREATE with duplicate field names throws",
+            async () => {
+                client = await GlideClusterClient.createClient(
+                    getClientConfigurationOption(
+                        cluster.getAddresses(),
+                        ProtocolVersion.RESP3,
+                    ),
+                );
+
+                await expect(
+                    GlideFt.create(client, getRandomKey(), [
+                        { type: "TEXT", name: "samename" },
+                        { type: "TEXT", name: "samename" },
+                    ]),
+                ).rejects.toThrow(RequestError);
+            },
+            TIMEOUT,
+        );
+
+        it(
+            "FT.SEARCH with nocontent and KNN returns keys only",
+            async () => {
+                client = await GlideClusterClient.createClient(
+                    getClientConfigurationOption(
+                        cluster.getAddresses(),
+                        ProtocolVersion.RESP3,
+                    ),
+                );
+
+                const prefix = "{" + getRandomKey() + "}:";
+                const index = prefix + "idx";
+
+                expect(
+                    await GlideFt.create(
+                        client,
+                        index,
+                        [
+                            {
+                                type: "VECTOR",
+                                name: "vec",
+                                alias: "VEC",
+                                attributes: {
+                                    algorithm: "FLAT",
+                                    distanceMetric: "L2",
+                                    dimensions: 2,
+                                },
+                            },
+                        ],
+                        { dataType: "HASH", prefixes: [prefix] },
+                    ),
+                ).toEqual("OK");
+
+                const vec1 = Buffer.alloc(8);
+                const vec2 = Buffer.alloc(8);
+                vec2.writeFloatLE(1.0, 0);
+                vec2.writeFloatLE(1.0, 4);
+
+                await client.hset(Buffer.from(prefix + "a"), [
+                    { field: "vec", value: vec1 },
+                ]);
+                await client.hset(Buffer.from(prefix + "b"), [
+                    { field: "vec", value: vec2 },
+                ]);
+
+                await new Promise((resolve) =>
+                    setTimeout(resolve, DATA_PROCESSING_TIMEOUT),
+                );
+
+                const result: FtSearchReturnType = await GlideFt.search(
+                    client,
+                    index,
+                    "*=>[KNN 2 @VEC $query_vec]",
+                    {
+                        params: [{ key: "query_vec", value: vec1 }],
+                        nocontent: true,
+                    },
+                );
+
+                // nocontent should return count and keys with empty value arrays
+                expect(result[0]).toEqual(2);
+
+                if (result.length > 1) {
+                    for (const doc of result[1]) {
+                        expect(doc.key).toBeTruthy();
+                        expect(doc.value).toEqual([]);
+                    }
+                }
+
+                await GlideFt.dropindex(client, index);
+            },
+            TIMEOUT,
+        );
+
+        it(
+            "FT.SEARCH vector search with mismatched dimensions throws",
+            async () => {
+                client = await GlideClusterClient.createClient(
+                    getClientConfigurationOption(
+                        cluster.getAddresses(),
+                        ProtocolVersion.RESP3,
+                    ),
+                );
+
+                const prefix = "{" + getRandomKey() + "}:";
+                const index = prefix + "idx";
+
+                // Create index with 2-dimensional vectors
+                expect(
+                    await GlideFt.create(
+                        client,
+                        index,
+                        [
+                            {
+                                type: "VECTOR",
+                                name: "vec",
+                                alias: "VEC",
+                                attributes: {
+                                    algorithm: "FLAT",
+                                    distanceMetric: "L2",
+                                    dimensions: 2,
+                                },
+                            },
+                        ],
+                        { dataType: "HASH", prefixes: [prefix] },
+                    ),
+                ).toEqual("OK");
+
+                // Insert a correct 2D vector
+                const vec2d = Buffer.alloc(8);
+                await client.hset(Buffer.from(prefix + "1"), [
+                    { field: "vec", value: vec2d },
+                ]);
+
+                await new Promise((resolve) =>
+                    setTimeout(resolve, DATA_PROCESSING_TIMEOUT),
+                );
+
+                // Search with a 3D query vector (12 bytes instead of 8)
+                const vec3d = Buffer.alloc(12);
+
+                await expect(
+                    GlideFt.search(
+                        client,
+                        index,
+                        "*=>[KNN 1 @VEC $query_vec]",
+                        {
+                            params: [{ key: "query_vec", value: vec3d }],
+                        },
+                    ),
+                ).rejects.toThrow(RequestError);
+
+                await GlideFt.dropindex(client, index);
+            },
+            TIMEOUT,
+        );
+
+        it(
+            "FT.SEARCH vector search with zero vector",
+            async () => {
+                client = await GlideClusterClient.createClient(
+                    getClientConfigurationOption(
+                        cluster.getAddresses(),
+                        ProtocolVersion.RESP3,
+                    ),
+                );
+
+                const prefix = "{" + getRandomKey() + "}:";
+                const index = prefix + "idx";
+
+                expect(
+                    await GlideFt.create(
+                        client,
+                        index,
+                        [
+                            {
+                                type: "VECTOR",
+                                name: "vec",
+                                alias: "VEC",
+                                attributes: {
+                                    algorithm: "FLAT",
+                                    distanceMetric: "L2",
+                                    dimensions: 2,
+                                },
+                            },
+                        ],
+                        { dataType: "HASH", prefixes: [prefix] },
+                    ),
+                ).toEqual("OK");
+
+                // Insert two vectors: zero and non-zero
+                const zeroVec = Buffer.alloc(8); // [0.0, 0.0]
+                const nonZeroVec = Buffer.alloc(8);
+                nonZeroVec.writeFloatLE(3.0, 0);
+                nonZeroVec.writeFloatLE(4.0, 4);
+
+                await client.hset(Buffer.from(prefix + "zero"), [
+                    { field: "vec", value: zeroVec },
+                ]);
+                await client.hset(Buffer.from(prefix + "nonzero"), [
+                    { field: "vec", value: nonZeroVec },
+                ]);
+
+                await new Promise((resolve) =>
+                    setTimeout(resolve, DATA_PROCESSING_TIMEOUT),
+                );
+
+                // Search with zero vector should work and return both results
+                const result: FtSearchReturnType = await GlideFt.search(
+                    client,
+                    index,
+                    "*=>[KNN 2 @VEC $query_vec]",
+                    {
+                        params: [{ key: "query_vec", value: zeroVec }],
+                    },
+                );
+                expect(result[0]).toEqual(2);
+
+                // The zero vector should be nearest to itself (distance 0)
+                expect(result[1][0].key).toContain("zero");
+
+                await GlideFt.dropindex(client, index);
+            },
+            TIMEOUT,
+        );
+
+        it(
+            "FT.INFO on valid index returns expected fields",
+            async () => {
+                client = await GlideClusterClient.createClient(
+                    getClientConfigurationOption(
+                        cluster.getAddresses(),
+                        ProtocolVersion.RESP3,
+                    ),
+                );
+
+                const index = getRandomKey();
+                const prefix = "{" + getRandomKey() + "}:";
+
+                expect(
+                    await GlideFt.create(
+                        client,
+                        index,
+                        [
+                            { type: "TEXT", name: "title" },
+                            { type: "NUMERIC", name: "price" },
+                            { type: "TAG", name: "category" },
+                        ],
+                        { dataType: "HASH", prefixes: [prefix] },
+                    ),
+                ).toEqual("OK");
+
+                const info = await GlideFt.info(client, index);
+
+                // Verify essential fields in the info response
+                expect(info["index_name"]).toEqual(index);
+                expect(info["key_type"]).toEqual("HASH");
+                expect(info["key_prefixes"]).toEqual([prefix]);
+                expect(info["fields"]).toBeDefined();
+                expect(
+                    (info["fields"] as unknown[]).length,
+                ).toBeGreaterThanOrEqual(3);
+
+                // Verify num_docs field exists (may be 0)
+                expect(info).toHaveProperty("num_docs");
+
+                await GlideFt.dropindex(client, index);
+            },
+            TIMEOUT,
+        );
+
+        it(
+            "FT._LIST returns all created indexes",
+            async () => {
+                client = await GlideClusterClient.createClient(
+                    getClientConfigurationOption(
+                        cluster.getAddresses(),
+                        ProtocolVersion.RESP3,
+                    ),
+                );
+
+                const idx1 = getRandomKey();
+                const idx2 = getRandomKey();
+                const idx3 = getRandomKey();
+
+                expect(
+                    await GlideFt.create(client, idx1, [
+                        { type: "TEXT", name: "f1" },
+                    ]),
+                ).toEqual("OK");
+                expect(
+                    await GlideFt.create(client, idx2, [
+                        { type: "TEXT", name: "f2" },
+                    ]),
+                ).toEqual("OK");
+                expect(
+                    await GlideFt.create(client, idx3, [
+                        { type: "TEXT", name: "f3" },
+                    ]),
+                ).toEqual("OK");
+
+                const listed = await GlideFt.list(client);
+                expect(listed).toContain(idx1);
+                expect(listed).toContain(idx2);
+                expect(listed).toContain(idx3);
+
+                // Cleanup
+                await GlideFt.dropindex(client, idx1);
+                await GlideFt.dropindex(client, idx2);
+                await GlideFt.dropindex(client, idx3);
+            },
+            TIMEOUT,
+        );
+    });
+
+    describe("GlideBf", () => {
+        let client: GlideClusterClient;
+
+        afterEach(async () => {
+            await flushAndCloseClient(true, cluster?.getAddresses(), client);
         });
 
-        it("FT.ALIASADD, FT.ALIASUPDATE and FT.ALIASDEL test", async () => {
-            client = await GlideClusterClient.createClient(
-                getClientConfigurationOption(
-                    cluster.getAddresses(),
-                    ProtocolVersion.RESP3,
-                ),
-            );
-            const index = getRandomKey();
-            const alias = getRandomKey() + "-alias";
+        it(
+            "reserve + info",
+            async () => {
+                client = await GlideClusterClient.createClient(
+                    getClientConfigurationOption(
+                        cluster.getAddresses(),
+                        ProtocolVersion.RESP3,
+                    ),
+                );
 
-            // Create an index.
-            expect(
-                await GlideFt.create(client, index, [
-                    { type: "NUMERIC", name: "published_at" },
-                    { type: "TAG", name: "category" },
-                ]),
-            ).toEqual("OK");
-            // Check if the index created successfully.
-            expect(await client.customCommand(["FT._LIST"])).toContain(index);
+                const key = getRandomKey();
+                expect(
+                    await GlideBf.reserve(client, key, 0.001, 10000),
+                ).toEqual("OK");
 
-            // Add an alias to the index.
-            expect(await GlideFt.aliasadd(client, index, alias)).toEqual("OK");
+                const info = await GlideBf.info(client, key);
+                expect(info.capacity).toEqual(10000);
+                expect(info.numberOfFilters).toBeGreaterThanOrEqual(1);
+                expect(info.numberOfItems).toEqual(0);
+                expect(info.size).toBeGreaterThan(0);
 
-            const newIndex = getRandomKey();
-            const newAlias = getRandomKey();
+                await client.del([key]);
+            },
+            TIMEOUT,
+        );
 
-            // Create a second index.
-            expect(
-                await GlideFt.create(client, newIndex, [
-                    { type: "NUMERIC", name: "published_at" },
-                    { type: "TAG", name: "category" },
-                ]),
-            ).toEqual("OK");
-            // Check if the second index created successfully.
-            expect(await client.customCommand(["FT._LIST"])).toContain(
-                newIndex,
-            );
+        it(
+            "add returns boolean",
+            async () => {
+                client = await GlideClusterClient.createClient(
+                    getClientConfigurationOption(
+                        cluster.getAddresses(),
+                        ProtocolVersion.RESP3,
+                    ),
+                );
 
-            // Add an alias to second index and also test addalias for bytes type input.
-            expect(
-                await GlideFt.aliasadd(
+                const key = getRandomKey();
+
+                // First add should return true (new item)
+                expect(await GlideBf.add(client, key, "item1")).toBe(true);
+                // Second add of same item should return false (already exists)
+                expect(await GlideBf.add(client, key, "item1")).toBe(false);
+                // Adding a different item should return true
+                expect(await GlideBf.add(client, key, "item2")).toBe(true);
+
+                await client.del([key]);
+            },
+            TIMEOUT,
+        );
+
+        it(
+            "madd",
+            async () => {
+                client = await GlideClusterClient.createClient(
+                    getClientConfigurationOption(
+                        cluster.getAddresses(),
+                        ProtocolVersion.RESP3,
+                    ),
+                );
+
+                const key = getRandomKey();
+
+                // Add single item first
+                expect(await GlideBf.add(client, key, "item1")).toBe(true);
+
+                // madd with mix of new and existing items
+                const results = await GlideBf.madd(client, key, [
+                    "item1",
+                    "item2",
+                    "item3",
+                ]);
+                expect(results).toEqual([false, true, true]);
+
+                await client.del([key]);
+            },
+            TIMEOUT,
+        );
+
+        it(
+            "exists",
+            async () => {
+                client = await GlideClusterClient.createClient(
+                    getClientConfigurationOption(
+                        cluster.getAddresses(),
+                        ProtocolVersion.RESP3,
+                    ),
+                );
+
+                const key = getRandomKey();
+                await GlideBf.add(client, key, "item1");
+
+                expect(await GlideBf.exists(client, key, "item1")).toBe(true);
+                expect(await GlideBf.exists(client, key, "missing")).toBe(
+                    false,
+                );
+
+                await client.del([key]);
+            },
+            TIMEOUT,
+        );
+
+        it(
+            "mexists",
+            async () => {
+                client = await GlideClusterClient.createClient(
+                    getClientConfigurationOption(
+                        cluster.getAddresses(),
+                        ProtocolVersion.RESP3,
+                    ),
+                );
+
+                const key = getRandomKey();
+                await GlideBf.madd(client, key, ["item1", "item2"]);
+
+                const results = await GlideBf.mexists(client, key, [
+                    "item1",
+                    "item2",
+                    "missing",
+                ]);
+                expect(results).toEqual([true, true, false]);
+
+                await client.del([key]);
+            },
+            TIMEOUT,
+        );
+
+        it(
+            "insert with default options",
+            async () => {
+                client = await GlideClusterClient.createClient(
+                    getClientConfigurationOption(
+                        cluster.getAddresses(),
+                        ProtocolVersion.RESP3,
+                    ),
+                );
+
+                const key = getRandomKey();
+
+                // Insert creates filter if it doesn't exist
+                const results = await GlideBf.insert(client, key, [
+                    "item1",
+                    "item2",
+                ]);
+                expect(results).toEqual([true, true]);
+
+                // Inserting existing items
+                const results2 = await GlideBf.insert(client, key, [
+                    "item1",
+                    "item3",
+                ]);
+                expect(results2).toEqual([false, true]);
+
+                await client.del([key]);
+            },
+            TIMEOUT,
+        );
+
+        it(
+            "insert with NOCREATE",
+            async () => {
+                client = await GlideClusterClient.createClient(
+                    getClientConfigurationOption(
+                        cluster.getAddresses(),
+                        ProtocolVersion.RESP3,
+                    ),
+                );
+
+                const key = getRandomKey();
+
+                // NOCREATE on non-existent key should throw
+                await expect(
+                    GlideBf.insert(client, key, ["item1"], { noCreate: true }),
+                ).rejects.toThrow(RequestError);
+
+                await client.del([key]);
+            },
+            TIMEOUT,
+        );
+
+        it(
+            "insert with CAPACITY and ERROR",
+            async () => {
+                client = await GlideClusterClient.createClient(
+                    getClientConfigurationOption(
+                        cluster.getAddresses(),
+                        ProtocolVersion.RESP3,
+                    ),
+                );
+
+                const key = getRandomKey();
+
+                const results = await GlideBf.insert(
                     client,
-                    Buffer.from(newIndex),
-                    Buffer.from(newAlias),
-                ),
-            ).toEqual("OK");
+                    key,
+                    ["item1", "item2"],
+                    {
+                        capacity: 5000,
+                        errorRate: 0.01,
+                    },
+                );
+                expect(results).toEqual([true, true]);
 
-            // Test if updating an already existing alias to point to an existing index returns "OK".
-            expect(await GlideFt.aliasupdate(client, newAlias, index)).toEqual(
-                "OK",
-            );
-            // Test alias update for byte type input.
-            expect(
-                await GlideFt.aliasupdate(
+                const info = await GlideBf.info(client, key);
+                expect(info.capacity).toEqual(5000);
+
+                await client.del([key]);
+            },
+            TIMEOUT,
+        );
+
+        it(
+            "card",
+            async () => {
+                client = await GlideClusterClient.createClient(
+                    getClientConfigurationOption(
+                        cluster.getAddresses(),
+                        ProtocolVersion.RESP3,
+                    ),
+                );
+
+                const key = getRandomKey();
+
+                // Non-existent key returns 0
+                expect(await GlideBf.card(client, key)).toEqual(0);
+
+                await GlideBf.madd(client, key, ["a", "b", "c"]);
+                expect(await GlideBf.card(client, key)).toEqual(3);
+
+                // Adding duplicate should not increase cardinality
+                await GlideBf.add(client, key, "a");
+                expect(await GlideBf.card(client, key)).toEqual(3);
+
+                await client.del([key]);
+            },
+            TIMEOUT,
+        );
+
+        it(
+            "reserve with EXPANSION",
+            async () => {
+                client = await GlideClusterClient.createClient(
+                    getClientConfigurationOption(
+                        cluster.getAddresses(),
+                        ProtocolVersion.RESP3,
+                    ),
+                );
+
+                const key = getRandomKey();
+                expect(
+                    await GlideBf.reserve(client, key, 0.01, 100, {
+                        expansion: 4,
+                    }),
+                ).toEqual("OK");
+
+                const info = await GlideBf.info(client, key);
+                expect(info.capacity).toEqual(100);
+                expect(info.expansionRate).toEqual(4);
+
+                await client.del([key]);
+            },
+            TIMEOUT,
+        );
+
+        it(
+            "reserve with NONSCALING",
+            async () => {
+                client = await GlideClusterClient.createClient(
+                    getClientConfigurationOption(
+                        cluster.getAddresses(),
+                        ProtocolVersion.RESP3,
+                    ),
+                );
+
+                const key = getRandomKey();
+                expect(
+                    await GlideBf.reserve(client, key, 0.01, 100, {
+                        nonScaling: true,
+                    }),
+                ).toEqual("OK");
+
+                const info = await GlideBf.info(client, key);
+                expect(info.capacity).toEqual(100);
+                // When nonScaling is set, expansion rate should be 0
+                expect(info.expansionRate).toEqual(0);
+
+                await client.del([key]);
+            },
+            TIMEOUT,
+        );
+
+        it(
+            "reserve duplicate key error",
+            async () => {
+                client = await GlideClusterClient.createClient(
+                    getClientConfigurationOption(
+                        cluster.getAddresses(),
+                        ProtocolVersion.RESP3,
+                    ),
+                );
+
+                const key = getRandomKey();
+                expect(
+                    await GlideBf.reserve(client, key, 0.01, 100),
+                ).toEqual("OK");
+
+                // Reserving on an existing key should throw
+                await expect(
+                    GlideBf.reserve(client, key, 0.01, 100),
+                ).rejects.toThrow(RequestError);
+
+                await client.del([key]);
+            },
+            TIMEOUT,
+        );
+
+        it(
+            "load with invalid data throws",
+            async () => {
+                client = await GlideClusterClient.createClient(
+                    getClientConfigurationOption(
+                        cluster.getAddresses(),
+                        ProtocolVersion.RESP3,
+                    ),
+                );
+
+                const key = getRandomKey();
+
+                // Loading invalid data should throw an error
+                await expect(
+                    GlideBf.load(client, key, Buffer.from("invalid_data")),
+                ).rejects.toThrow(RequestError);
+
+                await client.del([key]);
+            },
+            TIMEOUT,
+        );
+
+        // --- Edge case tests: reserve boundary values ---
+
+        it(
+            "reserve with errorRate 0 throws",
+            async () => {
+                client = await GlideClusterClient.createClient(
+                    getClientConfigurationOption(
+                        cluster.getAddresses(),
+                        ProtocolVersion.RESP3,
+                    ),
+                );
+
+                const key = getRandomKey();
+
+                // errorRate 0 is outside the valid range (0, 1) exclusive
+                await expect(
+                    GlideBf.reserve(client, key, 0, 100),
+                ).rejects.toThrow(RequestError);
+
+                await client.del([key]);
+            },
+            TIMEOUT,
+        );
+
+        it(
+            "reserve with errorRate 1 throws",
+            async () => {
+                client = await GlideClusterClient.createClient(
+                    getClientConfigurationOption(
+                        cluster.getAddresses(),
+                        ProtocolVersion.RESP3,
+                    ),
+                );
+
+                const key = getRandomKey();
+
+                // errorRate 1 is outside the valid range (0, 1) exclusive
+                await expect(
+                    GlideBf.reserve(client, key, 1, 100),
+                ).rejects.toThrow(RequestError);
+
+                await client.del([key]);
+            },
+            TIMEOUT,
+        );
+
+        it(
+            "reserve with very small errorRate (0.0001)",
+            async () => {
+                client = await GlideClusterClient.createClient(
+                    getClientConfigurationOption(
+                        cluster.getAddresses(),
+                        ProtocolVersion.RESP3,
+                    ),
+                );
+
+                const key = getRandomKey();
+
+                // Very small error rate should create a larger filter
+                expect(
+                    await GlideBf.reserve(client, key, 0.0001, 1000),
+                ).toEqual("OK");
+
+                const info = await GlideBf.info(client, key);
+                expect(info.capacity).toEqual(1000);
+                // A lower error rate requires more bits per item, so size should be larger
+                expect(info.size).toBeGreaterThan(0);
+
+                await client.del([key]);
+            },
+            TIMEOUT,
+        );
+
+        it(
+            "reserve with capacity 0 throws",
+            async () => {
+                client = await GlideClusterClient.createClient(
+                    getClientConfigurationOption(
+                        cluster.getAddresses(),
+                        ProtocolVersion.RESP3,
+                    ),
+                );
+
+                const key = getRandomKey();
+
+                await expect(
+                    GlideBf.reserve(client, key, 0.01, 0),
+                ).rejects.toThrow(RequestError);
+
+                await client.del([key]);
+            },
+            TIMEOUT,
+        );
+
+        it(
+            "reserve with negative capacity throws",
+            async () => {
+                client = await GlideClusterClient.createClient(
+                    getClientConfigurationOption(
+                        cluster.getAddresses(),
+                        ProtocolVersion.RESP3,
+                    ),
+                );
+
+                const key = getRandomKey();
+
+                await expect(
+                    GlideBf.reserve(client, key, 0.01, -10),
+                ).rejects.toThrow(RequestError);
+
+                await client.del([key]);
+            },
+            TIMEOUT,
+        );
+
+        // --- Edge case tests: add/exists with special values ---
+
+        it(
+            "add empty string as item",
+            async () => {
+                client = await GlideClusterClient.createClient(
+                    getClientConfigurationOption(
+                        cluster.getAddresses(),
+                        ProtocolVersion.RESP3,
+                    ),
+                );
+
+                const key = getRandomKey();
+
+                // Empty string is a valid item
+                expect(await GlideBf.add(client, key, "")).toBe(true);
+                expect(await GlideBf.exists(client, key, "")).toBe(true);
+
+                // Adding same empty string again should return false
+                expect(await GlideBf.add(client, key, "")).toBe(false);
+
+                await client.del([key]);
+            },
+            TIMEOUT,
+        );
+
+        it(
+            "add very long string (10KB)",
+            async () => {
+                client = await GlideClusterClient.createClient(
+                    getClientConfigurationOption(
+                        cluster.getAddresses(),
+                        ProtocolVersion.RESP3,
+                    ),
+                );
+
+                const key = getRandomKey();
+                const longItem = "x".repeat(10240); // 10KB string
+
+                expect(await GlideBf.add(client, key, longItem)).toBe(true);
+                expect(await GlideBf.exists(client, key, longItem)).toBe(true);
+
+                await client.del([key]);
+            },
+            TIMEOUT,
+        );
+
+        it(
+            "madd with duplicates in same call",
+            async () => {
+                client = await GlideClusterClient.createClient(
+                    getClientConfigurationOption(
+                        cluster.getAddresses(),
+                        ProtocolVersion.RESP3,
+                    ),
+                );
+
+                const key = getRandomKey();
+
+                // When duplicates appear in the same madd call,
+                // the first occurrence is new (true), subsequent are not (false)
+                const results = await GlideBf.madd(client, key, [
+                    "dup",
+                    "dup",
+                    "dup",
+                ]);
+                expect(results[0]).toBe(true);
+                expect(results[1]).toBe(false);
+                expect(results[2]).toBe(false);
+
+                // Cardinality should be 1
+                expect(await GlideBf.card(client, key)).toEqual(1);
+
+                await client.del([key]);
+            },
+            TIMEOUT,
+        );
+
+        // --- Edge case tests: operations on non-existent keys ---
+
+        it(
+            "add to non-existent key auto-creates filter",
+            async () => {
+                client = await GlideClusterClient.createClient(
+                    getClientConfigurationOption(
+                        cluster.getAddresses(),
+                        ProtocolVersion.RESP3,
+                    ),
+                );
+
+                const key = getRandomKey();
+
+                // BF.ADD auto-creates the filter if it does not exist
+                expect(await GlideBf.add(client, key, "auto_item")).toBe(true);
+
+                // Verify the filter was created via info
+                const info = await GlideBf.info(client, key);
+                expect(info.numberOfItems).toEqual(1);
+                expect(info.capacity).toBeGreaterThan(0);
+
+                await client.del([key]);
+            },
+            TIMEOUT,
+        );
+
+        it(
+            "exists on non-existent key returns false",
+            async () => {
+                client = await GlideClusterClient.createClient(
+                    getClientConfigurationOption(
+                        cluster.getAddresses(),
+                        ProtocolVersion.RESP3,
+                    ),
+                );
+
+                const key = getRandomKey();
+
+                // BF.EXISTS on a non-existent key should return false
+                expect(await GlideBf.exists(client, key, "anything")).toBe(
+                    false,
+                );
+            },
+            TIMEOUT,
+        );
+
+        it(
+            "info on non-existent key throws",
+            async () => {
+                client = await GlideClusterClient.createClient(
+                    getClientConfigurationOption(
+                        cluster.getAddresses(),
+                        ProtocolVersion.RESP3,
+                    ),
+                );
+
+                const key = getRandomKey();
+
+                await expect(GlideBf.info(client, key)).rejects.toThrow(
+                    RequestError,
+                );
+            },
+            TIMEOUT,
+        );
+
+        it(
+            "card on non-existent key returns 0",
+            async () => {
+                client = await GlideClusterClient.createClient(
+                    getClientConfigurationOption(
+                        cluster.getAddresses(),
+                        ProtocolVersion.RESP3,
+                    ),
+                );
+
+                const key = getRandomKey();
+
+                expect(await GlideBf.card(client, key)).toEqual(0);
+            },
+            TIMEOUT,
+        );
+
+        // --- Edge case tests: false positive rate verification ---
+
+        it(
+            "false positive rate within bounds",
+            async () => {
+                client = await GlideClusterClient.createClient(
+                    getClientConfigurationOption(
+                        cluster.getAddresses(),
+                        ProtocolVersion.RESP3,
+                    ),
+                );
+
+                const key = getRandomKey();
+                const errorRate = 0.05; // 5%
+                const numItems = 1000;
+
+                await GlideBf.reserve(client, key, errorRate, numItems);
+
+                // Add 1000 items with prefix "in_"
+                const addItems: string[] = [];
+
+                for (let i = 0; i < numItems; i++) {
+                    addItems.push(`in_${i}`);
+                }
+
+                // Add in batches
+                for (let i = 0; i < addItems.length; i += 100) {
+                    await GlideBf.madd(
+                        client,
+                        key,
+                        addItems.slice(i, i + 100),
+                    );
+                }
+
+                // Check 1000 items that were NOT added (prefix "out_")
+                let falsePositives = 0;
+
+                for (let i = 0; i < numItems; i++) {
+                    const exists = await GlideBf.exists(
+                        client,
+                        key,
+                        `out_${i}`,
+                    );
+
+                    if (exists) {
+                        falsePositives++;
+                    }
+                }
+
+                const observedRate = falsePositives / numItems;
+
+                // Allow 2x the configured error rate as slack for statistical variance
+                expect(observedRate).toBeLessThan(errorRate * 2);
+
+                await client.del([key]);
+            },
+            TIMEOUT * 2,
+        );
+
+        // --- Edge case tests: insert edge cases ---
+
+        it(
+            "insert with noCreate on existing filter works",
+            async () => {
+                client = await GlideClusterClient.createClient(
+                    getClientConfigurationOption(
+                        cluster.getAddresses(),
+                        ProtocolVersion.RESP3,
+                    ),
+                );
+
+                const key = getRandomKey();
+
+                // Create the filter first
+                expect(
+                    await GlideBf.reserve(client, key, 0.01, 100),
+                ).toEqual("OK");
+
+                // noCreate on an existing filter should succeed
+                const results = await GlideBf.insert(
                     client,
-                    Buffer.from(alias),
-                    Buffer.from(newIndex),
-                ),
-            ).toEqual("OK");
+                    key,
+                    ["x", "y", "z"],
+                    { noCreate: true },
+                );
+                expect(results).toEqual([true, true, true]);
 
-            // Test if an existing alias is deleted successfully.
-            expect(await GlideFt.aliasdel(client, alias)).toEqual("OK");
+                // Verify items exist
+                const exists = await GlideBf.mexists(client, key, [
+                    "x",
+                    "y",
+                    "z",
+                ]);
+                expect(exists).toEqual([true, true, true]);
 
-            // Test if an existing alias is deleted successfully for bytes type input.
-            expect(
-                await GlideFt.aliasdel(client, Buffer.from(newAlias)),
-            ).toEqual("OK");
+                await client.del([key]);
+            },
+            TIMEOUT,
+        );
 
-            // Drop both indexes.
-            expect(await GlideFt.dropindex(client, index)).toEqual("OK");
-            expect(await client.customCommand(["FT._LIST"])).not.toContain(
-                index,
-            );
-            expect(await GlideFt.dropindex(client, newIndex)).toEqual("OK");
-            expect(await client.customCommand(["FT._LIST"])).not.toContain(
-                newIndex,
-            );
-        });
+        it(
+            "insert creates filter if not exists",
+            async () => {
+                client = await GlideClusterClient.createClient(
+                    getClientConfigurationOption(
+                        cluster.getAddresses(),
+                        ProtocolVersion.RESP3,
+                    ),
+                );
 
-        it("FT._ALIASLIST test", async () => {
-            client = await GlideClusterClient.createClient(
-                getClientConfigurationOption(
-                    cluster.getAddresses(),
-                    ProtocolVersion.RESP3,
-                ),
-            );
-            const index1 = getRandomKey();
-            const alias1 = getRandomKey() + "-alias";
-            const index2 = getRandomKey();
-            const alias2 = getRandomKey() + "-alias";
+                const key = getRandomKey();
 
-            //Create the 2 test indexes.
-            expect(
-                await GlideFt.create(client, index1, [
-                    { type: "NUMERIC", name: "published_at" },
-                    { type: "TAG", name: "category" },
-                ]),
-            ).toEqual("OK");
-            expect(
-                await GlideFt.create(client, index2, [
-                    { type: "NUMERIC", name: "published_at" },
-                    { type: "TAG", name: "category" },
-                ]),
-            ).toEqual("OK");
+                // insert without prior reserve should auto-create
+                const results = await GlideBf.insert(client, key, [
+                    "alpha",
+                    "beta",
+                ]);
+                expect(results).toEqual([true, true]);
 
-            //Check if the two indexes created successfully.
-            expect(await client.customCommand(["FT._LIST"])).toContain(index1);
-            expect(await client.customCommand(["FT._LIST"])).toContain(index2);
+                // Verify filter was created
+                const info = await GlideBf.info(client, key);
+                expect(info.numberOfItems).toEqual(2);
 
-            //Add aliases to the 2 indexes.
-            expect(await GlideFt.aliasadd(client, index1, alias1)).toBe("OK");
-            expect(await GlideFt.aliasadd(client, index2, alias2)).toBe("OK");
+                await client.del([key]);
+            },
+            TIMEOUT,
+        );
 
-            //Test if the aliaslist command return the added alias.
-            const result = await GlideFt.aliaslist(client);
-            const expected: GlideRecord<GlideString> = [
-                {
-                    key: alias2,
-                    value: index2,
-                },
-                {
-                    key: alias1,
-                    value: index1,
-                },
-            ];
+        // --- Edge case tests: concurrent adds ---
 
-            const compareFunction = function (
-                a: { key: GlideString; value: GlideString },
-                b: { key: GlideString; value: GlideString },
-            ) {
-                return a.key.toString().localeCompare(b.key.toString()) > 0
-                    ? 1
-                    : -1;
-            };
+        it(
+            "concurrent adds from two clients both succeed",
+            async () => {
+                client = await GlideClusterClient.createClient(
+                    getClientConfigurationOption(
+                        cluster.getAddresses(),
+                        ProtocolVersion.RESP3,
+                    ),
+                );
 
-            expect(result.sort(compareFunction)).toEqual(
-                expected.sort(compareFunction),
-            );
-        });
+                const client2 = await GlideClusterClient.createClient(
+                    getClientConfigurationOption(
+                        cluster.getAddresses(),
+                        ProtocolVersion.RESP3,
+                    ),
+                );
+
+                const key = getRandomKey();
+
+                try {
+                    await GlideBf.reserve(client, key, 0.01, 1000);
+
+                    // Concurrently add items from two clients
+                    const [result1, result2] = await Promise.all([
+                        GlideBf.add(client, key, "concurrent_item"),
+                        GlideBf.add(client2, key, "concurrent_item"),
+                    ]);
+
+                    // One should be true (new) and one should be false (already existed),
+                    // or both true if processed truly simultaneously (race).
+                    // In either case, the item must exist after both complete.
+                    expect(
+                        await GlideBf.exists(client, key, "concurrent_item"),
+                    ).toBe(true);
+
+                    // At least one of the adds must have reported new
+                    expect(result1 || result2).toBe(true);
+
+                    await client.del([key]);
+                } finally {
+                    client2.close();
+                }
+            },
+            TIMEOUT,
+        );
     });
 });

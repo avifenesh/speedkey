@@ -1,10 +1,16 @@
-# speedkey
+# @glidemq/speedkey
 
-Experimental Valkey/Redis client based on valkey-glide core with direct NAPI bindings (no IPC socket).
+Valkey/Redis client with direct NAPI bindings based on [valkey-glide](https://github.com/valkey-io/valkey-glide) core. No IPC socket - Rust talks directly to Node.js via NAPI.
 
-**This is a testing-only package. Do not use in production.**
+Interim package - will be replaced by the official valkey-glide Node.js client once it ships formal Search, JSON, and Bloom module support.
 
-Extracted from [valkey-glide PR #5325](https://github.com/valkey-io/valkey-glide/pull/5325).
+## Modules
+
+- **Search** (GlideFt): 5 commands - CREATE, DROPINDEX, _LIST, INFO, SEARCH
+- **JSON** (GlideJson): 22 commands - full JSON manipulation
+- **Bloom Filter** (GlideBf): 9 commands - RESERVE, ADD, MADD, EXISTS, MEXISTS, INFO, INSERT, CARD, LOADCHUNK
+
+See [github.com/avifenesh/speedkey](https://github.com/avifenesh/speedkey) for full documentation.
 
 ## License
 

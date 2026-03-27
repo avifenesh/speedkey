@@ -7,6 +7,7 @@ import {
     Batch,
     ClusterBatch,
     ConditionalChange,
+    Decoder,
     DecoderOption,
     GlideClient,
     GlideClusterClient,
@@ -241,6 +242,48 @@ export class GlideJson {
     ): Promise<ReturnTypeJson<GlideString[]>> {
         const args = ["JSON.MGET", ...keys, path];
         return _executeCommand(client, args, options);
+    }
+
+    /**
+     * Sets JSON values at the specified paths for multiple keys.
+     *
+     * @remarks When in cluster mode, if keys map to different hash slots, the command
+     * will be split across these slots and executed separately for each. This means the command
+     * is atomic only at the slot level.
+     *
+     * @param client - The client to execute the command.
+     * @param keyPathValues - An array of objects, each containing:
+     * - `key`: The key of the JSON document.
+     * - `path`: The path within the JSON document.
+     * - `value`: The value to set, in JSON formatted string.
+     * @returns `"OK"` if all values were set successfully.
+     *
+     * @example
+     * ```typescript
+     * const result = await GlideJson.mset(client, [
+     *     { key: "doc1", path: "$", value: '{"a": 1}' },
+     *     { key: "doc2", path: "$", value: '{"b": 2}' },
+     * ]);
+     * console.log(result); // "OK"
+     * ```
+     */
+    static async mset(
+        client: BaseClient,
+        keyPathValues: {
+            key: GlideString;
+            path: GlideString;
+            value: GlideString;
+        }[],
+    ): Promise<"OK"> {
+        const args: GlideString[] = ["JSON.MSET"];
+
+        for (const entry of keyPathValues) {
+            args.push(entry.key, entry.path, entry.value);
+        }
+
+        return _executeCommand<"OK">(client, args, {
+            decoder: Decoder.String,
+        });
     }
 
     /**
