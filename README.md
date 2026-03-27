@@ -7,7 +7,7 @@ Valkey/Redis client with direct NAPI bindings based on [valkey-glide](https://gi
 
 This is the client layer for [glide-mq](https://github.com/avifenesh/glide-mq). It will be replaced by the official valkey-glide NAPI client once it ships upstream. Until then, speedkey provides the same typed API surface that glide-mq depends on.
 
-> **Note:** When valkey-glide ships formal Node.js support for Search, JSON, and Bloom modules, speedkey will be deprecated in favor of the official client. The API surface is designed to align with valkey-glide to minimize migration effort.
+> **Note:** speedkey will be replaced by valkey-glide when glide completes its migration to NAPI. The API surface is designed to align with valkey-glide to minimize migration effort.
 
 ## Install
 
