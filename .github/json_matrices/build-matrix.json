@@ -60,7 +60,6 @@
         "ARCH": "x64",
         "TARGET": "x86_64-pc-windows-msvc",
         "PACKAGE_MANAGERS": ["npm"],
-        "languages": ["node"],
-        "run": "always"
+        "languages": ["node"]
     }
 ]

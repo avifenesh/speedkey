@@ -1,0 +1,43 @@
+# cargo-deny configuration for Valkey GLIDE (speedkey).
+#
+# Referenced by .github/workflows/lint-rust/action.yml. The file was missing
+# from the tree (cargo-deny fell back to its default config, which only
+# allows a tiny set of licenses), so every PR after cargo-deny 0.19 turned
+# red on transitive deps with otherwise-fine permissive licenses (0BSD,
+# Unicode-3.0, CDLA-Permissive-2.0, etc.).
+#
+# Keep the allowlist limited to permissive / public-domain licenses that
+# match the Apache-2.0 project policy.
+
+[licenses]
+allow = [
+    "MIT",
+    "MIT-0",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "0BSD",
+    "CC0-1.0",
+    "Unlicense",
+    "Zlib",
+    "BSL-1.0",
+    "Unicode-3.0",
+    "Unicode-DFS-2016",
+    "CDLA-Permissive-2.0",
+    "MPL-2.0",
+]
+confidence-threshold = 0.93
+
+[bans]
+multiple-versions = "allow"
+wildcards = "allow"
+
+[advisories]
+yanked = "warn"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

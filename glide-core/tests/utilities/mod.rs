@@ -7,7 +7,7 @@ use glide_core::{
     connection_request::{self, AuthenticationInfo, NodeAddress, ProtocolVersion},
 };
 use once_cell::sync::Lazy;
-use rand::{Rng, RngExt, distr::Alphanumeric};
+use rand::{RngExt, distr::Alphanumeric};
 use redis::{
     ConnectionAddr, GlideConnectionOptions, PushInfo, RedisConnectionInfo, RedisResult, Value,
     cluster_routing::{MultipleNodeRoutingInfo, RoutingInfo},
@@ -68,7 +68,7 @@ pub fn get_shared_server_address(use_tls: bool) -> ConnectionAddr {
     }
 }
 
-#[ctor::dtor]
+#[dtor::dtor(unsafe)]
 fn clean_shared_clusters() {
     if let Some(mutex) = SharedServer::get(&SHARED_SERVER) {
         drop(mutex.lock().unwrap().take());
@@ -746,7 +746,7 @@ pub async fn setup_test_basics(use_tls: bool) -> TestBasics {
 }
 
 #[cfg(test)]
-#[ctor::ctor]
+#[ctor::ctor(unsafe)]
 fn init() {
     logger_core::init(Some(logger_core::Level::Debug), None);
 

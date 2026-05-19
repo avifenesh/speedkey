@@ -85,9 +85,8 @@ runs:
               version: "25.1"
               repo-token: ${{ inputs.github-token }}
 
-        # Install engine for testing (non-Windows only)
         - name: Install engine
-          if: "${{ inputs.engine-version && inputs.os != 'windows' }}"
+          if: "${{ inputs.engine-version }}"
           shell: bash
           run: |
               ENGINE_VERSION="${{ inputs.engine-version }}"
@@ -97,6 +96,33 @@ runs:
                   brew install valkey || brew install redis
               elif [[ "${{ inputs.os }}" == "amazon-linux" ]]; then
                   yum install -y valkey || yum install -y redis
+              elif [[ "${{ inputs.os }}" == "windows" ]]; then
+                  # `choco install redis-64` no longer ships a real
+                  # redis-server.exe - it now pulls in memurai-developer
+                  # (a redis-compatible Windows server) whose binary is
+                  # `memurai.exe`. cluster_manager.py probes for
+                  # `valkey-server` then `redis-server`, so we install
+                  # memurai and shim a `redis-server.exe` alias next to
+                  # it on PATH.
+                  choco install memurai-developer -y --no-progress
+                  # Locate memurai.exe wherever the MSI dropped it.
+                  memurai_exe=$(find "/c/Program Files" -iname 'memurai.exe' -print -quit 2>/dev/null)
+                  if [ -z "$memurai_exe" ]; then
+                      memurai_exe=$(find "/c/Program Files (x86)" -iname 'memurai.exe' -print -quit 2>/dev/null)
+                  fi
+                  if [ -z "$memurai_exe" ]; then
+                      echo "::error::memurai.exe not found after 'choco install memurai-developer'"
+                      echo "::error::tree under /c/Program Files/Memurai:"
+                      ls -la "/c/Program Files/Memurai" 2>/dev/null || true
+                      exit 1
+                  fi
+                  memurai_dir=$(dirname "$memurai_exe")
+                  # Alias memurai as redis-server so cluster_manager.py
+                  # finds it without further changes.
+                  cp "$memurai_exe" "$memurai_dir/redis-server.exe"
+                  win_dir=$(echo "$memurai_dir" | sed 's|^/c/|C:\\|; s|/|\\|g')
+                  echo "Adding $win_dir (memurai-developer + redis-server.exe shim) to GITHUB_PATH"
+                  echo "$win_dir" >> "$GITHUB_PATH"
               elif [[ "${{ contains(inputs.target, 'musl') }}" == "true" ]]; then
                   apk add --no-cache valkey || apk add --no-cache redis
               else
@@ -110,7 +136,11 @@ runs:
               fi
 
               # Verify - fail loudly if install silently dropped the binary.
-              if ! command -v valkey-server && ! command -v redis-server; then
-                  echo "::error::install-shared-dependencies finished without valkey-server or redis-server on PATH"
-                  exit 1
+              # Skip on Windows because the path is only on GITHUB_PATH
+              # for the next step, not the current bash session.
+              if [[ "${{ inputs.os }}" != "windows" ]]; then
+                  if ! command -v valkey-server && ! command -v redis-server; then
+                      echo "::error::install-shared-dependencies finished without valkey-server or redis-server on PATH"
+                      exit 1
+                  fi
               fi

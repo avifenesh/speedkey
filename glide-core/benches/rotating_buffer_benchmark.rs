@@ -11,7 +11,7 @@ use glide_core::{
 };
 use integer_encoding::VarInt;
 use protobuf::Message;
-use rand::{Rng, RngExt, distr::Alphanumeric};
+use rand::{RngExt, distr::Alphanumeric};
 
 fn benchmark(
     c: &mut Criterion,

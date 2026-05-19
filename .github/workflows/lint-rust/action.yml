@@ -15,10 +15,18 @@ runs:
     steps:
         - uses: actions/checkout@v4
 
-        - name: Install Rust toolchain and protoc
-          uses: ./.github/workflows/install-rust-and-protoc
+        # Inlined: the standalone `install-rust-and-protoc` composite was
+        # referenced for years but never lived in the repo, so every
+        # lint-rust run failed with "Can't find 'action.yml'". We need
+        # exactly the rust toolchain + protoc; install both directly.
+        - name: Install Rust toolchain
+          uses: dtolnay/rust-toolchain@stable
+
+        - name: Install protoc
+          uses: arduino/setup-protoc@v3
           with:
-              github-token: ${{ inputs.github-token }}
+              version: "25.1"
+              repo-token: ${{ inputs.github-token }}
 
         - uses: actions/cache@v4
           with:

@@ -866,8 +866,8 @@ impl GlideClientHandle {
     /// # Arguments
     /// * `callback_idx` - Index to identify this request in JavaScript
     /// * `request_type` - The type of Redis command (maps to RequestType enum)
-    /// * `args_pointer_high` - High 32 bits of the args Vec<Bytes> pointer
-    /// * `args_pointer_low` - Low 32 bits of the args Vec<Bytes> pointer
+    /// * `args_pointer_high` - High 32 bits of the args `Vec<Bytes>` pointer
+    /// * `args_pointer_low` - Low 32 bits of the args `Vec<Bytes>` pointer
     /// * `route_bytes` - Optional routing information for cluster mode
     ///
     /// # Returns
@@ -1616,7 +1616,7 @@ fn resp_value_to_js<'a>(val: Value, js_env: &'a Env, string_decoder: bool) -> Re
             // because `Record` does not support `GlideString` as a key.
             // The result is in format `GlideRecord<T>`.
             let mut js_array = js_env.create_array(map.len() as u32)?;
-            for (idx, (key, value)) in (0_u32..).zip(map.into_iter()) {
+            for (idx, (key, value)) in (0_u32..).zip(map) {
                 let mut obj = Object::new(js_env)?;
                 obj.set_named_property("key", resp_value_to_js(key, js_env, string_decoder)?)?;
                 obj.set_named_property("value", resp_value_to_js(value, js_env, string_decoder)?)?;

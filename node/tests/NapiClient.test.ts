@@ -30,12 +30,29 @@ import {
     Transaction,
 } from "../build-ts";
 
-const CLUSTER_PORTS = process.env.CLUSTER_ENDPOINTS || "127.0.0.1:37287";
-const STANDALONE_PORT = process.env.STAND_ALONE_ENDPOINT || "127.0.0.1:35086";
-
+// Endpoints come from STAND_ALONE_ENDPOINT / CLUSTER_ENDPOINTS env vars set
+// by the CI workflow (see .github/workflows/node.yml). Jest's worker fork
+// drops the main process argv, so tests/setup.ts can't reliably populate
+// `global.*` for every worker. Env vars propagate through fork(), so we
+// read them directly here. Fail loud if either is unset - a hard-coded
+// fallback (the old default of 127.0.0.1:35086) just produces "connection
+// refused" minutes later with a misleading message.
 function parseEndpoint(endpoint: string): { host: string; port: number } {
-    const [host, portStr] = endpoint.split(":");
+    // Standalone is a single host:port; cluster endpoints come comma-separated,
+    // we keep the first node for the bootstrap address.
+    const first = endpoint.split(",")[0];
+    const [host, portStr] = first.split(":");
     return { host, port: parseInt(portStr, 10) };
+}
+
+const STANDALONE_PORT = process.env.STAND_ALONE_ENDPOINT;
+const CLUSTER_PORTS = process.env.CLUSTER_ENDPOINTS;
+
+if (!STANDALONE_PORT || !CLUSTER_PORTS) {
+    throw new Error(
+        "NapiClient tests require STAND_ALONE_ENDPOINT and CLUSTER_ENDPOINTS env " +
+            "vars; the CI workflow should start Valkey servers and export both.",
+    );
 }
 
 describe("NAPI Client Integration Tests", () => {

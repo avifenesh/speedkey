@@ -129,7 +129,7 @@ pub fn get_shared_cluster_addresses(use_tls: bool) -> Vec<ConnectionAddr> {
     }
 }
 
-#[ctor::dtor]
+#[dtor::dtor(unsafe)]
 fn clean_shared_clusters() {
     if let Some(mutex) = SharedCluster::get(&SHARED_CLUSTER) {
         drop(mutex.lock().unwrap().take());
