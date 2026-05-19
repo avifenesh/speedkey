@@ -30,10 +30,13 @@ import {
     Transaction,
 } from "../build-ts";
 
-// Endpoints come from jest --standalone-endpoints / --cluster-endpoints and
-// are exposed via `global.*` by tests/setup.ts. They are not available at
-// module load (setupFilesAfterEnv runs after this file is parsed), so peer
-// suites read them inside their beforeAll - we follow the same pattern.
+// Endpoints come from STAND_ALONE_ENDPOINT / CLUSTER_ENDPOINTS env vars set
+// by the CI workflow (see .github/workflows/node.yml). Jest's worker fork
+// drops the main process argv, so tests/setup.ts can't reliably populate
+// `global.*` for every worker. Env vars propagate through fork(), so we
+// read them directly here. Fail loud if either is unset - a hard-coded
+// fallback (the old default of 127.0.0.1:35086) just produces "connection
+// refused" minutes later with a misleading message.
 function parseEndpoint(endpoint: string): { host: string; port: number } {
     // Standalone is a single host:port; cluster endpoints come comma-separated,
     // we keep the first node for the bootstrap address.
@@ -42,32 +45,17 @@ function parseEndpoint(endpoint: string): { host: string; port: number } {
     return { host, port: parseInt(portStr, 10) };
 }
 
-function requireEndpoint(name: "STAND_ALONE_ENDPOINT" | "CLUSTER_ENDPOINTS"): string {
-    const value = (global as Record<string, unknown>)[name] as
-        | string
-        | undefined;
-    if (!value) {
-        throw new Error(
-            `NapiClient tests require --standalone-endpoints and --cluster-endpoints; ` +
-                `${name} was not set on global. The CI workflow should start Valkey ` +
-                `servers and pass both flags.`,
-        );
-    }
-    return value;
+const STANDALONE_PORT = process.env.STAND_ALONE_ENDPOINT;
+const CLUSTER_PORTS = process.env.CLUSTER_ENDPOINTS;
+
+if (!STANDALONE_PORT || !CLUSTER_PORTS) {
+    throw new Error(
+        "NapiClient tests require STAND_ALONE_ENDPOINT and CLUSTER_ENDPOINTS env " +
+            "vars; the CI workflow should start Valkey servers and export both.",
+    );
 }
 
-// Resolved lazily in the top-level beforeAll below so they pick up the
-// globals set by tests/setup.ts (setupFilesAfterEnv runs after this file
-// is parsed but before any beforeAll fires).
-let STANDALONE_PORT = "";
-let CLUSTER_PORTS = "";
-
 describe("NAPI Client Integration Tests", () => {
-    beforeAll(() => {
-        STANDALONE_PORT = requireEndpoint("STAND_ALONE_ENDPOINT");
-        CLUSTER_PORTS = requireEndpoint("CLUSTER_ENDPOINTS");
-    });
-
     describe("GlideClient (Standalone)", () => {
         let client: GlideClient;
 

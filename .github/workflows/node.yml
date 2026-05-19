@@ -172,6 +172,13 @@ jobs:
               working-directory: ./node
               env:
                   JEST_HTML_REPORTER_OUTPUT_PATH: test-report-node.html
+                  # NapiClient.test.ts reads these directly from the
+                  # environment because jest's worker fork drops the main
+                  # process's argv (the `--*-endpoints` flags above only
+                  # reach tests that happen to share a context with
+                  # setup.ts).
+                  STAND_ALONE_ENDPOINT: ${{ steps.valkey.outputs.standalone }}
+                  CLUSTER_ENDPOINTS: ${{ steps.valkey.outputs.cluster }}
 
             - name: Stop Valkey servers
               if: always()
