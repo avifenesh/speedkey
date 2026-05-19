@@ -97,14 +97,22 @@ runs:
               elif [[ "${{ inputs.os }}" == "amazon-linux" ]]; then
                   yum install -y valkey || yum install -y redis
               elif [[ "${{ inputs.os }}" == "windows" ]]; then
-                  # Memurai is the modern Windows Valkey/Redis fork; the
-                  # tporadowski/redis chocolatey package (`redis-64`)
+                  # Install the tporadowski/redis chocolatey package; it
                   # ships a `redis-server.exe` that cluster_manager.py
-                  # picks up via its `redis-server` fallback.
+                  # picks up via its `redis-server` fallback. Locate
+                  # the binary after install (the path moves between
+                  # package versions) and prepend its dir to PATH.
                   choco install redis-64 -y --no-progress
-                  # Put the install dir at the front of PATH so the
-                  # subsequent steps find redis-server.exe.
-                  echo "C:\\ProgramData\\chocolatey\\lib\\redis-64\\tools" >> "$GITHUB_PATH"
+                  # `find` finds the .exe wherever choco dropped it.
+                  redis_exe=$(find /c/ProgramData/chocolatey/lib/redis-64 -iname 'redis-server.exe' -print -quit)
+                  if [ -z "$redis_exe" ]; then
+                      echo "::error::redis-server.exe not found after 'choco install redis-64'"
+                      exit 1
+                  fi
+                  # GITHUB_PATH wants Windows-style paths.
+                  redis_dir=$(dirname "$redis_exe" | sed 's|^/c/|C:\\|; s|/|\\|g')
+                  echo "Adding $redis_dir to GITHUB_PATH"
+                  echo "$redis_dir" >> "$GITHUB_PATH"
               elif [[ "${{ contains(inputs.target, 'musl') }}" == "true" ]]; then
                   apk add --no-cache valkey || apk add --no-cache redis
               else
