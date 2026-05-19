@@ -292,7 +292,11 @@ jobs:
               env:
                   JEST_HTML_REPORTER_OUTPUT_PATH: test-report-ecma.html
 
+            # The benchmarks/ tree was carried over from upstream Valkey
+            # GLIDE but is not present in this fork. Skip the step unless
+            # someone re-adds the directory.
             - name: Run benchmarks
+              if: hashFiles('benchmarks/install_and_test.sh') != ''
               uses: ./.github/workflows/test-benchmark
               with:
                   language-flag: -node
