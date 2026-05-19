@@ -85,9 +85,8 @@ runs:
               version: "25.1"
               repo-token: ${{ inputs.github-token }}
 
-        # Install engine for testing (non-Windows only)
         - name: Install engine
-          if: "${{ inputs.engine-version && inputs.os != 'windows' }}"
+          if: "${{ inputs.engine-version }}"
           shell: bash
           run: |
               ENGINE_VERSION="${{ inputs.engine-version }}"
@@ -97,6 +96,15 @@ runs:
                   brew install valkey || brew install redis
               elif [[ "${{ inputs.os }}" == "amazon-linux" ]]; then
                   yum install -y valkey || yum install -y redis
+              elif [[ "${{ inputs.os }}" == "windows" ]]; then
+                  # Memurai is the modern Windows Valkey/Redis fork; the
+                  # tporadowski/redis chocolatey package (`redis-64`)
+                  # ships a `redis-server.exe` that cluster_manager.py
+                  # picks up via its `redis-server` fallback.
+                  choco install redis-64 -y --no-progress
+                  # Put the install dir at the front of PATH so the
+                  # subsequent steps find redis-server.exe.
+                  echo "C:\\ProgramData\\chocolatey\\lib\\redis-64\\tools" >> "$GITHUB_PATH"
               elif [[ "${{ contains(inputs.target, 'musl') }}" == "true" ]]; then
                   apk add --no-cache valkey || apk add --no-cache redis
               else
@@ -110,7 +118,11 @@ runs:
               fi
 
               # Verify - fail loudly if install silently dropped the binary.
-              if ! command -v valkey-server && ! command -v redis-server; then
-                  echo "::error::install-shared-dependencies finished without valkey-server or redis-server on PATH"
-                  exit 1
+              # Skip on Windows because the path is only on GITHUB_PATH
+              # for the next step, not the current bash session.
+              if [[ "${{ inputs.os }}" != "windows" ]]; then
+                  if ! command -v valkey-server && ! command -v redis-server; then
+                      echo "::error::install-shared-dependencies finished without valkey-server or redis-server on PATH"
+                      exit 1
+                  fi
               fi
