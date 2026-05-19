@@ -68,7 +68,7 @@ mod tests {
     use crate::command_request::{Command, CommandRequest, RequestType};
     use crate::command_request::{command, command_request};
     use bytes::BufMut;
-    use rand::{Rng, distr::Alphanumeric};
+    use rand::{Rng, RngExt, distr::Alphanumeric};
     use rstest::rstest;
 
     fn write_length(buffer: &mut BytesMut, length: u32) {

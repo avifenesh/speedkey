@@ -7,7 +7,7 @@ use glide_core::{
     connection_request::{self, AuthenticationInfo, NodeAddress, ProtocolVersion},
 };
 use once_cell::sync::Lazy;
-use rand::{Rng, distr::Alphanumeric};
+use rand::{Rng, RngExt, distr::Alphanumeric};
 use redis::{
     ConnectionAddr, GlideConnectionOptions, PushInfo, RedisConnectionInfo, RedisResult, Value,
     cluster_routing::{MultipleNodeRoutingInfo, RoutingInfo},
