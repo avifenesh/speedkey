@@ -352,8 +352,8 @@ impl IAMTokenManager {
                     let jitter = (backoff_ms as f64 * 0.2) as u64;
                     let min = backoff_ms.saturating_sub(jitter);
                     let max = backoff_ms.saturating_add(jitter);
-                    let mut rng = rand::thread_rng();
-                    backoff_ms = rng.gen_range(min..=max);
+                    let mut rng = rand::rng();
+                    backoff_ms = rng.random_range(min..=max);
 
                     // Exponential increase with cap
                     backoff_ms = (backoff_ms.saturating_mul(2)).min(TOKEN_GEN_MAX_BACKOFF_MS);
