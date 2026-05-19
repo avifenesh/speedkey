@@ -5,7 +5,7 @@ use aws_sigv4::http_request::{
 };
 use aws_sigv4::sign::v4;
 use logger_core::{log_debug, log_error, log_info, log_warn};
-use rand::{Rng, RngExt};
+use rand::RngExt;
 use std::sync::Arc;
 use std::time::Duration;
 use std::time::SystemTime;

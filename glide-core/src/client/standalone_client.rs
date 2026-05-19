@@ -201,7 +201,7 @@ impl StandaloneClient {
             None
         };
 
-        let mut stream = stream::iter(connection_request.addresses.into_iter())
+        let mut stream = stream::iter(connection_request.addresses)
             .map(move |address| {
                 let info = valkey_connection_info.clone();
                 let retry = retry_strategy;
