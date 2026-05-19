@@ -25,8 +25,17 @@ runs:
               sudo apt-get install -y npm
 
         - shell: bash
-          # Disable RDB snapshots to avoid configuration errors
-          run: redis-server --save "" --daemonize "yes"
+          # Disable RDB snapshots to avoid configuration errors.
+          # Use whichever binary is on PATH (install-shared-dependencies
+          # prefers `valkey` apt, which installs `valkey-server`, not
+          # `redis-server`).
+          run: |
+              SERVER=$(command -v valkey-server || command -v redis-server)
+              if [ -z "$SERVER" ]; then
+                  echo "::error::Neither valkey-server nor redis-server on PATH"
+                  exit 1
+              fi
+              "$SERVER" --save "" --daemonize "yes"
 
         - shell: bash
           working-directory: ./benchmarks

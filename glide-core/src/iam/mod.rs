@@ -5,7 +5,7 @@ use aws_sigv4::http_request::{
 };
 use aws_sigv4::sign::v4;
 use logger_core::{log_debug, log_error, log_info, log_warn};
-use rand::Rng;
+use rand::{Rng, RngExt};
 use std::sync::Arc;
 use std::time::Duration;
 use std::time::SystemTime;
@@ -352,8 +352,8 @@ impl IAMTokenManager {
                     let jitter = (backoff_ms as f64 * 0.2) as u64;
                     let min = backoff_ms.saturating_sub(jitter);
                     let max = backoff_ms.saturating_add(jitter);
-                    let mut rng = rand::thread_rng();
-                    backoff_ms = rng.gen_range(min..=max);
+                    let mut rng = rand::rng();
+                    backoff_ms = rng.random_range(min..=max);
 
                     // Exponential increase with cap
                     backoff_ms = (backoff_ms.saturating_mul(2)).min(TOKEN_GEN_MAX_BACKOFF_MS);

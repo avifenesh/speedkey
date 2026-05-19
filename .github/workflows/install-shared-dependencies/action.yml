@@ -109,5 +109,8 @@ runs:
                   }
               fi
 
-              # Verify
-              command -v valkey-server || command -v redis-server || echo "Warning: No server binary found in PATH"
+              # Verify - fail loudly if install silently dropped the binary.
+              if ! command -v valkey-server && ! command -v redis-server; then
+                  echo "::error::install-shared-dependencies finished without valkey-server or redis-server on PATH"
+                  exit 1
+              fi
