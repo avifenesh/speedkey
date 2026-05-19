@@ -30,11 +30,26 @@ import {
     Transaction,
 } from "../build-ts";
 
-const CLUSTER_PORTS = process.env.CLUSTER_ENDPOINTS || "127.0.0.1:37287";
-const STANDALONE_PORT = process.env.STAND_ALONE_ENDPOINT || "127.0.0.1:35086";
+// Endpoints come from jest --standalone-endpoints / --cluster-endpoints (see
+// tests/setup.ts). The old hard-coded fallback (127.0.0.1:35086) was a trap:
+// when CI doesn't pass endpoints the suite would silently try to connect to a
+// port nothing was listening on, then fail every `afterEach` with
+// "Cannot read properties of undefined (reading 'flushall')".
+const CLUSTER_PORTS = global.CLUSTER_ENDPOINTS;
+const STANDALONE_PORT = global.STAND_ALONE_ENDPOINT;
+
+if (!STANDALONE_PORT || !CLUSTER_PORTS) {
+    throw new Error(
+        "NapiClient tests require --standalone-endpoints and --cluster-endpoints; " +
+            "the CI workflow should start Valkey servers and pass both flags.",
+    );
+}
 
 function parseEndpoint(endpoint: string): { host: string; port: number } {
-    const [host, portStr] = endpoint.split(":");
+    // Standalone is a single host:port; cluster endpoints come comma-separated,
+    // we keep the first node for the bootstrap address.
+    const first = endpoint.split(",")[0];
+    const [host, portStr] = first.split(":");
     return { host, port: parseInt(portStr, 10) };
 }
 

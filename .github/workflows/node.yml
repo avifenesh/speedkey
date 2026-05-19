@@ -139,14 +139,52 @@ jobs:
                   npm install
                   npm run build:release
 
+            # Start Valkey standalone (1 primary + 1 replica) and a cluster
+            # (3 shards x 2 nodes by default) so the integration suite has
+            # real servers to point at via jest --standalone-endpoints /
+            # --cluster-endpoints.
+            - name: Start Valkey servers
+              id: valkey
+              shell: bash
+              run: |
+                  set -euo pipefail
+                  out=$(python3 utils/cluster_manager.py start)
+                  echo "$out"
+                  standalone=$(echo "$out" | awk -F= '/^CLUSTER_NODES=/{print $2}' | cut -d, -f1)
+                  standalone_folder=$(echo "$out" | awk -F= '/^CLUSTER_FOLDER=/{print $2}')
+                  echo "standalone=$standalone" >> "$GITHUB_OUTPUT"
+                  echo "standalone_folder=$standalone_folder" >> "$GITHUB_OUTPUT"
+
+                  out=$(python3 utils/cluster_manager.py start --cluster-mode)
+                  echo "$out"
+                  cluster=$(echo "$out" | awk -F= '/^CLUSTER_NODES=/{print $2}')
+                  cluster_folder=$(echo "$out" | awk -F= '/^CLUSTER_FOLDER=/{print $2}')
+                  echo "cluster=$cluster" >> "$GITHUB_OUTPUT"
+                  echo "cluster_folder=$cluster_folder" >> "$GITHUB_OUTPUT"
+
             - name: Test
               shell: bash
               run: |
                   npm run build
-                  npm run test
+                  npm run test -- \
+                      --cluster-endpoints=${{ steps.valkey.outputs.cluster }} \
+                      --standalone-endpoints=${{ steps.valkey.outputs.standalone }}
               working-directory: ./node
               env:
                   JEST_HTML_REPORTER_OUTPUT_PATH: test-report-node.html
+
+            - name: Stop Valkey servers
+              if: always()
+              shell: bash
+              run: |
+                  if [ -n "${{ steps.valkey.outputs.standalone_folder }}" ]; then
+                      python3 utils/cluster_manager.py stop \
+                          --cluster-folder "${{ steps.valkey.outputs.standalone_folder }}" || true
+                  fi
+                  if [ -n "${{ steps.valkey.outputs.cluster_folder }}" ]; then
+                      python3 utils/cluster_manager.py stop \
+                          --cluster-folder "${{ steps.valkey.outputs.cluster_folder }}" || true
+                  fi
 
             - name: Upload test reports
               if: always()
