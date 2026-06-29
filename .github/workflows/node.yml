@@ -122,7 +122,7 @@ jobs:
               with:
                   node-version: ${{ matrix.node }}
 
-            - uses: actions/cache@v4
+            - uses: actions/cache@v6
               with:
                   path: |
                       node/rust-client/target
@@ -231,7 +231,7 @@ jobs:
               with:
                   node-version: 23.x
 
-            - uses: actions/cache@v4
+            - uses: actions/cache@v6
               with:
                   path: |
                       node/rust-client/target
@@ -403,7 +403,7 @@ jobs:
               with:
                   node-version: ${{ matrix.node }}
 
-            - uses: actions/cache@v4
+            - uses: actions/cache@v6
               with:
                   path: |
                       node/rust-client/target
@@ -467,7 +467,7 @@ jobs:
               with:
                   node-version: latest
 
-            - uses: actions/cache@v4
+            - uses: actions/cache@v6
               with:
                   path: |
                       node/rust-client/target
