@@ -80,7 +80,7 @@ jobs:
             version-matrix-output: ${{ steps.get-matrices.outputs.version-matrix-output }}
 
         steps:
-            - uses: actions/checkout@v4
+            - uses: actions/checkout@v7
             - id: get-matrices
               uses: ./.github/workflows/create-test-matrices
               with:
@@ -100,7 +100,7 @@ jobs:
                 host: ${{ fromJson(needs.get-matrices.outputs.host-matrix-output) }}
                 node: ${{ fromJson(needs.get-matrices.outputs.version-matrix-output) }}
         steps:
-            - uses: actions/checkout@v4
+            - uses: actions/checkout@v7
 
             - name: Output Matrix Parameters for this job
               run: |
@@ -207,7 +207,7 @@ jobs:
         runs-on: ubuntu-latest
         timeout-minutes: 25
         steps:
-            - uses: actions/checkout@v4
+            - uses: actions/checkout@v7
 
             - name: Output job information
               run: |
@@ -316,7 +316,7 @@ jobs:
         timeout-minutes: 15
         runs-on: ubuntu-latest
         steps:
-            - uses: actions/checkout@v4
+            - uses: actions/checkout@v7
 
             - name: lint node rust
               uses: ./.github/workflows/lint-rust
@@ -333,7 +333,7 @@ jobs:
             version-matrix-output: ${{ steps.get-matrices.outputs.version-matrix-output }}
 
         steps:
-            - uses: actions/checkout@v4
+            - uses: actions/checkout@v7
             - id: get-matrices
               uses: ./.github/workflows/create-test-matrices
               with:
@@ -371,7 +371,7 @@ jobs:
               run: mkdir -p $GITHUB_WORKSPACE
 
             - name: Checkout code
-              uses: actions/checkout@v4
+              uses: actions/checkout@v7
               with:
                   fetch-depth: 0
 
@@ -460,7 +460,7 @@ jobs:
             - name: Setup self-hosted runner access
               run: sudo chown -R $USER:$USER /home/ubuntu/actions-runner/_work/speedkey
 
-            - uses: actions/checkout@v4
+            - uses: actions/checkout@v7
 
             - name: Install Node.js
               uses: actions/setup-node@v5
