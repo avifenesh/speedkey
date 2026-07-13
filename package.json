@@ -8,7 +8,7 @@
         "eslint-plugin-jsdoc": "63",
         "prettier": "3",
         "prettier-eslint": "17",
-        "typescript": "6",
+        "typescript": "7",
         "typescript-eslint": "8"
     }
 }
