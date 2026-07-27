@@ -47,10 +47,13 @@ runs:
           working-directory: ${{ inputs.cargo-toml-folder }}
           shell: bash
 
+        # cargo-deny 0.20 moved --config from the `check` subcommand up to the
+        # root command, so it must come before `check`. Note `-c` is now COLOR,
+        # not config, so the long form is required.
         - run: |
               cargo update
               cargo install --locked cargo-deny
-              cargo deny check --config ${GITHUB_WORKSPACE}/deny.toml
+              cargo deny --config ${GITHUB_WORKSPACE}/deny.toml check
           working-directory: ${{ inputs.cargo-toml-folder }}
           shell: bash
 
