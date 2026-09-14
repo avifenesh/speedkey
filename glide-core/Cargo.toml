@@ -52,7 +52,7 @@ serde = { version = "1", features = ["derive"] }
 versions = "7"
 strum = "0.26"       
 strum_macros = "0.26"
-zstd = { version = "0.13" }
+zstd = { version = "0.14" }
 lz4 = { version = "1.28" }
 
 [features]
