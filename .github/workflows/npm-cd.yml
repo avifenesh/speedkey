@@ -9,6 +9,8 @@ on:
             - .github/json_matrices/**
             - node/package.json
             - node/npm/**
+            - glide-core/**/Cargo.toml
+            - node/rust-client/Cargo.lock
             - node/rust-client/Cargo.toml
             - node/rust-client/src/**
             - node/src/**/*.ts
