@@ -10,7 +10,9 @@ on:
             - release-*
             - v*
         paths:
+            - glide-core/**/Cargo.toml
             - glide-core/src/**
+            - glide-core/tests/**
             - glide-core/redis-rs/redis/src/**
             - node/**
             - utils/cluster_manager.py
@@ -21,7 +23,9 @@ on:
             - .github/workflows/create-test-matrices/action.yml
     pull_request:
         paths:
+            - glide-core/**/Cargo.toml
             - glide-core/src/**
+            - glide-core/tests/**
             - glide-core/redis-rs/redis/src/**
             - node/**
             - utils/cluster_manager.py
@@ -72,6 +76,25 @@ run-name:
     ${{ github.event_name == 'workflow_dispatch' && (inputs.name == '' && format('{0} @ {1} {2}', github.ref_name, github.sha, toJson(inputs)) || inputs.name) || '' }}
 
 jobs:
+    core-tests:
+        name: Core dependency tests
+        runs-on: ubuntu-latest
+        timeout-minutes: 30
+        defaults:
+            run:
+                working-directory: glide-core
+        steps:
+            - uses: actions/checkout@v7
+            - uses: dtolnay/rust-toolchain@stable
+            - uses: arduino/setup-protoc@v3
+              with:
+                  version: "25.1"
+                  repo-token: ${{ secrets.GITHUB_TOKEN }}
+            - name: Compile core test targets
+              run: cargo test --tests --no-run
+            - name: Test compression compatibility
+              run: cargo test --test test_compression
+
     get-matrices:
         runs-on: ubuntu-latest
         outputs:
