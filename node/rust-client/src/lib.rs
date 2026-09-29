@@ -844,6 +844,11 @@ pub fn create_direct_client<'a>(
         }
 
         // Message loop has exited (channel closed by client.close()).
+        // Close the sockets now. In-flight tasks still hold Client clones, and a blocking
+        // command would otherwise keep the connection attached to the server until it
+        // replies, delivering data (stream entries, list elements) to a closed client.
+        client.kill().await;
+
         // Release our reference to the worker pool.
         // When all clients have released their references, the pool will be dropped,
         // allowing worker threads to exit and Node.js to terminate cleanly.

@@ -24,7 +24,7 @@ use redis::{
 pub use standalone_client::StandaloneClient;
 use std::io;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicIsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
 use std::thread;
 use std::thread::JoinHandle;
 use std::time::Duration;
@@ -254,6 +254,9 @@ pub struct Client {
     request_timeout: Duration,
     // Setting this counter to limit the inflight requests, in case of any queue is blocked, so we return error to the customer.
     inflight_requests_allowed: Arc<AtomicIsize>,
+    /// Set by `kill()`. A lazy client checks it before connecting so a command queued
+    /// before `close()` cannot open a connection afterwards.
+    killed: Arc<AtomicBool>,
     // IAM token manager for automatic credential refresh
     iam_token_manager: Option<Arc<crate::iam::IAMTokenManager>>,
     // Optional compression manager for automatic compression/decompression
@@ -537,6 +540,12 @@ impl Client {
         config.lazy_connect = false;
 
         let mut guard = self.internal_client.write().await;
+        if self.killed.load(Ordering::Acquire) {
+            return Err(RedisError::from((
+                ErrorKind::ClientError,
+                "Client was closed before the lazy connection was established",
+            )));
+        }
         let iam_manager_ref = self.iam_token_manager.as_ref();
         if let ClientWrapper::Lazy(_) = &*guard {
             // Create the appropriate client based on configuration
@@ -591,6 +600,24 @@ impl Client {
         // Re-acquire for the return
         let guard = self.internal_client.read().await;
         Ok(guard.clone()) // ✅ Return clone of the now-initialized wrapper
+    }
+
+    /// Closes the underlying connections immediately.
+    ///
+    /// Unlike dropping the client, this does not wait for in-flight requests: a blocking
+    /// command (`XREADGROUP ... BLOCK`, `BLPOP`, ...) is cut off and the server discards it.
+    /// Pending requests fail with a connection error. The client must not be used afterwards.
+    ///
+    /// Cluster connections are not torn down here; they close once every clone is dropped
+    /// and the in-flight requests have been answered.
+    pub async fn kill(&self) {
+        // Set first: a lazy client that has not connected yet checks this flag under the
+        // write lock in get_or_initialize_client and refuses to connect.
+        self.killed.store(true, Ordering::Release);
+        let guard = self.internal_client.read().await;
+        if let ClientWrapper::Standalone(client) = &*guard {
+            client.kill();
+        }
     }
 
     /// Send a command to the server.
@@ -1692,6 +1719,7 @@ impl Client {
                 internal_client: internal_client_arc.clone(),
                 request_timeout,
                 inflight_requests_allowed,
+                killed: Arc::new(AtomicBool::new(false)),
                 compression_manager: compression_manager.clone(),
                 iam_token_manager: None,
                 pubsub_synchronizer: pubsub_synchronizer.clone(),
@@ -2070,7 +2098,7 @@ mod tests {
     fn create_test_client() -> Client {
         use crate::pubsub::create_pubsub_synchronizer;
         use std::sync::Arc;
-        use std::sync::atomic::AtomicIsize;
+        use std::sync::atomic::{AtomicBool, AtomicIsize};
         use tokio::sync::RwLock;
 
         let config = ConnectionRequest {
@@ -2105,10 +2133,29 @@ mod tests {
             internal_client: Arc::new(RwLock::new(ClientWrapper::Lazy(Box::new(lazy_client)))),
             request_timeout: Duration::from_millis(250),
             inflight_requests_allowed: Arc::new(AtomicIsize::new(1000)),
+            killed: Arc::new(AtomicBool::new(false)),
             iam_token_manager: None,
             compression_manager: None,
             pubsub_synchronizer,
         }
+    }
+
+    #[test]
+    fn kill_prevents_lazy_client_from_connecting() {
+        // A command queued before close() must not open the lazy connection after kill().
+        // Without the killed flag this would connect to 127.0.0.1:6379 (or fail with a
+        // connection error), never with ClientError.
+        let mut client = create_test_client();
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            client.kill().await;
+            let mut cmd = redis::cmd("PING");
+            let err = client.send_command(&mut cmd, None).await.unwrap_err();
+            assert!(
+                matches!(err.kind(), redis::ErrorKind::ClientError),
+                "expected ClientError, got {err}"
+            );
+        });
     }
 
     #[test]
