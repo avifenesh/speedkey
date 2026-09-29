@@ -14,6 +14,8 @@ on:
             - glide-core/src/**
             - glide-core/tests/**
             - glide-core/redis-rs/redis/src/**
+            - glide-logger/**
+            - glide-telemetry/**
             - node/**
             - utils/cluster_manager.py
             - .github/workflows/node.yml
@@ -27,6 +29,8 @@ on:
             - glide-core/src/**
             - glide-core/tests/**
             - glide-core/redis-rs/redis/src/**
+            - glide-logger/**
+            - glide-telemetry/**
             - node/**
             - utils/cluster_manager.py
             - .github/workflows/node.yml
@@ -271,34 +275,26 @@ jobs:
                   npm install
                   npm run build:release
 
-            - name: Install Yarn
-              id: install-yarn
+            - name: Enable Corepack for Yarn Berry
               shell: bash
               run: |
-                  curl -o- -L https://yarnpkg.com/install.sh | bash
-
-            - name: Add Yarn to PATH
-              id: add-yarn-to-path
-              if: ${{ steps.install-yarn.outcome == 'success' }}
-              run: |
-                  echo "$HOME/.yarn/bin:$HOME/.config/yarn/global/node_modules/.bin" >> $GITHUB_PATH
-                  echo "Yarn PATH configured"
+                  npm install --global corepack@0.35.0
+                  corepack enable
+                  corepack install --global yarn@4.18.0
 
             - name: Test yarn compatibility and correct typescript
-              if: ${{ steps.add-yarn-to-path.outcome == 'success' }}
               working-directory: ./node/pm-and-types-tests
               shell: bash
               run: |
                   cd depend-on-glide-package
                   yarn install
-                  rm -rf node_modules/speedkey/build-ts/*
-                  cp -r ../../build-ts ./node_modules/speedkey/
+                  rm -rf node_modules/@glidemq/speedkey/build-ts/*
+                  cp -r ../../build-ts ./node_modules/@glidemq/speedkey/
                   yarn run build
                   cd ../depend-on-glide-dependent
                   yarn install
                   yarn run build
 
-            # Test hybrid node modules - commonjs
             - name: Test hybrid node modules - commonjs
               run: |
                   npm install

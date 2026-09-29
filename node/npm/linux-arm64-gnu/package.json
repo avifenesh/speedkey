@@ -1,19 +1,19 @@
 {
-    "name": "@valkey/valkey-glide-linux-arm64-gnu",
-    "description": "Native bindings for valkey-glide on linux-arm64-gnu",
+    "name": "@glidemq/speedkey-linux-arm64-gnu",
+    "description": "Native bindings for speedkey on linux-arm64-gnu",
     "version": "0.0.0",
     "repository": {
         "type": "git",
-        "url": "git+https://github.com/valkey-io/valkey-glide.git"
+        "url": "git+https://github.com/avifenesh/speedkey.git"
     },
-    "homepage": "https://valkey.io/valkey-glide/node/",
+    "homepage": "https://github.com/avifenesh/speedkey",
     "author": "Valkey GLIDE Maintainers",
     "publishConfig": {
         "access": "public"
     },
-    "main": "valkey-glide.linux-arm64-gnu.node",
+    "main": "speedkey.linux-arm64-gnu.node",
     "files": [
-        "valkey-glide.linux-arm64-gnu.node"
+        "speedkey.linux-arm64-gnu.node"
     ],
     "os": [
         "linux"
@@ -44,6 +44,6 @@
         "distributed",
         "scalable",
         "resilient",
-        "valkey-glide"
+        "speedkey"
     ]
 }

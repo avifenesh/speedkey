@@ -296,7 +296,7 @@ export class GlideClient extends BaseClient {
      * @example
      * ```typescript
      * // Connecting to a Standalone Server
-     * import { GlideClient, GlideClientConfiguration } from '@valkey/valkey-glide';
+     * import { GlideClient, GlideClientConfiguration } from '@glidemq/speedkey';
      *
      * const client = await GlideClient.createClient({
      *   addresses: [

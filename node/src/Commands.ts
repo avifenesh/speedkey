@@ -142,7 +142,7 @@ export type SetOptions = (
      * @example
      * ```javascript
      *
-     *  import {TimeUnit} from "@valkey/valkey-glide";
+     *  import {TimeUnit} from "@glidemq/speedkey";
      *
      *  await client.set(key, JSON.stringify(key), {
      *   expiry: {

@@ -446,7 +446,7 @@ describe("Circular Dependency Fix", () => {
 
     it("should handle the Jest mock pattern without throwing TypeError", () => {
         expect(() => {
-            const actualModule = jest.requireActual("@valkey/valkey-glide");
+            const actualModule = jest.requireActual("@glidemq/speedkey");
             const mockDefinition = {
                 ...actualModule,
                 GlideClusterClient: {
@@ -475,7 +475,7 @@ describe("Circular Dependency Fix", () => {
             const {
                 GlideClusterClient,
                 TimeoutError,
-            } = require("@valkey/valkey-glide");
+            } = require("@glidemq/speedkey");
 
             expect(GlideClusterClient).toBeDefined();
             expect(TimeoutError).toBeDefined();

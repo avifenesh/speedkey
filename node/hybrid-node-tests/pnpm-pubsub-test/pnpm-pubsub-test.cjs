@@ -44,7 +44,7 @@ Module._resolveFilename = function (request, parent, ...rest) {
     return origResolve.call(this, request, parent, ...rest);
 };
 
-const { GlideClient } = require("@valkey/valkey-glide");
+const { GlideClient } = require("@glidemq/speedkey");
 const FreePort = require("find-free-port");
 const { startServer, checkWhichCommandAvailable } = require("../utils.js");
 

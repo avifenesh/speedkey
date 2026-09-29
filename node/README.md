@@ -1,160 +1,17 @@
-# Welcome to Valkey GLIDE!
+# @glidemq/speedkey
 
-Valkey General Language Independent Driver for the Enterprise (GLIDE) is the official open-source Valkey client library, proudly part of the Valkey organization. Our mission is to make your experience with Valkey and Redis OSS seamless and enjoyable. Whether you're a seasoned developer or just starting out, Valkey GLIDE is here to support you every step of the way.
+Valkey/Redis client with direct NAPI bindings based on [valkey-glide](https://github.com/valkey-io/valkey-glide) core. No IPC socket - Rust talks directly to Node.js via NAPI.
 
-# Why Choose Valkey GLIDE?
+Interim package - will be replaced by the official valkey-glide Node.js client once it ships formal Search, JSON, and Bloom module support.
 
-- **Community and Open Source**: Join our vibrant community and contribute to the project. We are always here to respond, and the client is for the community.
-- **Reliability**: Built with best practices learned from over a decade of operating Redis OSS-compatible services.
-- **Performance**: Optimized for high performance and low latency.
-- **High Availability**: Designed to ensure your applications are always up and running.
-- **Cross-Language Support**: Implemented using a core driver framework written in Rust, with language-specific extensions to ensure consistency and reduce complexity.
-- **Stability and Fault Tolerance**: We brought our years of experience to create a bulletproof client.
-- **Backed and Supported by AWS and GCP**: Ensuring robust support and continuous improvement of the project.
+## Modules
 
-## Documentation
+- **Search** (GlideFt): 5 commands - CREATE, DROPINDEX, _LIST, INFO, SEARCH
+- **JSON** (GlideJson): 22 commands - full JSON manipulation
+- **Bloom Filter** (GlideBf): 9 commands - RESERVE, ADD, MADD, EXISTS, MEXISTS, INFO, INSERT, CARD, LOADCHUNK
 
-See GLIDE's Node.js [documentation site](https://glide.valkey.io/languages/nodejs).
+See [github.com/avifenesh/speedkey](https://github.com/avifenesh/speedkey) for full documentation.
 
-## Supported Engine Versions
+## License
 
-Refer to the [Supported Engine Versions table](https://github.com/valkey-io/valkey-glide/blob/main/README.md#supported-engine-versions) for details.
-
-# Getting Started - Node Wrapper
-
-## System Requirements
-
-The release of Valkey GLIDE was tested on the following platforms:
-
-### Linux GNU
-
-Linux with **glibc 2.17** or higher.
-
-### MacOS (Darwin)
-
-MacOS Apple Silicon/aarch_64 and x86_64/amd64.
-
-- Full tests are running on MacOS 15.0 arm64/aarch64
-- Minimal tests are running on: MacOS 13.5 x86*64/amd64*(We do not recommend using MacOS Intel for production, It is supported for development purposes)\_
-
-### Alpine
-
-All alpine versions that are using _musl libc_ 1.2.3 (All Alpine non deprecated alpine versions) or higher should be supported.
-Tests are running on:
-
-- node:alpine (x86_64/amd64 and arm64/aarch64)
-
-## NodeJS supported version
-
-Node.js 16 or higher.
-**For npm users on linux it is recommended to use npm >=11 since it support optional download base on libc, yarn users should not be concerned**
-
-- Note: The library is dependent on the [protobufjs library](https://protobufjs.github.io/protobuf.js/#installation), which add a size to the package. The package is using the protobufjs/minimal version, hence, if size matter, bundlers should be able to strip the unused code. It should reduce the size of the dependency from 19kb gzipped to 6.5kb gzipped.
-
-### Building & Testing
-
-Development instructions for local building & testing the package are in the [DEVELOPER.md](https://github.com/valkey-io/valkey-glide/blob/main/node/DEVELOPER.md#build-from-source) file.
-
-# Quick Start
-
-## Installation
-
-```bash
-npm i @valkey/valkey-glide
-```
-
-## Basic Examples
-
-#### Standalone Mode:
-
-```typescript
-import { GlideClient, Logger } from "@valkey/valkey-glide";
-
-Logger.setLoggerConfig("info");
-
-const addresses = [
-    {
-        host: "localhost",
-        port: 6379,
-    },
-];
-
-// Check `GlideClientConfiguration` for additional options.
-const client = await GlideClient.createClient({
-    addresses,
-    // Enable TLS if required by the server.
-    // useTLS: true,
-    // Set a timeout appropriate for your use case.
-    requestTimeout: 500,
-    clientName: "test_standalone_client",
-});
-
-try {
-    // Pass the command and its arguments as an array.
-    const pong = await client.customCommand(["PING"]);
-    Logger.log("info", "app", `PING response: ${pong}`);
-
-    const setResponse = await client.set("foo", "bar");
-    Logger.log("info", "app", `Set response is: ${setResponse}`);
-
-    const getResponse = await client.get("foo");
-    Logger.log("info", "app", `Get response is: ${getResponse}`);
-} finally {
-    client.close();
-}
-```
-
-#### Cluster Mode:
-
-```typescript
-import { GlideClusterClient, Logger } from "@valkey/valkey-glide";
-
-Logger.setLoggerConfig("info");
-
-// Add the address of any cluster node; the client discovers the remaining nodes.
-const addresses = [
-    {
-        host: "localhost",
-        port: 6379,
-    },
-];
-
-// Check `GlideClusterClientConfiguration` for additional options.
-const client = await GlideClusterClient.createClient({
-    addresses,
-    // Enable TLS if required by the cluster nodes.
-    // useTLS: true,
-    // Set a timeout appropriate for your use case.
-    requestTimeout: 500,
-    clientName: "test_cluster_client",
-});
-
-try {
-    // Pass the command and its arguments as an array.
-    const pong = await client.customCommand(["PING"], {
-        route: "randomNode",
-    });
-    Logger.log("info", "app", `PING response: ${pong}`);
-
-    const setResponse = await client.set("foo", "bar");
-    Logger.log("info", "app", `Set response is: ${setResponse}`);
-
-    const getResponse = await client.get("foo");
-    Logger.log("info", "app", `Get response is: ${getResponse}`);
-} finally {
-    client.close();
-}
-```
-
-### Supported platforms
-
-Currently, the package is tested on:
-
-| Operation systems | C lib                | Architecture      |
-| ----------------- | -------------------- | ----------------- |
-| `Linux`           | `glibc`, `musl libc` | `x86_64`, `arm64` |
-| `macOS`           | `Darwin`             | `x86_64`, `arm64` |
-
-## Community and Feedback
-
-We encourage you to join our community to support, share feedback, and ask questions. You can approach us for anything on our Valkey Slack: [Join Valkey Slack](https://join.slack.com/t/valkey-oss-developer/shared_invite/zt-2nxs51chx-EB9hu9Qdch3GMfRcztTSkQ).
+Apache-2.0

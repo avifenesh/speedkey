@@ -725,7 +725,7 @@ export class GlideClusterClient extends BaseClient {
      * @example
      * ```typescript
      * // Connecting to a Cluster
-     * import { GlideClusterClient, GlideClusterClientConfiguration } from '@valkey/valkey-glide';
+     * import { GlideClusterClient, GlideClusterClientConfiguration } from '@glidemq/speedkey';
      *
      * const client = await GlideClusterClient.createClient({
      *   addresses: [

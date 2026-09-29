@@ -1,6 +1,6 @@
 {
-    "name": "@valkey/valkey-glide",
-    "description": "General Language Independent Driver for the Enterprise (GLIDE) for Valkey",
+    "name": "@glidemq/speedkey",
+    "description": "Valkey/Redis client with direct NAPI bindings based on valkey-glide core",
     "main": "build-ts/index.js",
     "module": "build-ts/index.js",
     "types": "build-ts/index.d.ts",
@@ -25,9 +25,9 @@
     "type": "commonjs",
     "repository": {
         "type": "git",
-        "url": "git+https://github.com/valkey-io/valkey-glide.git"
+        "url": "git+https://github.com/avifenesh/speedkey.git"
     },
-    "homepage": "https://valkey.io/valkey-glide/node/",
+    "homepage": "https://github.com/avifenesh/speedkey",
     "author": "Valkey GLIDE Maintainers",
     "license": "Apache-2.0",
     "dependencies": {
@@ -53,11 +53,12 @@
         "distributed",
         "scalable",
         "resilient",
-        "valkey-glide"
+        "valkey-glide",
+        "speedkey"
     ],
     "scripts": {
-        "clean:build": "shx rm -rf build-ts dist/*/target rust-client/target rust-client/valkey-glide.*.node src/valkey-glide.*.node build/*.tsbuildinfo",
-        "clean": "shx rm -rf build-ts dist/*/target node_modules rust-client/node_modules */node_modules rust-client/target glide-logs rust-client/valkey-glide.*.node src/valkey-glide.*.node rust-client/index.* src/ProtobufMessage.* *.tsbuildinfo test-report*.html yarn.lock package-lock.json rust-client/package-lock.json rust-client/Cargo.lock",
+        "clean:build": "shx rm -rf build-ts dist/*/target rust-client/target rust-client/speedkey.*.node src/speedkey.*.node build/*.tsbuildinfo",
+        "clean": "shx rm -rf build-ts dist/*/target node_modules rust-client/node_modules */node_modules rust-client/target glide-logs rust-client/speedkey.*.node src/speedkey.*.node rust-client/index.* src/ProtobufMessage.* *.tsbuildinfo test-report*.html yarn.lock package-lock.json rust-client/package-lock.json rust-client/Cargo.lock",
         "prebuild": "npm ci && npm run clean:build",
         "build": "npm run build-protobuf && npm run build:rust-client && npm run build:ts",
         "build:release": "npm run prereq && npm run build-protobuf && npm run build:rust-client:release && npm run build:ts",
@@ -82,7 +83,7 @@
         "staged": "lint-staged",
         "prereq": "npm ci",
         "artifacts": "napi artifacts",
-        "prepublishOnly": "cd ../.. && napi prepublish --config npm/glide/package.json -t npm --skip-gh-release",
+        "prepublishOnly": "echo \"napi prepublish is run explicitly in CI before npm publish\"",
         "docs": "npm run build && ./docs/build-docs"
     },
     "devDependencies": {
@@ -131,19 +132,17 @@
     "engines": {
         "node": ">=20"
     },
+    "workspaces": [],
     "napi": {
-        "binaryName": "valkey-glide",
-        "triples": {
-            "defaults": false,
-            "additional": [
-                "x86_64-apple-darwin",
-                "aarch64-apple-darwin",
-                "x86_64-unknown-linux-gnu",
-                "aarch64-unknown-linux-gnu",
-                "x86_64-unknown-linux-musl",
-                "aarch64-unknown-linux-musl",
-                "x86_64-pc-windows-msvc"
-            ]
-        }
+        "binaryName": "speedkey",
+        "targets": [
+            "x86_64-apple-darwin",
+            "aarch64-apple-darwin",
+            "x86_64-unknown-linux-gnu",
+            "aarch64-unknown-linux-gnu",
+            "x86_64-unknown-linux-musl",
+            "aarch64-unknown-linux-musl",
+            "x86_64-pc-windows-msvc"
+        ]
     }
 }

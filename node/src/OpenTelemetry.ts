@@ -113,7 +113,7 @@ export class OpenTelemetry {
      *
      * Example usage:
      * ```typescript
-     * import { OpenTelemetry, GlideOpenTelemetryConfig } from "@valkey/valkey-glide";
+     * import { OpenTelemetry, GlideOpenTelemetryConfig } from "@glidemq/speedkey";
      * import { trace } from "@opentelemetry/api";
      *
      * const config: GlideOpenTelemetryConfig = {

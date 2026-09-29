@@ -29,6 +29,17 @@
         "languages": ["node"]
     },
     {
+        "OS": "macos",
+        "NAMED_OS": "darwin",
+        "RUNNER": "macos-15-intel",
+        "CD_RUNNER": "macos-15",
+        "ARCH": "x64",
+        "TARGET": "x86_64-apple-darwin",
+        "PACKAGE_MANAGERS": ["npm"],
+        "languages": [],
+        "comment": "CI tests are skipped on this platform (upstream PR #3482); CD still builds it so the darwin-x64 artifact exists for napi artifacts."
+    },
+    {
         "OS": "ubuntu",
         "NAMED_OS": "linux",
         "ARCH": "arm64",
