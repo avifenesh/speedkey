@@ -5138,7 +5138,7 @@ export function runBaseTests(config: {
                 ]);
 
                 // Now it should throw a NOSCRIPT error
-                await expect(client.invokeScript(script2)).rejects.toThrowError(
+                await expect(client.invokeScript(script2)).rejects.toThrow(
                     /NoScriptError/,
                 );
             }, protocol);
@@ -9756,7 +9756,7 @@ export function runBaseTests(config: {
                     };
                     await expect(
                         client.flushall({ route: replicaRoute }),
-                    ).rejects.toThrowError();
+                    ).rejects.toThrow();
                 }
             }, protocol);
         },

@@ -279,7 +279,7 @@ describe("GlideClusterClient", () => {
                         host: "foo",
                     },
                 }),
-            ).rejects.toThrowError(RequestError);
+            ).rejects.toThrow(RequestError);
         },
         TIMEOUT,
     );
@@ -2351,7 +2351,7 @@ describe("GlideClusterClient", () => {
                             advancedConfiguration: { connectionTimeout: 100 }, // 100ms connection timeout
                             ...config, // Include the rest of the config
                         }),
-                    ).rejects.toThrowError(/timed?\s*out/i); // Ensure it throws a timeout error
+                    ).rejects.toThrow(/timed?\s*out/i); // Ensure it throws a timeout error
                 };
 
                 // Function that verifies that a larger connection timeout allows connection
@@ -2416,7 +2416,7 @@ describe("GlideClusterClient", () => {
                         advancedConfiguration: { connectionTimeout: 3000 },
                         ...config,
                     }),
-                ).rejects.toThrowError(/timed?\s*out/i);
+                ).rejects.toThrow(/timed?\s*out/i);
 
                 const elapsed = Date.now() - startTime;
 
