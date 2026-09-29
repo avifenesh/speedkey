@@ -1954,8 +1954,6 @@ describe("GlideClient", () => {
                 protocol,
                 configOverrides,
             );
-            client = await GlideClient.createClient(config);
-
             const configNew = getClientConfigurationOption(
                 azCluster.getAddresses(),
                 protocol,
