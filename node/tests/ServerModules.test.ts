@@ -19,6 +19,7 @@ import {
     FtAggregateReturnType,
     FtSearchOptions,
     FtSearchReturnType,
+    GlideBf,
     GlideClusterClient,
     GlideFt,
     GlideJson,
@@ -4352,5 +4353,798 @@ describe("Server Module Tests", () => {
             ).rejects.toThrow();
             await GlideFt.dropindex(client, index);
         });
+    });
+
+    describe("GlideBf", () => {
+        let client: GlideClusterClient;
+
+        afterEach(async () => {
+            await flushAndCloseClient(true, cluster?.getAddresses(), client);
+        });
+
+        it(
+            "reserve + info",
+            async () => {
+                client = await GlideClusterClient.createClient(
+                    getClientConfigurationOption(
+                        cluster.getAddresses(),
+                        ProtocolVersion.RESP3,
+                    ),
+                );
+
+                const key = getRandomKey();
+                expect(
+                    await GlideBf.reserve(client, key, 0.001, 10000),
+                ).toEqual("OK");
+
+                const info = await GlideBf.info(client, key);
+                expect(info.capacity).toEqual(10000);
+                expect(info.numberOfFilters).toBeGreaterThanOrEqual(1);
+                expect(info.numberOfItems).toEqual(0);
+                expect(info.size).toBeGreaterThan(0);
+
+                await client.del([key]);
+            },
+            TIMEOUT,
+        );
+
+        it(
+            "add returns boolean",
+            async () => {
+                client = await GlideClusterClient.createClient(
+                    getClientConfigurationOption(
+                        cluster.getAddresses(),
+                        ProtocolVersion.RESP3,
+                    ),
+                );
+
+                const key = getRandomKey();
+
+                // First add should return true (new item)
+                expect(await GlideBf.add(client, key, "item1")).toBe(true);
+                // Second add of same item should return false (already exists)
+                expect(await GlideBf.add(client, key, "item1")).toBe(false);
+                // Adding a different item should return true
+                expect(await GlideBf.add(client, key, "item2")).toBe(true);
+
+                await client.del([key]);
+            },
+            TIMEOUT,
+        );
+
+        it(
+            "madd",
+            async () => {
+                client = await GlideClusterClient.createClient(
+                    getClientConfigurationOption(
+                        cluster.getAddresses(),
+                        ProtocolVersion.RESP3,
+                    ),
+                );
+
+                const key = getRandomKey();
+
+                // Add single item first
+                expect(await GlideBf.add(client, key, "item1")).toBe(true);
+
+                // madd with mix of new and existing items
+                const results = await GlideBf.madd(client, key, [
+                    "item1",
+                    "item2",
+                    "item3",
+                ]);
+                expect(results).toEqual([false, true, true]);
+
+                await client.del([key]);
+            },
+            TIMEOUT,
+        );
+
+        it(
+            "exists",
+            async () => {
+                client = await GlideClusterClient.createClient(
+                    getClientConfigurationOption(
+                        cluster.getAddresses(),
+                        ProtocolVersion.RESP3,
+                    ),
+                );
+
+                const key = getRandomKey();
+                await GlideBf.add(client, key, "item1");
+
+                expect(await GlideBf.exists(client, key, "item1")).toBe(true);
+                expect(await GlideBf.exists(client, key, "missing")).toBe(
+                    false,
+                );
+
+                await client.del([key]);
+            },
+            TIMEOUT,
+        );
+
+        it(
+            "mexists",
+            async () => {
+                client = await GlideClusterClient.createClient(
+                    getClientConfigurationOption(
+                        cluster.getAddresses(),
+                        ProtocolVersion.RESP3,
+                    ),
+                );
+
+                const key = getRandomKey();
+                await GlideBf.madd(client, key, ["item1", "item2"]);
+
+                const results = await GlideBf.mexists(client, key, [
+                    "item1",
+                    "item2",
+                    "missing",
+                ]);
+                expect(results).toEqual([true, true, false]);
+
+                await client.del([key]);
+            },
+            TIMEOUT,
+        );
+
+        it(
+            "insert with default options",
+            async () => {
+                client = await GlideClusterClient.createClient(
+                    getClientConfigurationOption(
+                        cluster.getAddresses(),
+                        ProtocolVersion.RESP3,
+                    ),
+                );
+
+                const key = getRandomKey();
+
+                // Insert creates filter if it doesn't exist
+                const results = await GlideBf.insert(client, key, [
+                    "item1",
+                    "item2",
+                ]);
+                expect(results).toEqual([true, true]);
+
+                // Inserting existing items
+                const results2 = await GlideBf.insert(client, key, [
+                    "item1",
+                    "item3",
+                ]);
+                expect(results2).toEqual([false, true]);
+
+                await client.del([key]);
+            },
+            TIMEOUT,
+        );
+
+        it(
+            "insert with NOCREATE",
+            async () => {
+                client = await GlideClusterClient.createClient(
+                    getClientConfigurationOption(
+                        cluster.getAddresses(),
+                        ProtocolVersion.RESP3,
+                    ),
+                );
+
+                const key = getRandomKey();
+
+                // NOCREATE on non-existent key should throw
+                await expect(
+                    GlideBf.insert(client, key, ["item1"], { noCreate: true }),
+                ).rejects.toThrow(RequestError);
+
+                await client.del([key]);
+            },
+            TIMEOUT,
+        );
+
+        it(
+            "insert with CAPACITY and ERROR",
+            async () => {
+                client = await GlideClusterClient.createClient(
+                    getClientConfigurationOption(
+                        cluster.getAddresses(),
+                        ProtocolVersion.RESP3,
+                    ),
+                );
+
+                const key = getRandomKey();
+
+                const results = await GlideBf.insert(
+                    client,
+                    key,
+                    ["item1", "item2"],
+                    {
+                        capacity: 5000,
+                        errorRate: 0.01,
+                    },
+                );
+                expect(results).toEqual([true, true]);
+
+                const info = await GlideBf.info(client, key);
+                expect(info.capacity).toEqual(5000);
+
+                await client.del([key]);
+            },
+            TIMEOUT,
+        );
+
+        it(
+            "card",
+            async () => {
+                client = await GlideClusterClient.createClient(
+                    getClientConfigurationOption(
+                        cluster.getAddresses(),
+                        ProtocolVersion.RESP3,
+                    ),
+                );
+
+                const key = getRandomKey();
+
+                // Non-existent key returns 0
+                expect(await GlideBf.card(client, key)).toEqual(0);
+
+                await GlideBf.madd(client, key, ["a", "b", "c"]);
+                expect(await GlideBf.card(client, key)).toEqual(3);
+
+                // Adding duplicate should not increase cardinality
+                await GlideBf.add(client, key, "a");
+                expect(await GlideBf.card(client, key)).toEqual(3);
+
+                await client.del([key]);
+            },
+            TIMEOUT,
+        );
+
+        it(
+            "reserve with EXPANSION",
+            async () => {
+                client = await GlideClusterClient.createClient(
+                    getClientConfigurationOption(
+                        cluster.getAddresses(),
+                        ProtocolVersion.RESP3,
+                    ),
+                );
+
+                const key = getRandomKey();
+                expect(
+                    await GlideBf.reserve(client, key, 0.01, 100, {
+                        expansion: 4,
+                    }),
+                ).toEqual("OK");
+
+                const info = await GlideBf.info(client, key);
+                expect(info.capacity).toEqual(100);
+                expect(info.expansionRate).toEqual(4);
+
+                await client.del([key]);
+            },
+            TIMEOUT,
+        );
+
+        it(
+            "reserve with NONSCALING",
+            async () => {
+                client = await GlideClusterClient.createClient(
+                    getClientConfigurationOption(
+                        cluster.getAddresses(),
+                        ProtocolVersion.RESP3,
+                    ),
+                );
+
+                const key = getRandomKey();
+                expect(
+                    await GlideBf.reserve(client, key, 0.01, 100, {
+                        nonScaling: true,
+                    }),
+                ).toEqual("OK");
+
+                const info = await GlideBf.info(client, key);
+                expect(info.capacity).toEqual(100);
+                // A non-scaling filter has no expansion rate: valkey-bloom returns nil
+                expect(info.expansionRate).toBeNull();
+
+                await client.del([key]);
+            },
+            TIMEOUT,
+        );
+
+        it(
+            "reserve duplicate key error",
+            async () => {
+                client = await GlideClusterClient.createClient(
+                    getClientConfigurationOption(
+                        cluster.getAddresses(),
+                        ProtocolVersion.RESP3,
+                    ),
+                );
+
+                const key = getRandomKey();
+                expect(await GlideBf.reserve(client, key, 0.01, 100)).toEqual(
+                    "OK",
+                );
+
+                // Reserving on an existing key should throw
+                await expect(
+                    GlideBf.reserve(client, key, 0.01, 100),
+                ).rejects.toThrow(RequestError);
+
+                await client.del([key]);
+            },
+            TIMEOUT,
+        );
+
+        it(
+            "load with invalid data throws",
+            async () => {
+                client = await GlideClusterClient.createClient(
+                    getClientConfigurationOption(
+                        cluster.getAddresses(),
+                        ProtocolVersion.RESP3,
+                    ),
+                );
+
+                const key = getRandomKey();
+
+                // Loading invalid data should throw an error
+                await expect(
+                    GlideBf.load(client, key, Buffer.from("invalid_data")),
+                ).rejects.toThrow(RequestError);
+
+                await client.del([key]);
+            },
+            TIMEOUT,
+        );
+
+        // --- Edge case tests: reserve boundary values ---
+
+        it(
+            "reserve with errorRate 0 throws",
+            async () => {
+                client = await GlideClusterClient.createClient(
+                    getClientConfigurationOption(
+                        cluster.getAddresses(),
+                        ProtocolVersion.RESP3,
+                    ),
+                );
+
+                const key = getRandomKey();
+
+                // errorRate 0 is outside the valid range (0, 1) exclusive
+                await expect(
+                    GlideBf.reserve(client, key, 0, 100),
+                ).rejects.toThrow(RequestError);
+
+                await client.del([key]);
+            },
+            TIMEOUT,
+        );
+
+        it(
+            "reserve with errorRate 1 throws",
+            async () => {
+                client = await GlideClusterClient.createClient(
+                    getClientConfigurationOption(
+                        cluster.getAddresses(),
+                        ProtocolVersion.RESP3,
+                    ),
+                );
+
+                const key = getRandomKey();
+
+                // errorRate 1 is outside the valid range (0, 1) exclusive
+                await expect(
+                    GlideBf.reserve(client, key, 1, 100),
+                ).rejects.toThrow(RequestError);
+
+                await client.del([key]);
+            },
+            TIMEOUT,
+        );
+
+        it(
+            "reserve with very small errorRate (0.0001)",
+            async () => {
+                client = await GlideClusterClient.createClient(
+                    getClientConfigurationOption(
+                        cluster.getAddresses(),
+                        ProtocolVersion.RESP3,
+                    ),
+                );
+
+                const key = getRandomKey();
+
+                // Very small error rate should create a larger filter
+                expect(
+                    await GlideBf.reserve(client, key, 0.0001, 1000),
+                ).toEqual("OK");
+
+                const info = await GlideBf.info(client, key);
+                expect(info.capacity).toEqual(1000);
+                // A lower error rate requires more bits per item, so size should be larger
+                expect(info.size).toBeGreaterThan(0);
+
+                await client.del([key]);
+            },
+            TIMEOUT,
+        );
+
+        it(
+            "reserve with capacity 0 throws",
+            async () => {
+                client = await GlideClusterClient.createClient(
+                    getClientConfigurationOption(
+                        cluster.getAddresses(),
+                        ProtocolVersion.RESP3,
+                    ),
+                );
+
+                const key = getRandomKey();
+
+                await expect(
+                    GlideBf.reserve(client, key, 0.01, 0),
+                ).rejects.toThrow(RequestError);
+
+                await client.del([key]);
+            },
+            TIMEOUT,
+        );
+
+        it(
+            "reserve with negative capacity throws",
+            async () => {
+                client = await GlideClusterClient.createClient(
+                    getClientConfigurationOption(
+                        cluster.getAddresses(),
+                        ProtocolVersion.RESP3,
+                    ),
+                );
+
+                const key = getRandomKey();
+
+                await expect(
+                    GlideBf.reserve(client, key, 0.01, -10),
+                ).rejects.toThrow(RequestError);
+
+                await client.del([key]);
+            },
+            TIMEOUT,
+        );
+
+        // --- Edge case tests: add/exists with special values ---
+
+        it(
+            "add empty string as item",
+            async () => {
+                client = await GlideClusterClient.createClient(
+                    getClientConfigurationOption(
+                        cluster.getAddresses(),
+                        ProtocolVersion.RESP3,
+                    ),
+                );
+
+                const key = getRandomKey();
+
+                // Empty string is a valid item
+                expect(await GlideBf.add(client, key, "")).toBe(true);
+                expect(await GlideBf.exists(client, key, "")).toBe(true);
+
+                // Adding same empty string again should return false
+                expect(await GlideBf.add(client, key, "")).toBe(false);
+
+                await client.del([key]);
+            },
+            TIMEOUT,
+        );
+
+        it(
+            "add very long string (10KB)",
+            async () => {
+                client = await GlideClusterClient.createClient(
+                    getClientConfigurationOption(
+                        cluster.getAddresses(),
+                        ProtocolVersion.RESP3,
+                    ),
+                );
+
+                const key = getRandomKey();
+                const longItem = "x".repeat(10240); // 10KB string
+
+                expect(await GlideBf.add(client, key, longItem)).toBe(true);
+                expect(await GlideBf.exists(client, key, longItem)).toBe(true);
+
+                await client.del([key]);
+            },
+            TIMEOUT,
+        );
+
+        it(
+            "madd with duplicates in same call",
+            async () => {
+                client = await GlideClusterClient.createClient(
+                    getClientConfigurationOption(
+                        cluster.getAddresses(),
+                        ProtocolVersion.RESP3,
+                    ),
+                );
+
+                const key = getRandomKey();
+
+                // When duplicates appear in the same madd call,
+                // the first occurrence is new (true), subsequent are not (false)
+                const results = await GlideBf.madd(client, key, [
+                    "dup",
+                    "dup",
+                    "dup",
+                ]);
+                expect(results[0]).toBe(true);
+                expect(results[1]).toBe(false);
+                expect(results[2]).toBe(false);
+
+                // Cardinality should be 1
+                expect(await GlideBf.card(client, key)).toEqual(1);
+
+                await client.del([key]);
+            },
+            TIMEOUT,
+        );
+
+        // --- Edge case tests: operations on non-existent keys ---
+
+        it(
+            "add to non-existent key auto-creates filter",
+            async () => {
+                client = await GlideClusterClient.createClient(
+                    getClientConfigurationOption(
+                        cluster.getAddresses(),
+                        ProtocolVersion.RESP3,
+                    ),
+                );
+
+                const key = getRandomKey();
+
+                // BF.ADD auto-creates the filter if it does not exist
+                expect(await GlideBf.add(client, key, "auto_item")).toBe(true);
+
+                // Verify the filter was created via info
+                const info = await GlideBf.info(client, key);
+                expect(info.numberOfItems).toEqual(1);
+                expect(info.capacity).toBeGreaterThan(0);
+
+                await client.del([key]);
+            },
+            TIMEOUT,
+        );
+
+        it(
+            "exists on non-existent key returns false",
+            async () => {
+                client = await GlideClusterClient.createClient(
+                    getClientConfigurationOption(
+                        cluster.getAddresses(),
+                        ProtocolVersion.RESP3,
+                    ),
+                );
+
+                const key = getRandomKey();
+
+                // BF.EXISTS on a non-existent key should return false
+                expect(await GlideBf.exists(client, key, "anything")).toBe(
+                    false,
+                );
+            },
+            TIMEOUT,
+        );
+
+        it(
+            "info on non-existent key throws",
+            async () => {
+                client = await GlideClusterClient.createClient(
+                    getClientConfigurationOption(
+                        cluster.getAddresses(),
+                        ProtocolVersion.RESP3,
+                    ),
+                );
+
+                const key = getRandomKey();
+
+                await expect(GlideBf.info(client, key)).rejects.toThrow(
+                    RequestError,
+                );
+            },
+            TIMEOUT,
+        );
+
+        it(
+            "card on non-existent key returns 0",
+            async () => {
+                client = await GlideClusterClient.createClient(
+                    getClientConfigurationOption(
+                        cluster.getAddresses(),
+                        ProtocolVersion.RESP3,
+                    ),
+                );
+
+                const key = getRandomKey();
+
+                expect(await GlideBf.card(client, key)).toEqual(0);
+            },
+            TIMEOUT,
+        );
+
+        // --- Edge case tests: false positive rate verification ---
+
+        it(
+            "false positive rate within bounds",
+            async () => {
+                client = await GlideClusterClient.createClient(
+                    getClientConfigurationOption(
+                        cluster.getAddresses(),
+                        ProtocolVersion.RESP3,
+                    ),
+                );
+
+                const key = getRandomKey();
+                const errorRate = 0.05; // 5%
+                const numItems = 1000;
+
+                await GlideBf.reserve(client, key, errorRate, numItems);
+
+                // Add 1000 items with prefix "in_"
+                const addItems: string[] = [];
+
+                for (let i = 0; i < numItems; i++) {
+                    addItems.push(`in_${i}`);
+                }
+
+                // Add in batches
+                for (let i = 0; i < addItems.length; i += 100) {
+                    await GlideBf.madd(client, key, addItems.slice(i, i + 100));
+                }
+
+                // Check 1000 items that were NOT added (prefix "out_")
+                let falsePositives = 0;
+
+                for (let i = 0; i < numItems; i++) {
+                    const exists = await GlideBf.exists(
+                        client,
+                        key,
+                        `out_${i}`,
+                    );
+
+                    if (exists) {
+                        falsePositives++;
+                    }
+                }
+
+                const observedRate = falsePositives / numItems;
+
+                // Allow 2x the configured error rate as slack for statistical variance
+                expect(observedRate).toBeLessThan(errorRate * 2);
+
+                await client.del([key]);
+            },
+            TIMEOUT * 2,
+        );
+
+        // --- Edge case tests: insert edge cases ---
+
+        it(
+            "insert with noCreate on existing filter works",
+            async () => {
+                client = await GlideClusterClient.createClient(
+                    getClientConfigurationOption(
+                        cluster.getAddresses(),
+                        ProtocolVersion.RESP3,
+                    ),
+                );
+
+                const key = getRandomKey();
+
+                // Create the filter first
+                expect(await GlideBf.reserve(client, key, 0.01, 100)).toEqual(
+                    "OK",
+                );
+
+                // noCreate on an existing filter should succeed
+                const results = await GlideBf.insert(
+                    client,
+                    key,
+                    ["x", "y", "z"],
+                    { noCreate: true },
+                );
+                expect(results).toEqual([true, true, true]);
+
+                // Verify items exist
+                const exists = await GlideBf.mexists(client, key, [
+                    "x",
+                    "y",
+                    "z",
+                ]);
+                expect(exists).toEqual([true, true, true]);
+
+                await client.del([key]);
+            },
+            TIMEOUT,
+        );
+
+        it(
+            "insert creates filter if not exists",
+            async () => {
+                client = await GlideClusterClient.createClient(
+                    getClientConfigurationOption(
+                        cluster.getAddresses(),
+                        ProtocolVersion.RESP3,
+                    ),
+                );
+
+                const key = getRandomKey();
+
+                // insert without prior reserve should auto-create
+                const results = await GlideBf.insert(client, key, [
+                    "alpha",
+                    "beta",
+                ]);
+                expect(results).toEqual([true, true]);
+
+                // Verify filter was created
+                const info = await GlideBf.info(client, key);
+                expect(info.numberOfItems).toEqual(2);
+
+                await client.del([key]);
+            },
+            TIMEOUT,
+        );
+
+        // --- Edge case tests: concurrent adds ---
+
+        it(
+            "concurrent adds from two clients both succeed",
+            async () => {
+                client = await GlideClusterClient.createClient(
+                    getClientConfigurationOption(
+                        cluster.getAddresses(),
+                        ProtocolVersion.RESP3,
+                    ),
+                );
+
+                const client2 = await GlideClusterClient.createClient(
+                    getClientConfigurationOption(
+                        cluster.getAddresses(),
+                        ProtocolVersion.RESP3,
+                    ),
+                );
+
+                const key = getRandomKey();
+
+                try {
+                    await GlideBf.reserve(client, key, 0.01, 1000);
+
+                    // Concurrently add items from two clients
+                    const [result1, result2] = await Promise.all([
+                        GlideBf.add(client, key, "concurrent_item"),
+                        GlideBf.add(client2, key, "concurrent_item"),
+                    ]);
+
+                    // One should be true (new) and one should be false (already existed),
+                    // or both true if processed truly simultaneously (race).
+                    // In either case, the item must exist after both complete.
+                    expect(
+                        await GlideBf.exists(client, key, "concurrent_item"),
+                    ).toBe(true);
+
+                    // At least one of the adds must have reported new
+                    expect(result1 || result2).toBe(true);
+
+                    await client.del([key]);
+                } finally {
+                    client2.close();
+                }
+            },
+            TIMEOUT,
+        );
     });
 });
