@@ -14,6 +14,7 @@ import { BufferReader, BufferWriter } from "protobufjs/minimal";
 import { ValkeyCluster } from "../../utils/TestUtils.js";
 import {
     Batch,
+    ClosingError,
     Decoder,
     FlushMode,
     FunctionRestorePolicy,
@@ -2008,6 +2009,94 @@ describe("GlideClient", () => {
             expect(await clientFalse.set("key3", "value3")).toBe("OK");
             expect(await clientFalse.get("key3")).toBe("value3");
             clientFalse.close();
+        },
+        TIMEOUT,
+    );
+    it(
+        "close detaches a client with a blocked command from the server",
+        async () => {
+            const config = getClientConfigurationOption(
+                cluster.getAddresses(),
+                ProtocolVersion.RESP3,
+            );
+            const observer = await GlideClient.createClient(config);
+            const blocked = await GlideClient.createClient(config);
+            const key = getRandomKey();
+            const group = getRandomKey();
+            const blockedId = await blocked.clientId();
+
+            const isAttached = async () => {
+                const list = (await observer.customCommand([
+                    "CLIENT",
+                    "LIST",
+                ])) as string;
+                return list
+                    .split("\n")
+                    .some((line) => line.startsWith(`id=${blockedId} `));
+            };
+
+            const isBlocked = async () => {
+                const list = (await observer.customCommand([
+                    "CLIENT",
+                    "LIST",
+                ])) as string;
+                return list
+                    .split("\n")
+                    .some(
+                        (line) =>
+                            line.startsWith(`id=${blockedId} `) &&
+                            / flags=\S*b/.test(line),
+                    );
+            };
+
+            const poll = async (
+                predicate: () => Promise<boolean>,
+                deadlineMs: number,
+            ) => {
+                const deadline = Date.now() + deadlineMs;
+
+                while (!(await predicate()) && Date.now() < deadline) {
+                    await new Promise((resolve) => setTimeout(resolve, 5));
+                }
+
+                return predicate();
+            };
+
+            try {
+                expect(
+                    await observer.xgroupCreate(key, group, "$", {
+                        mkStream: true,
+                    }),
+                ).toEqual("OK");
+
+                const pending = blocked.xreadgroup(
+                    group,
+                    "consumer",
+                    { [key]: ">" },
+                    { block: 10000 },
+                );
+                expect(await poll(isBlocked, 2000)).toBe(true);
+
+                blocked.close();
+                await expect(pending).rejects.toThrow(ClosingError);
+
+                // The server must drop the connection promptly, not when BLOCK expires.
+                const closedAt = Date.now();
+                expect(
+                    await poll(async () => !(await isAttached()), 1000),
+                ).toBe(true);
+                expect(Date.now() - closedAt).toBeLessThan(1000);
+
+                // An entry added now must not be claimed by the closed consumer.
+                expect(
+                    await observer.xadd(key, [["field", "value"]]),
+                ).not.toBeNull();
+                const [pendingCount] = await observer.xpending(key, group);
+                expect(pendingCount).toEqual(0);
+            } finally {
+                await observer.del([key]);
+                observer.close();
+            }
         },
         TIMEOUT,
     );
