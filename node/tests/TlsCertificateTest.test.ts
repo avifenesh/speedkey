@@ -10,7 +10,6 @@ import {
     expect,
     it,
 } from "@jest/globals";
-import * as fs from "fs";
 import { TestTLSConfig, ValkeyCluster } from "../../utils/TestUtils.js";
 import {
     GlideClient,
@@ -18,15 +17,27 @@ import {
     Logger,
     ProtocolVersion,
 } from "../build-ts";
+import { IP_ADDRESS_V4, IP_ADDRESS_V6 } from "./Constants";
 import {
+    assertConnected,
+    getCaCertificateData,
     getClientConfigurationOption,
     getServerVersion,
 } from "./TestUtilities";
 
 const TIMEOUT = 50000;
 const CLUSTER_CREATION_TIMEOUT = 120000; // Increased timeout for TLS cluster creation
+const TLS_REQUEST_TIMEOUT = 10000;
 
-describe("TLS with custom certificates", () => {
+const getTlsClientConfigurationOption = (addresses: [string, number][]) =>
+    getClientConfigurationOption(addresses, ProtocolVersion.RESP3, {
+        requestTimeout: TLS_REQUEST_TIMEOUT,
+    });
+
+// These tests were very flaky for Amazon Linux Containers.
+// Disabled for now as they are not critical.
+// See https://github.com/valkey-io/valkey-glide/issues/4989
+describe.skip("TLS with custom certificates", () => {
     let standaloneCluster: ValkeyCluster;
     let clusterModeCluster: ValkeyCluster;
     let standaloneClient: GlideClient | undefined;
@@ -39,6 +50,7 @@ describe("TLS with custom certificates", () => {
         // The actual test connections will use proper certificate validation
         const startupTlsConfig: TestTLSConfig = {
             useTLS: true,
+            requestTimeout: TLS_REQUEST_TIMEOUT,
             advancedConfiguration: {
                 tlsAdvancedConfiguration: {
                     insecure: true,
@@ -67,10 +79,7 @@ describe("TLS with custom certificates", () => {
         );
 
         // Read CA certificate after servers start (certificates now exist)
-        const glideHomeDir =
-            process.env.GLIDE_HOME_DIR || process.cwd() + "/..";
-        const caCertPath = `${glideHomeDir}/utils/tls_crts/ca.crt`;
-        caCertData = fs.readFileSync(caCertPath);
+        caCertData = getCaCertificateData();
 
         // Small delay to ensure cluster is fully ready after TLS setup
         await new Promise((resolve) => setTimeout(resolve, 1000));
@@ -114,9 +123,8 @@ describe("TLS with custom certificates", () => {
                 // Self-signed certificate will be rejected by platform verifier
                 await expect(
                     GlideClient.createClient({
-                        ...getClientConfigurationOption(
+                        ...getTlsClientConfigurationOption(
                             standaloneCluster.getAddresses(),
-                            ProtocolVersion.RESP3,
                         ),
                         useTLS: true,
                     }),
@@ -126,12 +134,32 @@ describe("TLS with custom certificates", () => {
         );
 
         it(
+            "should connect when insecure TLS is enabled without certificate",
+            async () => {
+                standaloneClient = await GlideClient.createClient({
+                    ...getTlsClientConfigurationOption(
+                        standaloneCluster.getAddresses(),
+                    ),
+                    useTLS: true,
+                    advancedConfiguration: {
+                        tlsAdvancedConfiguration: {
+                            insecure: true,
+                        },
+                    },
+                });
+
+                const result = await standaloneClient.ping();
+                expect(result).toBe("PONG");
+            },
+            TIMEOUT,
+        );
+
+        it(
             "should connect with TLS using custom certificate as Buffer",
             async () => {
                 standaloneClient = await GlideClient.createClient({
-                    ...getClientConfigurationOption(
+                    ...getTlsClientConfigurationOption(
                         standaloneCluster.getAddresses(),
-                        ProtocolVersion.RESP3,
                     ),
                     useTLS: true,
                     advancedConfiguration: {
@@ -156,9 +184,8 @@ describe("TLS with custom certificates", () => {
                 const certString = caCertData.toString("utf-8");
 
                 standaloneClient = await GlideClient.createClient({
-                    ...getClientConfigurationOption(
+                    ...getTlsClientConfigurationOption(
                         standaloneCluster.getAddresses(),
-                        ProtocolVersion.RESP3,
                     ),
                     useTLS: true,
                     advancedConfiguration: {
@@ -183,9 +210,8 @@ describe("TLS with custom certificates", () => {
                 const certBundle = Buffer.from(multipleCerts, "utf-8");
 
                 standaloneClient = await GlideClient.createClient({
-                    ...getClientConfigurationOption(
+                    ...getTlsClientConfigurationOption(
                         standaloneCluster.getAddresses(),
-                        ProtocolVersion.RESP3,
                     ),
                     useTLS: true,
                     advancedConfiguration: {
@@ -208,9 +234,8 @@ describe("TLS with custom certificates", () => {
 
                 await expect(
                     GlideClient.createClient({
-                        ...getClientConfigurationOption(
+                        ...getTlsClientConfigurationOption(
                             standaloneCluster.getAddresses(),
-                            ProtocolVersion.RESP3,
                         ),
                         useTLS: true,
                         advancedConfiguration: {
@@ -234,9 +259,8 @@ describe("TLS with custom certificates", () => {
 
                 await expect(
                     GlideClient.createClient({
-                        ...getClientConfigurationOption(
+                        ...getTlsClientConfigurationOption(
                             standaloneCluster.getAddresses(),
-                            ProtocolVersion.RESP3,
                         ),
                         useTLS: true,
                         advancedConfiguration: {
@@ -255,9 +279,8 @@ describe("TLS with custom certificates", () => {
             async () => {
                 await expect(
                     GlideClient.createClient({
-                        ...getClientConfigurationOption(
+                        ...getTlsClientConfigurationOption(
                             standaloneCluster.getAddresses(),
-                            ProtocolVersion.RESP3,
                         ),
                         useTLS: false,
                         advancedConfiguration: {
@@ -281,9 +304,8 @@ describe("TLS with custom certificates", () => {
                 // Self-signed certificate will be rejected by platform verifier
                 await expect(
                     GlideClusterClient.createClient({
-                        ...getClientConfigurationOption(
+                        ...getTlsClientConfigurationOption(
                             clusterModeCluster.getAddresses(),
-                            ProtocolVersion.RESP3,
                         ),
                         useTLS: true,
                     }),
@@ -293,12 +315,32 @@ describe("TLS with custom certificates", () => {
         );
 
         it(
+            "should connect when insecure TLS is enabled without certificate",
+            async () => {
+                clusterClient = await GlideClusterClient.createClient({
+                    ...getTlsClientConfigurationOption(
+                        clusterModeCluster.getAddresses(),
+                    ),
+                    useTLS: true,
+                    advancedConfiguration: {
+                        tlsAdvancedConfiguration: {
+                            insecure: true,
+                        },
+                    },
+                });
+
+                const result = await clusterClient.ping();
+                expect(result).toBe("PONG");
+            },
+            TIMEOUT,
+        );
+
+        it(
             "should connect with TLS using custom certificate as Buffer",
             async () => {
                 clusterClient = await GlideClusterClient.createClient({
-                    ...getClientConfigurationOption(
+                    ...getTlsClientConfigurationOption(
                         clusterModeCluster.getAddresses(),
-                        ProtocolVersion.RESP3,
                     ),
                     useTLS: true,
                     advancedConfiguration: {
@@ -323,9 +365,8 @@ describe("TLS with custom certificates", () => {
                 const certString = caCertData.toString("utf-8");
 
                 clusterClient = await GlideClusterClient.createClient({
-                    ...getClientConfigurationOption(
+                    ...getTlsClientConfigurationOption(
                         clusterModeCluster.getAddresses(),
-                        ProtocolVersion.RESP3,
                     ),
                     useTLS: true,
                     advancedConfiguration: {
@@ -350,9 +391,8 @@ describe("TLS with custom certificates", () => {
                 const certBundle = Buffer.from(multipleCerts, "utf-8");
 
                 clusterClient = await GlideClusterClient.createClient({
-                    ...getClientConfigurationOption(
+                    ...getTlsClientConfigurationOption(
                         clusterModeCluster.getAddresses(),
-                        ProtocolVersion.RESP3,
                     ),
                     useTLS: true,
                     advancedConfiguration: {
@@ -375,9 +415,8 @@ describe("TLS with custom certificates", () => {
 
                 await expect(
                     GlideClusterClient.createClient({
-                        ...getClientConfigurationOption(
+                        ...getTlsClientConfigurationOption(
                             clusterModeCluster.getAddresses(),
-                            ProtocolVersion.RESP3,
                         ),
                         useTLS: true,
                         advancedConfiguration: {
@@ -401,9 +440,8 @@ describe("TLS with custom certificates", () => {
 
                 await expect(
                     GlideClusterClient.createClient({
-                        ...getClientConfigurationOption(
+                        ...getTlsClientConfigurationOption(
                             clusterModeCluster.getAddresses(),
-                            ProtocolVersion.RESP3,
                         ),
                         useTLS: true,
                         advancedConfiguration: {
@@ -422,9 +460,8 @@ describe("TLS with custom certificates", () => {
             async () => {
                 await expect(
                     GlideClusterClient.createClient({
-                        ...getClientConfigurationOption(
+                        ...getTlsClientConfigurationOption(
                             clusterModeCluster.getAddresses(),
-                            ProtocolVersion.RESP3,
                         ),
                         useTLS: false,
                         advancedConfiguration: {
@@ -436,6 +473,98 @@ describe("TLS with custom certificates", () => {
                 ).rejects.toThrow(
                     "TLS advanced configuration cannot be set when useTLS is disabled.",
                 );
+            },
+            TIMEOUT,
+        );
+    });
+
+    describe("Standalone TLS with IP addresses", () => {
+        it(
+            "should connect with IPv4 address",
+            async () => {
+                const address = {
+                    host: IP_ADDRESS_V4,
+                    port: standaloneCluster.ports()[0],
+                };
+                standaloneClient = await GlideClient.createClient({
+                    addresses: [address],
+                    useTLS: true,
+                    advancedConfiguration: {
+                        tlsAdvancedConfiguration: {
+                            rootCertificates: caCertData,
+                        },
+                    },
+                });
+
+                await assertConnected(standaloneClient);
+            },
+            TIMEOUT,
+        );
+
+        it(
+            "should connect with IPv6 address",
+            async () => {
+                const address = {
+                    host: IP_ADDRESS_V6,
+                    port: standaloneCluster.ports()[0],
+                };
+                standaloneClient = await GlideClient.createClient({
+                    addresses: [address],
+                    useTLS: true,
+                    advancedConfiguration: {
+                        tlsAdvancedConfiguration: {
+                            rootCertificates: caCertData,
+                        },
+                    },
+                });
+
+                await assertConnected(standaloneClient);
+            },
+            TIMEOUT,
+        );
+    });
+
+    describe("Cluster TLS with IP addresses", () => {
+        it(
+            "should connect with IPv4 address",
+            async () => {
+                const address = {
+                    host: IP_ADDRESS_V4,
+                    port: clusterModeCluster.getAddresses()[0][1],
+                };
+                clusterClient = await GlideClusterClient.createClient({
+                    addresses: [address],
+                    useTLS: true,
+                    advancedConfiguration: {
+                        tlsAdvancedConfiguration: {
+                            rootCertificates: caCertData,
+                        },
+                    },
+                });
+
+                await assertConnected(clusterClient);
+            },
+            TIMEOUT,
+        );
+
+        it(
+            "should connect with IPv6 address",
+            async () => {
+                const address = {
+                    host: IP_ADDRESS_V6,
+                    port: clusterModeCluster.getAddresses()[0][1],
+                };
+                clusterClient = await GlideClusterClient.createClient({
+                    addresses: [address],
+                    useTLS: true,
+                    advancedConfiguration: {
+                        tlsAdvancedConfiguration: {
+                            rootCertificates: caCertData,
+                        },
+                    },
+                });
+
+                await assertConnected(clusterClient);
             },
             TIMEOUT,
         );

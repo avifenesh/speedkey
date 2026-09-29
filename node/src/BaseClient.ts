@@ -7,6 +7,7 @@
  * to suppress unused import errors for types referenced only in JSDoc.
  */
 
+import { readFile } from "node:fs/promises";
 import Long from "long";
 import { Buffer } from "protobufjs/minimal";
 import {
@@ -23,12 +24,15 @@ import {
     BitOffsetOptions,
     BitwiseOperation,
     Boundary,
+    ClientSideCache,
     ClosingError,
     ClusterBatchOptions,
+    CompressionConfiguration,
     ConfigurationError,
     ConnectionError,
     CoordOrigin, // eslint-disable-line @typescript-eslint/no-unused-vars
     DEFAULT_CONNECTION_TIMEOUT_IN_MILLISECONDS,
+    CircuitBreakerError,
     ExecAbortError,
     ExpireOptions,
     GeoAddOptions,
@@ -51,6 +55,8 @@ import {
     ListDirection,
     Logger,
     MemberOrigin, // eslint-disable-line @typescript-eslint/no-unused-vars
+    MigrateOptions,
+    OpenTelemetry,
     RangeByIndex,
     RangeByLex,
     RangeByScore,
@@ -63,11 +69,12 @@ import {
     SearchOrigin,
     SetOptions,
     SortOptions,
+    CommandResponse,
     CreateDirectClient,
     GlideClientHandle,
-    CommandResponse,
     createLeakedStringVec,
-    freeLeakedStringVec,
+    registerAddressResolver,
+    removeAddressResolver,
     StreamAddOptions,
     StreamClaimOptions,
     StreamGroupOptions,
@@ -159,7 +166,10 @@ import {
     createLRem,
     createLSet,
     createLTrim,
+    createLeakedOtelSpan,
+    createOtelSpanWithTraceContext,
     createMGet,
+    createMigrate,
     createMSet,
     createMSetNX,
     createMove,
@@ -178,11 +188,20 @@ import {
     createPubSubChannels,
     createPubSubNumPat,
     createPubSubNumSub,
+    createPSubscribe,
+    createPSubscribeLazy,
+    createPUnsubscribe,
+    createPUnsubscribeLazy,
+    createSubscribe,
+    createSubscribeLazy,
+    createUnsubscribe,
+    createUnsubscribeLazy,
     createRPop,
     createRPush,
     createRPushX,
     createRename,
     createRenameNX,
+    createReset,
     createRestore,
     createSAdd,
     createSCard,
@@ -265,10 +284,11 @@ import {
     createZScore,
     createZUnion,
     createZUnionStore,
-    createLeakedOtelSpan,
     dropOtelSpan,
     getStatistics,
-    OpenTelemetry,
+    compressionConfigToProtobuf,
+    validateCompressionConfiguration,
+    valueFromPointer,
     valueFromSplitPointer,
 } from ".";
 import {
@@ -276,6 +296,7 @@ import {
     connection_request,
     response,
 } from "../build-ts/ProtobufMessage";
+import { resolveClientLibraryName } from "./ClientLibraryNameResolver.js";
 /* eslint-disable-next-line @typescript-eslint/no-explicit-any */
 type PromiseFunction = (value?: any) => void;
 type ErrorFunction = (error: ValkeyError) => void;
@@ -311,6 +332,256 @@ export type GlideReturnType =
  * Union type that can store either a valid UTF-8 string or array of bytes.
  */
 export type GlideString = string | Buffer;
+
+/**
+ * Mutual TLS (mTLS) client authentication material.
+ *
+ * The `kind` field selects one of two mutually exclusive ways to supply the
+ * client certificate and private key. The bytes variant uses
+ * `clientCertificate` and `clientKey`; the path variant uses `clientCertPath`
+ * and `clientKeyPath`. Pairing each variant's fields under a shared
+ * discriminant lets the compiler reject mixed configurations (for example a
+ * `clientCertificate` alongside `clientKeyPath`, or a `reloadIntervalSeconds`
+ * on the bytes variant).
+ *
+ * With `kind: "bytes"`, `clientCertificate` and `clientKey` are PEM material
+ * passed inline and read once at connect time. A `string` value is encoded as
+ * UTF-8.
+ *
+ * With `kind: "path"`, `clientCertPath` and `clientKeyPath` point at files on
+ * disk. The core reads them at connect time and re-reads them on a schedule,
+ * so a rotated cert is adopted on the next reconnect while open connections
+ * keep their current material. If a reload fails (missing file, mismatched
+ * key, unreadable), the last known good material is kept. When
+ * `reloadIntervalSeconds` is omitted, the cadence defaults to the GLIDE core
+ * default (`DEFAULT_RELOAD_INTERVAL_SECONDS` in glide-core's `tls_reload`
+ * module); very long intervals may adopt a rotated cert late.
+ *
+ * Reload is on iff `kind === "path"`. There is no separate toggle.
+ */
+export type MutualTls =
+    | {
+          readonly kind: "bytes";
+          readonly clientCertificate: Buffer | string;
+          readonly clientKey: Buffer | string;
+      }
+    | {
+          readonly kind: "path";
+          readonly clientCertPath: string;
+          readonly clientKeyPath: string;
+          readonly reloadIntervalSeconds?: number;
+      };
+
+/**
+ * Largest value that fits in an unsigned 32-bit protobuf field:
+ * `4_294_967_295` (`2 ** 32 - 1`). Reused by validators that need to bound
+ * a value to the uint32 wire range. protobufjs casts through `value >>> 0`
+ * when the request is built, so a larger value would silently truncate
+ * before reaching the core. Rejecting up front keeps the user's requested
+ * value visible instead of quietly changing it.
+ *
+ * @internal
+ */
+const MAX_UINT32 = 2 ** 32 - 1;
+
+/**
+ * Reads a PEM file for TLS configuration. Shared by
+ * {@link loadRootCertificatesFromFile} and
+ * {@link loadClientCertificateAndKeyFromFile}.
+ *
+ * @param path - Path to the PEM file.
+ * @param label - Label used in error messages (e.g. `"Root certificate"`).
+ * @returns The file contents.
+ * @throws {@link ConfigurationError} If the file is missing, unreadable, or empty.
+ * @internal
+ */
+async function loadTlsPemFile(path: string, label: string): Promise<Buffer> {
+    let data: Buffer;
+
+    try {
+        data = await readFile(path);
+    } catch (error) {
+        const fsError = error as NodeJS.ErrnoException;
+        const message =
+            fsError.code === "ENOENT"
+                ? `${label} file not found: ${path}`
+                : `Failed to read ${label.toLowerCase()} file at ${path}: ${
+                      error instanceof Error ? error.message : String(error)
+                  }`;
+        const wrapped = new ConfigurationError(message);
+        (wrapped as Error).cause = error;
+        throw wrapped;
+    }
+
+    if (data.length === 0) {
+        throw new ConfigurationError(`${label} file is empty: ${path}`);
+    }
+
+    return data;
+}
+
+/**
+ * Loads PEM-encoded root certificates for TLS server verification. Feed the
+ * result to `rootCertificates` on
+ * {@link AdvancedBaseClientConfiguration.tlsAdvancedConfiguration}.
+ *
+ * @param path - Path to a PEM root certificate or bundle.
+ * @returns The certificate bytes.
+ * @throws {@link ConfigurationError} If the file is missing, unreadable, or empty.
+ */
+export function loadRootCertificatesFromFile(path: string): Promise<Buffer> {
+    return loadTlsPemFile(path, "Root certificate");
+}
+
+/**
+ * Loads a PEM client certificate and its private key for the byte-based
+ * {@link MutualTls} variant (`kind: "bytes"`). For automatic reload, use the
+ * path-based variant instead; the core then owns the file lifecycle.
+ *
+ * The cert is read first. If it fails, the key file is not touched.
+ *
+ * @param clientCertPath - Path to a PEM client certificate.
+ * @param clientKeyPath - Path to a PEM client private key.
+ * @returns `{ cert, key }` as Buffers.
+ * @throws {@link ConfigurationError} If either file is missing, unreadable, or empty.
+ */
+export async function loadClientCertificateAndKeyFromFile(
+    clientCertPath: string,
+    clientKeyPath: string,
+): Promise<{ cert: Buffer; key: Buffer }> {
+    const cert = await loadTlsPemFile(clientCertPath, "Client certificate");
+    const key = await loadTlsPemFile(clientKeyPath, "Client key");
+    return { cert, key };
+}
+
+/**
+ * Encodes PEM input for the connection request and rejects empty material.
+ * String values are UTF-8 encoded; Buffer values pass through. Empty content
+ * has to be caught here: proto3 `bytes` treats empty as unset, so a request
+ * with both `clientCertificate` and `clientKey` empty would silently
+ * downgrade to server-auth-only TLS instead of surfacing a mTLS configuration
+ * error.
+ *
+ * @internal
+ */
+function encodePem(value: Buffer | string, fieldName: string): Uint8Array {
+    const buffer =
+        typeof value === "string" ? Buffer.from(value, "utf-8") : value;
+
+    if (buffer.length === 0) {
+        throw new ConfigurationError(`${fieldName} must not be empty.`);
+    }
+
+    return new Uint8Array(buffer);
+}
+
+/**
+ * Validates the optional reload interval. protobufjs casts `uint32` through
+ * `value >>> 0` when the request is built, so an out-of-range or non-integer
+ * value would silently truncate before reaching the core. The core cannot
+ * validate what it never receives, so this check has to stay client-side.
+ *
+ * @internal
+ */
+function validateReloadInterval(value: number | undefined): void {
+    if (value === undefined) {
+        return;
+    }
+
+    if (!Number.isInteger(value) || value <= 0 || value > MAX_UINT32) {
+        throw new ConfigurationError(
+            `mutualTls.reloadIntervalSeconds must be a positive integer no greater than ${MAX_UINT32}.`,
+        );
+    }
+}
+
+/**
+ * Writes a {@link MutualTls} value into the connection request. The byte
+ * variant sets `client_cert` / `client_key` (proto fields 22/23); the path
+ * variant sets `client_cert_path` / `client_key_path` / `cert_reload`
+ * (proto fields 31/32/33).
+ *
+ * @internal
+ */
+function applyMutualTls(
+    mtls: MutualTls,
+    request: connection_request.IConnectionRequest,
+): void {
+    switch (mtls.kind) {
+        case "bytes": {
+            request.clientCert = encodePem(
+                mtls.clientCertificate,
+                "mutualTls.clientCertificate",
+            );
+            request.clientKey = encodePem(
+                mtls.clientKey,
+                "mutualTls.clientKey",
+            );
+            return;
+        }
+
+        case "path": {
+            validateReloadInterval(mtls.reloadIntervalSeconds);
+            request.clientCertPath = mtls.clientCertPath;
+            request.clientKeyPath = mtls.clientKeyPath;
+            request.certReload = {
+                enabled: true,
+                intervalSeconds: mtls.reloadIntervalSeconds,
+            };
+            return;
+        }
+
+        default: {
+            // Compile-time: assigning `mtls` to `never` fails to build if a
+            // new variant is added without a case. Runtime: the throw only
+            // fires for an untyped JS caller supplying an unknown `kind`,
+            // and the cast is needed because `mtls` is narrowed to `never`.
+            const _exhaustive: never = mtls;
+            void _exhaustive;
+            throw new ConfigurationError(
+                `Unsupported mutualTls variant: kind=${String(
+                    (mtls as { kind?: unknown }).kind,
+                )}`,
+            );
+        }
+    }
+}
+
+/**
+ * Applies the `tlsAdvancedConfiguration` block onto the connection request:
+ * the `useTLS`-off guard, the `insecure` flag, `rootCertificates`, and the
+ * mTLS dispatch.
+ *
+ * @internal
+ */
+export function applyTlsAdvancedConfiguration(
+    tls: NonNullable<
+        AdvancedBaseClientConfiguration["tlsAdvancedConfiguration"]
+    >,
+    request: connection_request.IConnectionRequest,
+): void {
+    if (request.tlsMode === connection_request.TlsMode.NoTls) {
+        throw new ConfigurationError(
+            "TLS advanced configuration cannot be set when useTLS is disabled.",
+        );
+    }
+
+    if (tls.insecure) {
+        request.tlsMode = connection_request.TlsMode.InsecureTls;
+    }
+
+    if (tls.rootCertificates) {
+        const certData =
+            typeof tls.rootCertificates === "string"
+                ? Buffer.from(tls.rootCertificates, "utf-8")
+                : tls.rootCertificates;
+        request.rootCerts = [new Uint8Array(certData)];
+    }
+
+    if (tls.mutualTls !== undefined) {
+        applyMutualTls(tls.mutualTls, request);
+    }
+}
 
 /**
  * Enum representing the different types of decoders.
@@ -384,6 +655,28 @@ export type StreamEntryDataType = Record<string, [GlideString, GlideString][]>;
  * Union type that can store either a number or positive/negative infinity.
  */
 export type Score = number | "+inf" | "-inf";
+
+/**
+ * Constant representing "all channels" for unsubscribe operations.
+ * Use this to unsubscribe from all channel subscriptions at once.
+ *
+ * @example
+ * ```typescript
+ * await client.unsubscribeLazy(ALL_CHANNELS);
+ * ```
+ */
+export const ALL_CHANNELS = null;
+
+/**
+ * Constant representing "all patterns" for punsubscribe operations.
+ * Use this to unsubscribe from all pattern subscriptions at once.
+ *
+ * @example
+ * ```typescript
+ * await client.punsubscribeLazy(ALL_PATTERNS);
+ * ```
+ */
+export const ALL_PATTERNS = null;
 
 /**
  * Data type which represents sorted sets data for input parameter of ZADD command,
@@ -489,9 +782,7 @@ export type ReturnTypeXinfoStream = Record<
  * See {@link ReturnTypeXinfoStream}.
  */
 export type StreamEntries =
-    | GlideString
-    | number
-    | (GlideString | number | GlideString[])[][];
+    GlideString | number | (GlideString | number | GlideString[])[][];
 
 /**
  * @internal
@@ -562,7 +853,43 @@ export type ReadFrom =
     | "AZAffinity"
     /** Spread the read requests among all nodes within the client's Availability Zone (AZ) in a round robin manner,
          prioritizing local replicas, then the local primary, and falling back to any replica or the primary if needed.*/
-    | "AZAffinityReplicasAndPrimary";
+    | "AZAffinityReplicasAndPrimary"
+    /** Spread the read requests between all nodes (primary and replicas) in a round robin manner.*/
+    | "allNodes"
+    /** Spread the read requests round robin across all nodes (primary and replicas) within the client's Availability
+        Zone (AZ). Falls back to a round robin across all nodes when no node in the client's AZ is available. Unlike
+        `AZAffinityReplicasAndPrimary`, this strategy does not prioritize replicas ahead of the primary within the AZ,
+        which allows an even per-node read distribution. Unlike `allNodes`, which is AZ agnostic, this strategy is
+        scoped to the client's AZ. Requires `clientAz` to be set.*/
+    | "AZAffinityAllNodes";
+
+/**
+ * The set of {@link ReadFrom} strategies that are scoped to the client's Availability
+ * Zone and therefore require `clientAz` to be set. This is the single source of truth
+ * for AZ-affinity validation: any new AZ-scoped {@link ReadFrom} member must be added
+ * here so it is not silently allowed to skip the `clientAz` requirement. It is enforced
+ * to stay in sync with {@link ReadFrom} by a unit test.
+ */
+export const AZ_AFFINITY_READ_FROM_STRATEGIES: ReadonlySet<ReadFrom> = new Set([
+    "AZAffinity",
+    "AZAffinityReplicasAndPrimary",
+    "AZAffinityAllNodes",
+]);
+
+/**
+ * Controls how the client discovers node roles and topology in standalone mode.
+ */
+export enum NodeDiscoveryMode {
+    /** Default: verify node roles via INFO REPLICATION, use only provided addresses. */
+    Standard = 0,
+    /** Skip role detection entirely. Trust provided addresses as-is; first address is primary.
+     *  Use when connecting through a proxy (e.g., Envoy) or when the topology is known and static.
+     *  Note: Do not set `clientName` when using this mode with a proxy. */
+    Static = 1,
+    /** Discover full topology (primary + all replicas) from any starting node.
+     *  Provide any single node address and the client will find and connect to all other nodes. */
+    DiscoverAll = 2,
+}
 
 /**
  * Configuration settings for creating a client. Shared settings for standalone and cluster clients.
@@ -599,14 +926,17 @@ export type ReadFrom =
  * ### Client Identification
  *
  * - **Client Name**: Set `clientName` to identify the client connection.
+ * - **Library Name**: Set `libName` to override the default library name (`GlideJS`) reported by `CLIENT INFO`; an empty value uses the default.
+ * - **Client Info Tag**: Set `clientInfoTag` to append an attribution tag to the library name (e.g., `GlideJS(my-framework:1.0)`); an empty value adds no tag.
+ * - Both options apply to ordinary standalone and cluster clients and to dedicated monitor clients. Every character in a non-empty value must be printable ASCII from `!` (U+0021) through `~` (U+007E), inclusive, excluding `(` and `)`, which are reserved as composition delimiters; otherwise a `ConfigurationError` is thrown.
  *
  * ### Read Strategy
  *
- * - Use `readFrom` to specify the client's read strategy (e.g., primary, preferReplica, AZAffinity, AZAffinityReplicasAndPrimary).
+ * - Use `readFrom` to specify the client's read strategy (e.g., primary, preferReplica, AZAffinity, AZAffinityReplicasAndPrimary, AZAffinityAllNodes).
  *
  * ### Availability Zone
  *
- * - Use `clientAz` to specify the client's availability zone, which can influence read operations when using `readFrom: 'AZAffinity'or `readFrom: 'AZAffinityReplicasAndPrimary'`.
+ * - Use `clientAz` to specify the client's availability zone, which can influence read operations when using `readFrom: 'AZAffinity'`, `readFrom: 'AZAffinityReplicasAndPrimary'`, or `readFrom: 'AZAffinityAllNodes'`.
  *
  * ### Decoder Settings
  *
@@ -738,6 +1068,38 @@ export interface BaseClientConfiguration {
      */
     clientName?: string;
     /**
+     * Optional library-name override sent with {@code CLIENT SETINFO LIB-NAME} during connection
+     * establishment. If omitted or empty, the default {@code GlideJS} is used. When
+     * {@link clientInfoTag} is present and non-empty, it is appended to the effective library name
+     * in parentheses.
+     *
+     * This option applies to ordinary standalone and cluster clients and dedicated monitor clients.
+     * Every character in a non-empty override must be printable ASCII from {@code !} (U+0021)
+     * through {@code ~} (U+007E), inclusive, excluding {@code (} and {@code )}, which are
+     * reserved as composition delimiters; all other in-range punctuation is preserved.
+     *
+     * @throws ConfigurationError if a non-empty override contains a character outside printable
+     * ASCII U+0021 through U+007E or contains the reserved {@code (} or {@code )} delimiter.
+     * See: validateClientAttr in https://github.com/valkey-io/valkey/blob/4e98093b208f956050fb441d89e1e2d7f91ac466/src/networking.c
+     */
+    libName?: string;
+    /**
+     * Optional attribution tag appended to the effective library name in parentheses.
+     * For example, setting this to {@code "my-framework:1.2.3"} results in a lib-name of
+     * {@code GlideJS(my-framework:1.2.3)} (or {@code custom-lib(my-framework:1.2.3)} if
+     * {@link libName} is also set). An empty tag is treated as absent.
+     *
+     * This option applies to ordinary standalone and cluster clients and dedicated monitor clients.
+     * Every character in a non-empty tag must be printable ASCII from {@code !} (U+0021) through
+     * {@code ~} (U+007E), inclusive, excluding {@code (} and {@code )}, which are reserved as
+     * composition delimiters; all other in-range punctuation is preserved.
+     *
+     * @throws ConfigurationError if a non-empty tag contains a character outside printable ASCII
+     * U+0021 through U+007E or contains the reserved {@code (} or {@code )} delimiter.
+     * See: validateClientAttr in https://github.com/valkey-io/valkey/blob/4e98093b208f956050fb441d89e1e2d7f91ac466/src/networking.c
+     */
+    clientInfoTag?: string;
+    /**
      * Default decoder when decoder is not set per command.
      * If not set, 'Decoder.String' will be used.
      */
@@ -751,7 +1113,7 @@ export interface BaseClientConfiguration {
     inflightRequestsLimit?: number;
     /**
      * Availability Zone of the client.
-     * If ReadFrom strategy is AZAffinity or AZAffinityReplicasAndPrimary, this setting ensures that readonly commands are directed to nodes within the specified AZ if they exist.
+     * If ReadFrom strategy is AZAffinity, AZAffinityReplicasAndPrimary, or AZAffinityAllNodes, this setting ensures that readonly commands are directed to nodes within the specified AZ if they exist.
      *
      * @example
      * ```typescript
@@ -760,6 +1122,8 @@ export interface BaseClientConfiguration {
      * configuration.readFrom = 'AZAffinity'; // Directs read operations to nodes within the same AZ
      * Or
      * configuration.readFrom = 'AZAffinityReplicasAndPrimary'; // Directs read operations to any node (primary or replica) within the same AZ
+     * Or
+     * configuration.readFrom = 'AZAffinityAllNodes'; // Spreads read operations round robin across all nodes (primary and replicas) within the same AZ
      * ```
      */
     clientAz?: string;
@@ -830,6 +1194,114 @@ export interface BaseClientConfiguration {
      * ```
      */
     lazyConnect?: boolean;
+
+    /**
+     * Configuration for automatic compression of values.
+     * When enabled, values that meet the minimum size threshold will be
+     * automatically compressed before being sent to the server and
+     * decompressed when retrieved.
+     *
+     * @example
+     * ```typescript
+     * const client = await GlideClient.createClient({
+     *   addresses: [{ host: "localhost", port: 6379 }],
+     *   compression: { enabled: true },
+     * });
+     * ```
+     */
+    compression?: CompressionConfiguration;
+
+    /**
+     * Client-side cache configuration.
+     *
+     * @remarks
+     * When provided, enables client-side caching for cacheable commands (GET, MGET, HGETALL, SMEMBERS).
+     * The cache reduces network round-trips and server load by storing frequently accessed data locally.
+     * An MGET response may combine locally cached values with values fetched from the server, so it does not provide
+     * an atomic snapshot across all keys.
+     *
+     * - **Memory Management**: The cache respects the configured memory limit and evicts entries based on the specified policy.
+     * - **TTL Support**: Entries can have optional time-to-live values for automatic expiration.
+     * - **Shared Caches**: Multiple clients can share the same cache instance using the same cache ID.
+     * - **Metrics**: Optional metrics collection provides insights into cache performance.
+     *
+     * @example
+     * ```typescript
+     * // Simple cache configuration
+     * const config: BaseClientConfiguration = {
+     *   addresses: [{ host: 'localhost', port: 6379 }],
+     *   clientSideCache: ClientSideCache.create(1024, 0), // 1MB cache, no TTL
+     * };
+     *
+     * // Advanced cache configuration
+     * const advancedConfig: BaseClientConfiguration = {
+     *   addresses: [{ host: 'localhost', port: 6379 }],
+     *   clientSideCache: new ClientSideCache({
+     *     maxCacheKb: 2048,
+     *     entryTtlMs: 300000,
+     *     evictionPolicy: EvictionPolicy.LFU,
+     *     enableMetrics: true,
+     *   }),
+     * };
+     * ```
+     */
+    clientSideCache?: ClientSideCache;
+
+    /**
+     * Optional callback for resolving server addresses before connection.
+     *
+     * When provided, this callback will be invoked for each configured address during connection
+     * establishment and during cluster topology refreshes. The callback receives the configured
+     * host and port, and should return a tuple `[resolvedHost, resolvedPort]` with the actual
+     * address to use for the connection.
+     *
+     * Use cases:
+     * - Custom DNS resolution for service discovery
+     * - Address translation for proxy setups
+     * - Dynamic endpoint resolution for cloud environments
+     *
+     * If the resolver throws an exception or returns an invalid value, the original address
+     * is used as a fallback.
+     *
+     * @example
+     * ```typescript
+     * const config: BaseClientConfiguration = {
+     *   addresses: [{ host: "internal-service", port: 9999 }],
+     *   addressResolver: (host, port) => {
+     *     if (host === "internal-service") {
+     *       return ["10.0.0.5", 6379];
+     *     }
+     *     return [host, port];
+     *   },
+     * };
+     * ```
+     */
+    addressResolver?: (host: string, port: number) => [string, number];
+    /**
+     * Configuration for the client-wide circuit breaker.
+     * When set, enables the circuit breaker which detects sustained error rates
+     * and rejects requests before they enter the core.
+     * If not set (undefined), the circuit breaker is disabled.
+     */
+    clientCircuitBreaker?: ClientCircuitBreakerConfiguration;
+}
+
+/**
+ * Configuration for the client-wide circuit breaker.
+ */
+export interface ClientCircuitBreakerConfiguration {
+    /** Sliding window duration in milliseconds for error rate calculation. Default: 10000. */
+    windowSizeMs?: number;
+    /** Error rate (0.0-1.0) within the window to trip the breaker. Default: 0.5. */
+    failureRateThreshold?: number;
+    /** Minimum errors within window before rate is evaluated. Default: 50. */
+    minErrors?: number;
+    /** Time in milliseconds in Open state before allowing a probe. Default: 5000. */
+    openTimeoutMs?: number;
+    /** Whether timeouts count toward tripping. Default: false. */
+    countTimeouts?: boolean;
+    /** Consecutive successful probes needed before closing. Default: 3. */
+    consecutiveSuccesses?: number;
 }
 
 /**
@@ -895,6 +1367,20 @@ export interface AdvancedBaseClientConfiguration {
          * - This is useful when connecting to servers with self-signed certificates or custom certificate authorities.
          */
         rootCertificates?: string | Buffer;
+
+        /**
+         * Mutual TLS (mTLS) client authentication material. See
+         * {@link MutualTls} for the two variants: `kind: "bytes"` for static
+         * material and `kind: "path"` for material the core reloads from
+         * disk. Reload is on iff `kind === "path"`. When
+         * `reloadIntervalSeconds` is omitted, the reload cadence defaults to
+         * the GLIDE core default (see `DEFAULT_RELOAD_INTERVAL_SECONDS` in
+         * glide-core's `tls_reload` module).
+         *
+         * Requires `useTLS: true` on the base client configuration. Setting
+         * `mutualTls` when TLS is disabled raises a {@link ConfigurationError}.
+         */
+        readonly mutualTls?: MutualTls;
     };
 
     /**
@@ -909,6 +1395,33 @@ export interface AdvancedBaseClientConfiguration {
      * - If not explicitly set, a default value of `true` will be used by the Rust core.
      */
     tcpNoDelay?: boolean;
+
+    /**
+     * The interval in milliseconds between PubSub subscription reconciliation attempts.
+     *
+     * The reconciliation process ensures that the client's desired subscriptions match
+     * the actual subscriptions on the server. This is useful when subscriptions may have
+     * been lost due to network issues or server restarts.
+     *
+     * If not explicitly set, the Rust core will use its default reconciliation interval.
+     *
+     * @remarks
+     * - Must be a positive integer representing milliseconds.
+     * - The reconciliation process runs automatically in the background.
+     * - A lower interval provides faster recovery from subscription issues but increases overhead.
+     * - A higher interval reduces overhead but may delay recovery from subscription issues.
+     *
+     * @example
+     * ```typescript
+     * const config: GlideClientConfiguration = {
+     *   addresses: [{ host: "localhost", port: 6379 }],
+     *   advancedConfiguration: {
+     *     pubsubReconciliationIntervalMs: 5000 // Reconcile every 5 seconds
+     *   }
+     * };
+     * ```
+     */
+    pubsubReconciliationIntervalMs?: number;
 }
 
 /**
@@ -944,6 +1457,10 @@ function getRequestErrorClass(
         return TimeoutError;
     }
 
+    if (type === response.RequestErrorType.CircuitBreakerOpen) {
+        return CircuitBreakerError;
+    }
+
     if (type === response.RequestErrorType.Unspecified) {
         return RequestError;
     }
@@ -971,8 +1488,7 @@ export interface PubSubMsg {
  */
 type BaseOptions = RouteOption & DecoderOption;
 type WritePromiseOptions =
-    | BaseOptions
-    | (BaseOptions & (ClusterBatchOptions | BatchOptions));
+    BaseOptions | (BaseOptions & (ClusterBatchOptions | BatchOptions));
 
 /**
  * Base client interface for GLIDE
@@ -987,6 +1503,7 @@ export class BaseClient {
     private readonly pubsubFutures: [PromiseFunction, ErrorFunction][] = [];
     private pendingPushNotification: response.Response[] = [];
     private config: BaseClientConfiguration | undefined;
+    private addressResolverKey: string | undefined;
     protected clientHandle: GlideClientHandle | null = null;
     /** Stores OTel span pointers keyed by callbackIndex for span lifecycle management. */
     private readonly otelSpanPointers = new Map<number, bigint>();
@@ -1107,6 +1624,15 @@ export class BaseClient {
         }
     }
 
+    private encodeRouteBytes(
+        route: Routes | undefined,
+    ): Uint8Array | undefined {
+        const protoRoute = this.toProtobufRoute(route);
+        return protoRoute
+            ? command_request.Routes.encode(protoRoute).finish()
+            : undefined;
+    }
+
     /**
      * Creates an OTel span for a command and stores the span pointer keyed by
      * callbackIndex so it can be dropped when the response arrives.
@@ -1117,12 +1643,22 @@ export class BaseClient {
     private createOtelSpanForCallback(
         callbackIndex: number,
         commandName: string,
-    ): void {
-        const [low, high] = createLeakedOtelSpan(commandName);
+    ): bigint {
+        const parentCtx = OpenTelemetry.getParentSpanContext();
+        const [low, high] = parentCtx
+            ? createOtelSpanWithTraceContext(
+                  commandName,
+                  parentCtx.traceId,
+                  parentCtx.spanId,
+                  parentCtx.traceFlags,
+                  parentCtx.traceState,
+              )
+            : createLeakedOtelSpan(commandName);
         // Combine split pointer into a single bigint for dropOtelSpan,
         // using Long to match the pointer representation used elsewhere.
         const spanPtr = BigInt(new Long(low, high, true).toString());
         this.otelSpanPointers.set(callbackIndex, spanPtr);
+        return spanPtr;
     }
 
     /**
@@ -1324,17 +1860,6 @@ export class BaseClient {
     ): Promise<T> {
         // Validate: retry strategy is not supported for atomic batches (transactions)
         if (isAtomic && "retryStrategy" in options && options.retryStrategy) {
-            // Free any leaked arg pointers in the commands before rejecting
-            for (const cmd of commands) {
-                if (cmd.argsVecPointer) {
-                    const ptr =
-                        typeof cmd.argsVecPointer === "number"
-                            ? Long.fromNumber(cmd.argsVecPointer)
-                            : cmd.argsVecPointer;
-                    freeLeakedStringVec(ptr.high, ptr.low);
-                }
-            }
-
             return Promise.reject(
                 new RequestError(
                     "Retry strategy is not supported for atomic batches.",
@@ -1342,11 +1867,20 @@ export class BaseClient {
             ) as Promise<T>;
         }
 
+        let routeBytes: Uint8Array | undefined;
+
+        try {
+            routeBytes = this.encodeRouteBytes(options.route);
+        } catch (err) {
+            return Promise.reject(err) as Promise<T>;
+        }
+
         const callbackIndex = this.getCallbackIndex();
+        let spanPtr: bigint | undefined;
 
         // Create an OTel span for this batch if tracing is enabled
         if (OpenTelemetry.shouldSample()) {
-            this.createOtelSpanForCallback(callbackIndex, "Batch");
+            spanPtr = this.createOtelSpanForCallback(callbackIndex, "Batch");
         }
 
         return new Promise<T>((resolve, reject) => {
@@ -1357,12 +1891,15 @@ export class BaseClient {
             ];
 
             // Convert commands to BatchCommand format
+            const pointerBackedCommands: command_request.Command[] = [];
             const batchCommands = commands.map((cmd) => {
                 let argsPointerHigh = 0;
                 let argsPointerLow = 0;
 
                 if (cmd.argsVecPointer) {
                     // Already have a heap pointer
+                    pointerBackedCommands.push(cmd);
+
                     if (typeof cmd.argsVecPointer === "number") {
                         const long = Long.fromNumber(cmd.argsVecPointer);
                         argsPointerHigh = long.high;
@@ -1405,18 +1942,6 @@ export class BaseClient {
                     ? options.retryStrategy?.retryConnectionError
                     : undefined;
 
-            // Encode route to protobuf bytes if provided
-            let routeBytes: Uint8Array | undefined;
-
-            if (options.route) {
-                const protoRoute = this.toProtobufRoute(options.route);
-
-                if (protoRoute) {
-                    routeBytes =
-                        command_request.Routes.encode(protoRoute).finish();
-                }
-            }
-
             // Call the Rust sendBatch via NAPI
             const success = this.clientHandle!.sendBatch(
                 callbackIndex,
@@ -1426,8 +1951,13 @@ export class BaseClient {
                 timeout,
                 retryServerError,
                 retryConnectionError,
+                spanPtr,
                 routeBytes,
             );
+
+            for (const cmd of pointerBackedCommands) {
+                cmd.argsVecPointer = undefined;
+            }
 
             if (!success) {
                 // Inflight limit exceeded - drop span and clean up
@@ -1450,7 +1980,16 @@ export class BaseClient {
         command: command_request.Command,
         options: WritePromiseOptions = {},
     ): Promise<T> {
+        let routeBytes: Uint8Array | undefined;
+
+        try {
+            routeBytes = this.encodeRouteBytes(options.route);
+        } catch (err) {
+            return Promise.reject(err) as Promise<T>;
+        }
+
         const callbackIndex = this.getCallbackIndex();
+        let spanPtr: bigint | undefined;
 
         // Create an OTel span for this command if tracing is enabled.
         // Defer the command name lookup to avoid the string table access
@@ -1458,7 +1997,10 @@ export class BaseClient {
         if (OpenTelemetry.shouldSample()) {
             const commandName =
                 command_request.RequestType[command.requestType] ?? "Unknown";
-            this.createOtelSpanForCallback(callbackIndex, commandName);
+            spanPtr = this.createOtelSpanForCallback(
+                callbackIndex,
+                commandName,
+            );
         }
 
         return new Promise<T>((resolve, reject) => {
@@ -1495,26 +2037,19 @@ export class BaseClient {
                 argsPointerLow = low;
             }
 
-            // Encode route to protobuf bytes if provided
-            let routeBytes: Uint8Array | undefined;
-
-            if (options.route) {
-                const protoRoute = this.toProtobufRoute(options.route);
-
-                if (protoRoute) {
-                    routeBytes =
-                        command_request.Routes.encode(protoRoute).finish();
-                }
-            }
-
             // Call the Rust sendCommand via NAPI
             const success = this.clientHandle!.sendCommand(
                 callbackIndex,
                 command.requestType,
                 argsPointerHigh,
                 argsPointerLow,
+                spanPtr,
                 routeBytes,
             );
+
+            if (command.argsVecPointer) {
+                command.argsVecPointer = undefined;
+            }
 
             if (!success) {
                 // Inflight limit exceeded - drop span and clean up
@@ -1585,11 +2120,62 @@ export class BaseClient {
         });
     }
 
+    protected createGetCacheMetricsPromise(
+        command: command_request.GetCacheMetrics,
+    ) {
+        this.ensureClientIsOpen();
+        const callbackIdx = this.getCallbackIndex();
+
+        return new Promise<number>((resolve, reject) => {
+            this.promiseCallbackFunctions[callbackIdx] = [resolve, reject];
+
+            const success = this.clientHandle!.getCacheMetrics(
+                callbackIdx,
+                command.metricsTypes,
+            );
+
+            if (!success) {
+                this.availableCallbackSlots.push(callbackIdx);
+                reject(
+                    new RequestError(
+                        "Inflight request limit exceeded. Please try again later.",
+                    ),
+                );
+            }
+        });
+    }
+
+    /**
+     * @internal
+     * Get cache metrics.
+     *
+     * @param metricsType - Type of metric to retrieve (e.g., hit rate, miss rate).
+     * @returns The requested cache metric.
+     * @throws RequestError if client-side caching is not enabled or metrics tracking is disabled.
+     */
+    private async getCacheMetrics(
+        metricsType: command_request.CacheMetricsType,
+    ): Promise<number> {
+        const getCacheMetrics = command_request.GetCacheMetrics.create({
+            metricsTypes: metricsType,
+        });
+        return await this.createGetCacheMetricsPromise(getCacheMetrics);
+    }
+
     protected createScriptInvocationPromise<T = GlideString>(
         command: command_request.ScriptInvocation,
         options: DecoderOption & RouteOption = {},
     ): Promise<T> {
         this.ensureClientIsOpen();
+
+        let routeBytes: Uint8Array | undefined;
+
+        try {
+            routeBytes = this.encodeRouteBytes(options.route);
+        } catch (err) {
+            return Promise.reject(err) as Promise<T>;
+        }
+
         const callbackIndex = this.getCallbackIndex();
 
         return new Promise<T>((resolve, reject) => {
@@ -1632,18 +2218,6 @@ export class BaseClient {
                 argsPointerLow = low;
             }
             // else: keep default (0, 0) — Rust treats null pointer as empty vec
-
-            // Encode route to protobuf bytes if provided
-            let routeBytes: Uint8Array | undefined;
-
-            if (options.route) {
-                const protoRoute = this.toProtobufRoute(options.route);
-
-                if (protoRoute) {
-                    routeBytes =
-                        command_request.Routes.encode(protoRoute).finish();
-                }
-            }
 
             const success = this.clientHandle!.invokeScript(
                 callbackIndex,
@@ -1727,13 +2301,11 @@ export class BaseClient {
             );
         }
 
-        if (!this.isPubsubConfigured(this.config!)) {
-            throw new ConfigurationError(
-                "The operation will never complete since there was no pubsbub subscriptions applied to the client.",
-            );
-        }
-
-        if (this.getPubsubCallbackAndContext(this.config!)[0]) {
+        // only throw error if BOTH config exists AND callback exists
+        if (
+            this.isPubsubConfigured(this.config!) &&
+            this.getPubsubCallbackAndContext(this.config!)[0]
+        ) {
             throw new ConfigurationError(
                 "The operation will never complete since messages will be passed to the configured callback.",
             );
@@ -1752,13 +2324,11 @@ export class BaseClient {
             );
         }
 
-        if (!this.isPubsubConfigured(this.config!)) {
-            throw new ConfigurationError(
-                "The operation will never complete since there was no pubsbub subscriptions applied to the client.",
-            );
-        }
-
-        if (this.getPubsubCallbackAndContext(this.config!)[0]) {
+        // only throw error if BOTH config exists AND callback exists
+        if (
+            this.isPubsubConfigured(this.config!) &&
+            this.getPubsubCallbackAndContext(this.config!)[0]
+        ) {
             throw new ConfigurationError(
                 "The operation will never complete since messages will be passed to the configured callback.",
             );
@@ -1783,24 +2353,22 @@ export class BaseClient {
     ): PubSubMsg | null {
         let msg: PubSubMsg | null = null;
         const responsePointer = pushNotification.respPointer;
-        let nextPushNotificationValue: Record<string, unknown> = {};
+        let nextPushNotificationValue: Record<string, unknown>;
         const isStringDecoder =
             (decoder ?? this.defaultDecoder) === Decoder.String;
 
         if (responsePointer) {
-            if (typeof responsePointer !== "number") {
-                nextPushNotificationValue = valueFromSplitPointer(
-                    responsePointer.high,
-                    responsePointer.low,
-                    isStringDecoder,
-                ) as Record<string, unknown>;
-            } else {
-                nextPushNotificationValue = valueFromSplitPointer(
-                    0,
-                    responsePointer,
-                    isStringDecoder,
-                ) as Record<string, unknown>;
-            }
+            nextPushNotificationValue =
+                typeof responsePointer === "number"
+                    ? (valueFromPointer(
+                          responsePointer,
+                          isStringDecoder,
+                      ) as Record<string, unknown>)
+                    : (valueFromSplitPointer(
+                          responsePointer.high,
+                          responsePointer.low,
+                          isStringDecoder,
+                      ) as Record<string, unknown>);
 
             const messageKind = nextPushNotificationValue["kind"];
 
@@ -2395,6 +2963,46 @@ export class BaseClient {
     ): Promise<boolean> {
         return this.createWritePromise(
             createCopy(source, destination, options),
+        );
+    }
+
+    /**
+     * Atomically transfers a key from a source Valkey instance to a destination Valkey instance.
+     * Once the key is successfully transferred, it is deleted from the source instance
+     * unless `copy` is set to `true` in options.
+     *
+     * @see {@link https://valkey.io/commands/migrate/|valkey.io} for details.
+     *
+     * @param host - The host of the destination Valkey instance.
+     * @param port - The port of the destination Valkey instance.
+     * @param key - The key to migrate.
+     * @param destinationDB - The database index on the destination instance.
+     * @param timeout - The maximum idle time in milliseconds for the bulk-transfer.
+     * @param options - Optional migration options.
+     * @returns `"OK"` on success, or `"NOKEY"` if the key does not exist.
+     *
+     * @example
+     * ```typescript
+     * const result = await client.migrate("127.0.0.1", 6379, "mykey", 0, 5000);
+     * console.log(result); // Output: "OK" - "mykey" was migrated to the destination instance.
+     * ```
+     * @example
+     * ```typescript
+     * // Migrate with copy (keep source key) and replace (overwrite destination)
+     * const result = await client.migrate("127.0.0.1", 6379, "mykey", 0, 5000, { copy: true, replace: true });
+     * console.log(result); // Output: "OK" - "mykey" was copied to the destination instance.
+     * ```
+     */
+    public async migrate(
+        host: string,
+        port: number,
+        key: GlideString,
+        destinationDB: number,
+        timeout: number,
+        options?: MigrateOptions,
+    ): Promise<string> {
+        return this.createWritePromise(
+            createMigrate(host, port, key, destinationDB, timeout, options),
         );
     }
 
@@ -3971,7 +4579,7 @@ export class BaseClient {
      *
      * @see {@link https://valkey.io/commands/blmove/|valkey.io} for details.
      * @remarks When in cluster mode, both `source` and `destination` must map to the same hash slot.
-     * @remarks `BLMOVE` is a client blocking command, see {@link https://github.com/valkey-io/valkey-glide/wiki/General-Concepts#blocking-commands|Valkey Glide Wiki} for more details and best practices.
+     * @remarks `BLMOVE` is a client blocking command, see {@link https://glide.valkey.io/how-to/connection-management/#blocking-commands|Valkey GLIDE Documentation} for more details and best practices.
      * @remarks Since Valkey version 6.2.0.
      *
      * @param source - The key to the source list.
@@ -4435,7 +5043,7 @@ export class BaseClient {
 
     /** Gets the intersection of all the given sets.
      *
-     * @see {@link https://valkey.io/docs/latest/commands/sinter/|valkey.io} for more details.
+     * @see {@link https://valkey.io/commands/sinter/|valkey.io} for more details.
      * @remarks When in cluster mode, all `keys` must map to the same hash slot.
      *
      * @param keys - The `keys` of the sets to get the intersection.
@@ -7568,6 +8176,8 @@ export class BaseClient {
         AZAffinity: connection_request.ReadFrom.AZAffinity,
         AZAffinityReplicasAndPrimary:
             connection_request.ReadFrom.AZAffinityReplicasAndPrimary,
+        allNodes: connection_request.ReadFrom.AllNodes,
+        AZAffinityAllNodes: connection_request.ReadFrom.AZAffinityAllNodes,
     };
 
     /**
@@ -7786,7 +8396,7 @@ export class BaseClient {
      *
      * @see {@link https://valkey.io/commands/brpop/|valkey.io} for more details.
      * @remarks When in cluster mode, all `keys` must map to the same hash slot.
-     * @remarks `BRPOP` is a blocking command, see [Blocking Commands](https://github.com/valkey-io/valkey-glide/wiki/General-Concepts#blocking-commands) for more details and best practices.
+     * @remarks `BRPOP` is a blocking command, see [Blocking Commands](https://glide.valkey.io/how-to/connection-management/#blocking-commands) for more details and best practices.
      *
      * @param keys - The `keys` of the lists to pop from.
      * @param timeout - The `timeout` in seconds.
@@ -7818,7 +8428,7 @@ export class BaseClient {
      *
      * @see {@link https://valkey.io/commands/blpop/|valkey.io} for more details.
      * @remarks When in cluster mode, all `keys` must map to the same hash slot.
-     * @remarks `BLPOP` is a blocking command, see [Blocking Commands](https://github.com/valkey-io/valkey-glide/wiki/General-Concepts#blocking-commands) for more details and best practices.
+     * @remarks `BLPOP` is a blocking command, see [Blocking Commands](https://glide.valkey.io/how-to/connection-management/#blocking-commands) for more details and best practices.
      *
      * @param keys - The `keys` of the lists to pop from.
      * @param timeout - The `timeout` in seconds.
@@ -8437,7 +9047,7 @@ export class BaseClient {
      *
      * @see {@link https://valkey.io/commands/bzmpop/|valkey.io} for more details.
      * @remarks When in cluster mode, all `keys` must map to the same hash slot.
-     * @remarks `BZMPOP` is a client blocking command, see {@link https://github.com/valkey-io/valkey-glide/wiki/General-Concepts#blocking-commands | Valkey Glide Wiki} for more details and best practices.
+     * @remarks `BZMPOP` is a client blocking command, see {@link https://glide.valkey.io/how-to/connection-management/#blocking-commands | Valkey GLIDE Documentation} for more details and best practices.
      * @remarks Since Valkey version 7.0.0.
      *
      * @param keys - The keys of the sorted sets.
@@ -8813,7 +9423,7 @@ export class BaseClient {
      * will only execute commands if the watched keys are not modified before execution of the
      * transaction. Executing a transaction will automatically flush all previously watched keys.
      *
-     * @see {@link https://valkey.io/commands/watch/|valkey.io} and {@link https://valkey.io/topics/transactions/#cas|Valkey Glide Wiki} for more details.
+     * @see {@link https://valkey.io/commands/watch/|valkey.io} and {@link https://valkey.io/topics/transactions/#cas|Valkey GLIDE Documentation} for more details.
      *
      * @remarks In cluster mode, if keys in `keys` map to different hash slots,
      * the command will be split across these slots and executed separately for each.
@@ -8879,6 +9489,27 @@ export class BaseClient {
      */
     public async wait(numreplicas: number, timeout: number): Promise<number> {
         return this.createWritePromise(createWait(numreplicas, timeout));
+    }
+
+    /**
+     * Resets the connection state.
+     *
+     * @see {@link https://valkey.io/commands/reset/|valkey.io} for more details.
+     *
+     * @remarks Resets the database index, client name, protocol, and pubsub subscriptions.
+     *
+     * @returns "RESET" when the connection state is successfully reset.
+     *
+     * @example
+     * ```typescript
+     * const result = await client.reset();
+     * console.log(result); // Output: "RESET"
+     * ```
+     */
+    public async reset(): Promise<"RESET"> {
+        return this.createWritePromise(createReset(), {
+            decoder: Decoder.String,
+        });
     }
 
     /**
@@ -9236,6 +9867,7 @@ export class BaseClient {
     /**
      * @internal
      */
+    // TODO #6669: move to module level so the request is testable
     protected createClientRequest(
         options: BaseClientConfiguration,
     ): connection_request.IConnectionRequest {
@@ -9247,8 +9879,7 @@ export class BaseClient {
 
         // Build a protobuf AuthenticationInfo
         let authenticationInfo:
-            | connection_request.IAuthenticationInfo
-            | undefined;
+            connection_request.IAuthenticationInfo | undefined;
 
         if (creds) {
             if ("iamConfig" in creds) {
@@ -9291,23 +9922,54 @@ export class BaseClient {
         }
 
         const protocol = options.protocol as
-            | connection_request.ProtocolVersion
-            | undefined;
+            connection_request.ProtocolVersion | undefined;
 
-        // Validate that clientAz is set when using AZ affinity strategies
+        // Normalize clientAz: trim surrounding whitespace and treat a blank value as
+        // absent. The core compares availability zones with exact equality and never
+        // trims, so an untrimmed or whitespace-only value (e.g. " us-east-1a " or
+        // "   ") would match no node and silently fall through to the AZ-affinity
+        // all-nodes fallback. This mirrors Java's ConnectionManager.resolveClientAz.
+        const trimmedClientAz = options.clientAz?.trim();
+        const clientAz =
+            trimmedClientAz === undefined || trimmedClientAz === ""
+                ? undefined
+                : trimmedClientAz;
+
+        // Validate that clientAz is set when using AZ affinity strategies. The set of
+        // AZ-scoped strategies is declared once (AZ_AFFINITY_READ_FROM_STRATEGIES) so a
+        // newly added AZ strategy cannot silently skip this check.
         if (
-            (options.readFrom === "AZAffinity" ||
-                options.readFrom === "AZAffinityReplicasAndPrimary") &&
-            !options.clientAz
+            options.readFrom !== undefined &&
+            AZ_AFFINITY_READ_FROM_STRATEGIES.has(options.readFrom) &&
+            !clientAz
         ) {
             throw new ConfigurationError(
                 `clientAz must be set when readFrom is set to ${options.readFrom}`,
             );
         }
 
-        return {
+        // Configure client-side cache if provided
+        let clientSideCache: connection_request.IClientSideCache | undefined;
+
+        if (options.clientSideCache) {
+            const cache = options.clientSideCache;
+            clientSideCache = connection_request.ClientSideCache.create({
+                cacheId: cache.cacheId,
+                maxCacheKb: cache.maxCacheKb,
+                entryTtlMs: cache.entryTtlMs,
+                evictionPolicy: cache.evictionPolicy,
+                enableMetrics: cache.enableMetrics,
+                serverAssisted: cache.serverAssisted,
+            });
+        }
+
+        const request: connection_request.IConnectionRequest = {
             protocol,
             clientName: options.clientName,
+            libName: resolveClientLibraryName(
+                options.libName,
+                options.clientInfoTag,
+            ),
             addresses: options.addresses,
             tlsMode: options.useTLS
                 ? connection_request.TlsMode.SecureTls
@@ -9318,10 +9980,65 @@ export class BaseClient {
             authenticationInfo,
             databaseId: options.databaseId,
             inflightRequestsLimit: options.inflightRequestsLimit,
-            clientAz: options.clientAz ?? null,
+            clientAz: clientAz ?? null,
             connectionRetryStrategy: options.connectionBackoff,
             lazyConnect: options.lazyConnect ?? false,
+            clientSideCache,
         };
+
+        if (options.compression) {
+            validateCompressionConfiguration(options.compression);
+            request.compressionConfig = compressionConfigToProtobuf(
+                options.compression,
+                connection_request,
+            );
+        }
+
+        if (options.clientCircuitBreaker) {
+            const cb = options.clientCircuitBreaker;
+
+            if (cb.windowSizeMs !== undefined && cb.windowSizeMs <= 0) {
+                throw new ConfigurationError("windowSizeMs must be positive");
+            }
+
+            if (
+                cb.failureRateThreshold !== undefined &&
+                (cb.failureRateThreshold <= 0.0 ||
+                    cb.failureRateThreshold > 1.0)
+            ) {
+                throw new ConfigurationError(
+                    "failureRateThreshold must be between 0.0 (exclusive) and 1.0 (inclusive)",
+                );
+            }
+
+            if (cb.minErrors !== undefined && cb.minErrors <= 0) {
+                throw new ConfigurationError("minErrors must be positive");
+            }
+
+            if (cb.openTimeoutMs !== undefined && cb.openTimeoutMs <= 0) {
+                throw new ConfigurationError("openTimeoutMs must be positive");
+            }
+
+            if (
+                cb.consecutiveSuccesses !== undefined &&
+                cb.consecutiveSuccesses <= 0
+            ) {
+                throw new ConfigurationError(
+                    "consecutiveSuccesses must be positive",
+                );
+            }
+
+            request.clientCircuitBreaker = {
+                windowSizeMs: cb.windowSizeMs,
+                failureRateThreshold: cb.failureRateThreshold,
+                minErrors: cb.minErrors,
+                openTimeoutMs: cb.openTimeoutMs,
+                countTimeouts: cb.countTimeouts,
+                consecutiveSuccesses: cb.consecutiveSuccesses,
+            };
+        }
+
+        return request;
     }
 
     /**
@@ -9330,7 +10047,7 @@ export class BaseClient {
     protected configureAdvancedConfigurationBase(
         options: AdvancedBaseClientConfiguration,
         request: connection_request.IConnectionRequest,
-    ) {
+    ): void {
         request.connectionTimeout =
             options.connectionTimeout ??
             DEFAULT_CONNECTION_TIMEOUT_IN_MILLISECONDS;
@@ -9340,31 +10057,17 @@ export class BaseClient {
             request.tcpNodelay = options.tcpNoDelay;
         }
 
-        // Apply TLS configuration if present
+        // Set PubSub reconciliation interval if explicitly configured
+        if (options.pubsubReconciliationIntervalMs !== undefined) {
+            request.pubsubReconciliationIntervalMs =
+                options.pubsubReconciliationIntervalMs;
+        }
+
         if (options.tlsAdvancedConfiguration) {
-            // request.tlsMode is either SecureTls or InsecureTls here
-            if (request.tlsMode === connection_request.TlsMode.NoTls) {
-                throw new ConfigurationError(
-                    "TLS advanced configuration cannot be set when useTLS is disabled.",
-                );
-            }
-
-            // If options.tlsAdvancedConfiguration.insecure is true then use InsecureTls mode
-            if (options.tlsAdvancedConfiguration.insecure) {
-                request.tlsMode = connection_request.TlsMode.InsecureTls;
-            }
-
-            if (options.tlsAdvancedConfiguration.rootCertificates) {
-                const certData =
-                    typeof options.tlsAdvancedConfiguration.rootCertificates ===
-                    "string"
-                        ? Buffer.from(
-                              options.tlsAdvancedConfiguration.rootCertificates,
-                              "utf-8",
-                          )
-                        : options.tlsAdvancedConfiguration.rootCertificates;
-                request.rootCerts = [new Uint8Array(certData)];
-            }
+            applyTlsAdvancedConfiguration(
+                options.tlsAdvancedConfiguration,
+                request,
+            );
         }
     }
 
@@ -9375,21 +10078,46 @@ export class BaseClient {
     protected async connectToServer(
         options: BaseClientConfiguration,
     ): Promise<void> {
-        const connectionRequestBytes = Buffer.from(
-            connection_request.ConnectionRequest.encode(
-                this.createClientRequest(options),
-            ).finish(),
-        );
+        const request = this.createClientRequest(options);
 
-        this.clientHandle = await CreateDirectClient(
-            connectionRequestBytes,
-            this.handleResponsesAvailable,
-        );
-        Logger.log("info", "Client lifetime", "Client connection established");
+        if (options.addressResolver) {
+            this.addressResolverKey = registerAddressResolver(
+                options.addressResolver,
+            );
+            request.addressResolverKey = this.addressResolverKey;
+        }
+
+        try {
+            const connectionRequestBytes = Buffer.from(
+                connection_request.ConnectionRequest.encode(
+                    connection_request.ConnectionRequest.create(request),
+                ).finish(),
+            );
+
+            this.clientHandle = await CreateDirectClient(
+                connectionRequestBytes,
+                this.handleResponsesAvailable,
+            );
+            Logger.log(
+                "info",
+                "Client lifetime",
+                "Client connection established",
+            );
+        } catch (err) {
+            if (this.addressResolverKey) {
+                removeAddressResolver(this.addressResolverKey);
+                this.addressResolverKey = undefined;
+            }
+
+            throw err;
+        }
     }
 
     /**
      * Callback invoked when responses are available.
+     *
+     * Response handling failures must not escape this callback because one
+     * exception would stop the rest of the drained responses from processing.
      * @internal
      */
     private handleResponsesAvailable = (): void => {
@@ -9398,9 +10126,25 @@ export class BaseClient {
         const responses = this.clientHandle.drainResponses();
 
         for (const response of responses) {
-            this.handleResponse(response);
+            try {
+                this.handleResponse(response);
+            } catch (err) {
+                Logger.log(
+                    "error",
+                    "Response handling",
+                    `Unhandled exception while handling response: '${err}'`,
+                );
+            }
         }
     };
+
+    /**
+     * Returns the internal client ID used by the Rust core for scope/pool registration.
+     * @internal
+     */
+    public getClientId(): number {
+        return this.clientHandle?.clientId ?? -1;
+    }
 
     /**
      *  Terminate the client by closing all associated resources and any active promises.
@@ -9417,6 +10161,12 @@ export class BaseClient {
         this.pubsubFutures.forEach(([, reject]) => {
             reject(new ClosingError(errorMessage || ""));
         });
+
+        // Clean up address resolver from the global registry
+        if (this.addressResolverKey) {
+            removeAddressResolver(this.addressResolverKey);
+            this.addressResolverKey = undefined;
+        }
 
         // Clean up OTel spans for in-flight requests to prevent memory leaks
         for (const spanPtr of this.otelSpanPointers.values()) {
@@ -9440,6 +10190,40 @@ export class BaseClient {
         }
 
         Logger.log("info", "Client lifetime", "disposing of client");
+    }
+
+    /**
+     * @internal
+     * Serialize a client configuration into the protobuf bytes expected by the
+     * Rust pool APIs (`createPool`, etc.).
+     *
+     * Exposed as a public static so that `ClientPool` (which is not a
+     * BaseClient subclass) can serialise connection config without making a
+     * real connection.
+     */
+    public static serializeConnectionRequest(
+        options: BaseClientConfiguration,
+        constructor: (options?: BaseClientConfiguration) => BaseClient,
+    ): { bytes: Uint8Array; resolverKey: string | undefined } {
+        const instance = constructor(options);
+        const request = instance.createClientRequest(options);
+
+        let resolverKey: string | undefined;
+
+        if (options.addressResolver) {
+            // Register the resolver so Rust can find it by key when creating
+            // pool connections. The key must be embedded in the serialised
+            // request so every new pool connection can locate the callback.
+            resolverKey = registerAddressResolver(options.addressResolver);
+            request.addressResolverKey = resolverKey;
+        }
+
+        const bytes = Buffer.from(
+            connection_request.ConnectionRequest.encode(
+                connection_request.ConnectionRequest.create(request),
+            ).finish(),
+        );
+        return { bytes, resolverKey };
     }
 
     /**
@@ -9553,6 +10337,411 @@ export class BaseClient {
         const refresh = command_request.RefreshIamToken.create({});
         const response = await this.createRefreshIamTokenPromise(refresh);
         return response; // "OK"
+    }
+    /**
+     * Get the cache hit rate (hits / total requests).
+     *
+     * @returns The cache hit rate as a number between 0.0 and 1.0.
+     * @throws RequestError if client-side caching is not enabled or metrics tracking is disabled.
+     * @example
+     * ```typescript
+     * const hitRate = await client.getCacheHitRate();
+     * console.log(`Cache hit rate: ${(hitRate * 100).toFixed(2)}%`);
+     * // Output: Cache hit rate: 85.50%
+     * ```
+     */
+    public async getCacheHitRate(): Promise<number> {
+        return await this.getCacheMetrics(
+            command_request.CacheMetricsType.HitRate,
+        );
+    }
+    /**
+     * Get the cache miss rate (misses / total requests).
+     *
+     * @returns The cache miss rate as a number between 0.0 and 1.0.
+     * @throws RequestError if client-side caching is not enabled or metrics tracking is disabled.
+     * @example
+     * ```typescript
+     * const missRate = await client.getCacheMissRate();
+     * console.log(`Cache miss rate: ${(missRate * 100).toFixed(2)}%`);
+     * // Output: Cache miss rate: 14.50%
+     * ```
+     */
+    public async getCacheMissRate(): Promise<number> {
+        return await this.getCacheMetrics(
+            command_request.CacheMetricsType.MissRate,
+        );
+    }
+    /**
+     * Get the current number of entries in the client-side cache.
+     *
+     * @returns The number of entries in the cache.
+     * @throws RequestError if client-side caching is not enabled.
+     * @example
+     * ```typescript
+     * const entryCount = await client.getCacheEntryCount();
+     * console.log(`Cache entry count: ${entryCount}`);
+     * // Output: Cache entry count: 1500
+     * ```
+     */
+    public async getCacheEntryCount(): Promise<number> {
+        return await this.getCacheMetrics(
+            command_request.CacheMetricsType.EntryCount,
+        );
+    }
+    /**
+     * Get the total number of entries evicted from the client-side cache due to memory constraints.
+     *
+     * @returns The number of evictions.
+     * @throws RequestError if client-side caching is not enabled or metrics tracking is disabled.
+     * @example
+     * ```typescript
+     * const evictions = await client.getCacheEvictions();
+     * console.log(`Cache evictions: ${evictions}`);
+     * // Output: Cache evictions: 100
+     * ```
+     */
+    public async getCacheEvictions(): Promise<number> {
+        return await this.getCacheMetrics(
+            command_request.CacheMetricsType.Evictions,
+        );
+    }
+
+    /**
+     * Get the total number of entries expired from the client-side cache.
+     *
+     * @returns The number of expirations.
+     * @throws RequestError if client-side caching is not enabled or metrics tracking is disabled.
+     * @example
+     * ```typescript
+     * const expirations = await client.getCacheExpirations();
+     * console.log(`Cache expirations: ${expirations}`);
+     * // Output: Cache expirations: 250
+     * ```
+     */
+    public async getCacheExpirations(): Promise<number> {
+        return await this.getCacheMetrics(
+            command_request.CacheMetricsType.Expirations,
+        );
+    }
+
+    /**
+     * Get the total number of cache lookups (hits + misses).
+     *
+     * @returns The total number of cache lookups.
+     * @throws RequestError if client-side caching is not enabled or metrics tracking is disabled.
+     * @example
+     * ```typescript
+     * const totalLookups = await client.getCacheTotalLookups();
+     * console.log(`Total cache lookups: ${totalLookups}`);
+     * // Output: Total cache lookups: 5000
+     * ```
+     */
+    public async getCacheTotalLookups(): Promise<number> {
+        return await this.getCacheMetrics(
+            command_request.CacheMetricsType.TotalLookups,
+        );
+    }
+
+    /**
+     * Subscribes the client to the specified channels (non-blocking).
+     * Returns immediately without waiting for subscription confirmation.
+     *
+     * @see {@link https://valkey.io/commands/subscribe/|valkey.io} for details.
+     *
+     * @param channels - A collection of channel names to subscribe to.
+     * @param options - (Optional) See {@link DecoderOption}.
+     * @returns A promise that resolves immediately.
+     *
+     * @example
+     * ```typescript
+     * await client.subscribeLazy(new Set(["news", "updates"]));
+     * ```
+     */
+    public async subscribeLazy(
+        channels: Iterable<GlideString>,
+        options?: DecoderOption,
+    ): Promise<void> {
+        const channelsArray = Array.from(channels);
+        return this.createWritePromise(
+            createSubscribeLazy(channelsArray),
+            options,
+        );
+    }
+
+    /**
+     * Subscribes the client to the specified channels (blocking).
+     * Waits for subscription confirmation or until timeout.
+     *
+     * @see {@link https://valkey.io/commands/subscribe/|valkey.io} for details.
+     *
+     * @param channels - A collection of channel names to subscribe to.
+     * @param timeoutMs - Maximum time in milliseconds to wait. Use 0 for indefinite wait.
+     * @param options - (Optional) See {@link DecoderOption}.
+     * @returns A promise that resolves when subscription is confirmed or timeout occurs.
+     *
+     * @example
+     * ```typescript
+     * // Wait up to 5 seconds
+     * await client.subscribe(new Set(["news"]), 5000);
+     * // Wait indefinitely
+     * await client.subscribe(new Set(["news"]), 0);
+     * ```
+     */
+    public async subscribe(
+        channels: Iterable<GlideString>,
+        timeoutMs: number,
+        options?: DecoderOption,
+    ): Promise<void> {
+        const channelsArray = Array.from(channels);
+        return this.createWritePromise(
+            createSubscribe(channelsArray, timeoutMs),
+            options,
+        );
+    }
+
+    /**
+     * Subscribes the client to the specified patterns (non-blocking).
+     * Returns immediately without waiting for subscription confirmation.
+     *
+     * @see {@link https://valkey.io/commands/psubscribe/|valkey.io} for details.
+     *
+     * @param patterns - An array of glob-style patterns to subscribe to.
+     * @param options - (Optional) See {@link DecoderOption}.
+     * @returns A promise that resolves immediately.
+     *
+     * @example
+     * ```typescript
+     * await client.psubscribeLazy(["news.*", "updates.*"]);
+     * ```
+     */
+    public async psubscribeLazy(
+        patterns: Iterable<GlideString>,
+        options?: DecoderOption,
+    ): Promise<void> {
+        const patternsArray = Array.from(patterns);
+        return this.createWritePromise(
+            createPSubscribeLazy(patternsArray),
+            options,
+        );
+    }
+
+    /**
+     * Subscribes the client to the specified patterns (blocking).
+     * Waits for subscription confirmation or until timeout.
+     *
+     * @see {@link https://valkey.io/commands/psubscribe/|valkey.io} for details.
+     *
+     * @param patterns - An array of glob-style patterns to subscribe to.
+     * @param timeoutMs - Maximum time in milliseconds to wait. Use 0 for indefinite wait.
+     * @param options - (Optional) See {@link DecoderOption}.
+     * @returns A promise that resolves when subscription is confirmed or timeout occurs.
+     *
+     * @example
+     * ```typescript
+     * await client.psubscribe(["news.*"], 5000);
+     * ```
+     */
+    public async psubscribe(
+        patterns: Iterable<GlideString>,
+        timeoutMs: number,
+        options?: DecoderOption,
+    ): Promise<void> {
+        const patternsArray = Array.from(patterns);
+        return this.createWritePromise(
+            createPSubscribe(patternsArray, timeoutMs),
+            options,
+        );
+    }
+
+    /**
+     * Unsubscribes the client from the specified channels (non-blocking).
+     * Pass null or ALL_CHANNELS to unsubscribe from all exact channels.
+     *
+     * @see {@link https://valkey.io/commands/unsubscribe/|valkey.io} for details.
+     *
+     * @param channels - Channel names to unsubscribe from, or null for all channels.
+     * @param options - (Optional) See {@link DecoderOption}.
+     * @returns A promise that resolves immediately.
+     *
+     * @example
+     * ```typescript
+     * await client.unsubscribeLazy(new Set(["news"]));
+     * // Unsubscribe from all channels
+     * await client.unsubscribeLazy(ALL_CHANNELS);
+     * ```
+     */
+    public async unsubscribeLazy(
+        channels?: Iterable<GlideString> | null,
+        options?: DecoderOption,
+    ): Promise<void> {
+        const channelsArray = channels ? Array.from(channels) : undefined;
+        return this.createWritePromise(
+            createUnsubscribeLazy(channelsArray),
+            options,
+        );
+    }
+
+    /**
+     * Unsubscribes the client from the specified channels (blocking).
+     * Pass null or ALL_CHANNELS to unsubscribe from all exact channels.
+     *
+     * @see {@link https://valkey.io/commands/unsubscribe/|valkey.io} for details.
+     *
+     * @param channels - Channel names to unsubscribe from, or null for all channels.
+     * @param timeoutMs - Maximum time in milliseconds to wait. Use 0 for indefinite wait.
+     * @param options - (Optional) See {@link DecoderOption}.
+     * @returns A promise that resolves when unsubscription is confirmed or timeout occurs.
+     *
+     * @example
+     * ```typescript
+     * await client.unsubscribe(new Set(["news"]), 5000);
+     * // Unsubscribe from all channels with timeout
+     * await client.unsubscribe(ALL_CHANNELS, 5000);
+     * ```
+     */
+    public async unsubscribe(
+        channels: Iterable<GlideString> | null,
+        timeoutMs: number,
+        options?: DecoderOption,
+    ): Promise<void> {
+        const channelsArray = channels ? Array.from(channels) : [];
+        return this.createWritePromise(
+            createUnsubscribe(channelsArray, timeoutMs),
+            options,
+        );
+    }
+
+    /**
+     * Unsubscribes the client from the specified patterns (non-blocking).
+     * Pass null or ALL_PATTERNS to unsubscribe from all patterns.
+     *
+     * @see {@link https://valkey.io/commands/punsubscribe/|valkey.io} for details.
+     *
+     * @param patterns - Pattern names to unsubscribe from, or null for all patterns.
+     * @param options - (Optional) See {@link DecoderOption}.
+     * @returns A promise that resolves immediately.
+     *
+     * @example
+     * ```typescript
+     * await client.punsubscribeLazy(new Set(["news.*"]));
+     * // Unsubscribe from all patterns
+     * await client.punsubscribeLazy(ALL_PATTERNS);
+     * ```
+     */
+    public async punsubscribeLazy(
+        patterns?: Iterable<GlideString> | null,
+        options?: DecoderOption,
+    ): Promise<void> {
+        const patternsArray = patterns ? Array.from(patterns) : undefined;
+        return this.createWritePromise(
+            createPUnsubscribeLazy(patternsArray),
+            options,
+        );
+    }
+
+    /**
+     * Unsubscribes the client from the specified patterns (blocking).
+     * Pass null or ALL_PATTERNS to unsubscribe from all patterns.
+     *
+     * @see {@link https://valkey.io/commands/punsubscribe/|valkey.io} for details.
+     *
+     * @param patterns - Pattern names to unsubscribe from, or null for all patterns.
+     * @param timeoutMs - Maximum time in milliseconds to wait. Use 0 for indefinite wait.
+     * @param options - (Optional) See {@link DecoderOption}.
+     * @returns A promise that resolves when unsubscription is confirmed or timeout occurs.
+     *
+     * @example
+     * ```typescript
+     * await client.punsubscribe(new Set(["news.*"]), 5000);
+     * // Unsubscribe from all patterns with timeout
+     * await client.punsubscribe(ALL_PATTERNS, 5000);
+     * ```
+     */
+    public async punsubscribe(
+        patterns: Iterable<GlideString> | null,
+        timeoutMs: number,
+        options?: DecoderOption,
+    ): Promise<void> {
+        const patternsArray = patterns ? Array.from(patterns) : [];
+        return this.createWritePromise(
+            createPUnsubscribe(patternsArray, timeoutMs),
+            options,
+        );
+    }
+
+    /**
+     * @internal
+     * Helper method to parse GetSubscriptions response from Rust core.
+     * Converts array response to structured object with desired and actual subscriptions.
+     *
+     * The Rust core returns subscription data as a Value::Map with string keys ("Exact", "Pattern", "Sharded").
+     * The NAPI layer converts this to GlideRecord format: [{key: "Exact", value: [...]}, ...]
+     *
+     * @param response - The response array from Rust core with format:
+     *   ["desired", GlideRecord, "actual", GlideRecord]
+     * @returns Parsed subscription state with desired and actual subscriptions
+     */
+    protected parseGetSubscriptionsResponse<T extends number>(
+        response: unknown[],
+    ): {
+        desiredSubscriptions: Partial<Record<T, Set<GlideString>>>;
+        actualSubscriptions: Partial<Record<T, Set<GlideString>>>;
+    } {
+        // Response format: ["desired", GlideRecord, "actual", GlideRecord]
+        if (!Array.isArray(response) || response.length !== 4) {
+            throw new Error(
+                `Invalid GetSubscriptions response format: expected array of length 4, got ${JSON.stringify(response)}`,
+            );
+        }
+
+        // Map string mode names to numeric enum values
+        const modeNameToNumber: Record<string, number> = {
+            Exact: 0,
+            Pattern: 1,
+            Sharded: 2,
+        };
+
+        const desiredSubscriptions: Partial<Record<T, Set<GlideString>>> = {};
+        const actualSubscriptions: Partial<Record<T, Set<GlideString>>> = {};
+
+        // Helper function to parse subscription data from GlideRecord format
+        const parseSubscriptionData = (
+            data: unknown,
+            target: Partial<Record<T, Set<GlideString>>>,
+        ): void => {
+            if (!Array.isArray(data)) {
+                return;
+            }
+
+            for (const entry of data) {
+                if (
+                    !entry ||
+                    typeof entry !== "object" ||
+                    !("key" in entry) ||
+                    !("value" in entry)
+                ) {
+                    continue;
+                }
+
+                // Key might be a Buffer, convert to string
+                const modeName =
+                    entry.key instanceof Buffer
+                        ? entry.key.toString()
+                        : String(entry.key);
+                const modeKey = modeNameToNumber[modeName] as T;
+
+                if (modeKey !== undefined && Array.isArray(entry.value)) {
+                    target[modeKey] = new Set(entry.value as GlideString[]);
+                }
+            }
+        };
+
+        // Parse desired and actual subscriptions
+        parseSubscriptionData(response[1], desiredSubscriptions);
+        parseSubscriptionData(response[3], actualSubscriptions);
+
+        return { desiredSubscriptions, actualSubscriptions };
     }
 
     /**

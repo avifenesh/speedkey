@@ -1,25 +1,33 @@
 // Copyright Valkey GLIDE Project Contributors - SPDX Identifier: Apache-2.0
 
 #![allow(dead_code)]
+use crate::constants::{HOSTNAME_TLS, IP_ADDRESS_V4, IP_ADDRESS_V6};
 use futures::Future;
 use glide_core::{
     client::{Client, StandaloneClient},
     connection_request::{self, AuthenticationInfo, NodeAddress, ProtocolVersion},
 };
 use once_cell::sync::Lazy;
-use rand::{RngExt, distr::Alphanumeric};
+use rand::{Rng, distributions::Alphanumeric};
 use redis::{
     ConnectionAddr, GlideConnectionOptions, PushInfo, RedisConnectionInfo, RedisResult, Value,
     cluster_routing::{MultipleNodeRoutingInfo, RoutingInfo},
 };
 use socket2::{Domain, Socket, Type};
 use std::{
-    env, fs, io, net::SocketAddr, net::TcpListener, ops::Deref, path::PathBuf, process,
-    sync::Mutex, time::Duration,
+    collections::HashMap,
+    env, fs, io,
+    net::{SocketAddr, TcpListener},
+    ops::Deref,
+    path::PathBuf,
+    process,
+    sync::Mutex,
+    time::Duration,
 };
-use tempfile::TempDir;
 use tokio::sync::mpsc;
 use versions::Versioning;
+
+use crate::utilities::{self, cluster::create_cluster_client};
 
 pub mod cluster;
 pub mod mocks;
@@ -68,7 +76,7 @@ pub fn get_shared_server_address(use_tls: bool) -> ConnectionAddr {
     }
 }
 
-#[dtor::dtor(unsafe)]
+#[ctor::dtor]
 fn clean_shared_clusters() {
     if let Some(mutex) = SharedServer::get(&SHARED_SERVER) {
         drop(mutex.lock().unwrap().take());
@@ -88,20 +96,41 @@ pub enum Module {
     Json,
 }
 
-pub fn get_listener_on_available_port() -> TcpListener {
-    let addr = &"127.0.0.1:0".parse::<SocketAddr>().unwrap().into();
-    let socket = Socket::new(Domain::IPV4, Type::STREAM, None).unwrap();
-    socket.set_reuse_address(true).unwrap();
-    socket.bind(addr).unwrap();
-    socket.listen(1).unwrap();
-    TcpListener::from(socket)
+pub fn get_available_port() -> u16 {
+    let attempts = 100;
+    for _ in 0..attempts {
+        let port = rand::random::<u16>().max(6379);
+
+        let addr4 = format!("{}:{}", IP_ADDRESS_V4, port)
+            .parse::<SocketAddr>()
+            .unwrap()
+            .into();
+
+        let sock4 = Socket::new(Domain::IPV4, Type::STREAM, None).unwrap();
+        if sock4.bind(&addr4).is_err() {
+            continue;
+        }
+
+        let addr6 = format!("[{}]:{}", IP_ADDRESS_V6, port)
+            .parse::<SocketAddr>()
+            .unwrap()
+            .into();
+
+        let sock6 = Socket::new(Domain::IPV6, Type::STREAM, None).unwrap();
+        sock6.set_only_v6(true).unwrap();
+        if sock6.bind(&addr6).is_err() {
+            continue;
+        }
+
+        return port;
+    }
+
+    panic!("Failed to find available port after {} attempts", attempts);
 }
 
-pub fn get_available_port() -> u16 {
-    // this is technically a race but we can't do better with
-    // the tools that redis gives us :(
-    let listener = get_listener_on_available_port();
-    listener.local_addr().unwrap().port()
+pub fn get_listener_on_available_port() -> TcpListener {
+    TcpListener::bind((IP_ADDRESS_V4, 0))
+        .expect("failed to bind test listener to an ephemeral port")
 }
 
 impl RedisServer {
@@ -115,13 +144,13 @@ impl RedisServer {
                 let redis_port = get_available_port();
                 if tls {
                     redis::ConnectionAddr::TcpTls {
-                        host: "127.0.0.1".to_string(),
+                        host: IP_ADDRESS_V4.to_string(),
                         port: redis_port,
                         insecure: true,
                         tls_params: None,
                     }
                 } else {
-                    redis::ConnectionAddr::Tcp("127.0.0.1".to_string(), redis_port)
+                    redis::ConnectionAddr::Tcp(IP_ADDRESS_V4.to_string(), redis_port)
                 }
             }
             ServerType::Unix => {
@@ -131,6 +160,25 @@ impl RedisServer {
             }
         };
         RedisServer::new_with_addr_and_modules(addr, modules)
+    }
+
+    pub fn new_with_tls(use_tls: bool, tls_paths: Option<TlsFilePaths>) -> RedisServer {
+        let redis_port = get_available_port();
+        let addr = if use_tls {
+            redis::ConnectionAddr::TcpTls {
+                host: IP_ADDRESS_V4.to_string(),
+                port: redis_port,
+                insecure: true,
+                tls_params: None,
+            }
+        } else {
+            redis::ConnectionAddr::Tcp(IP_ADDRESS_V4.to_string(), redis_port)
+        };
+
+        RedisServer::new_with_addr_tls_modules_and_spawner(addr, tls_paths, &[], false, |cmd| {
+            cmd.spawn()
+                .unwrap_or_else(|err| panic!("Failed to run {cmd:?}: {err}"))
+        })
     }
 
     pub fn new_with_addr_and_modules(
@@ -188,7 +236,7 @@ impl RedisServer {
                 }
             }
             redis::ConnectionAddr::TcpTls { ref host, port, .. } => {
-                let tls_paths = tls_paths.unwrap_or_else(|| build_keys_and_certs_for_tls(&tempdir));
+                let tls_paths = tls_paths.unwrap_or_else(|| build_tls_file_paths(&tempdir));
                 let tls_auth_clients_arg_value = match tls_auth_clients {
                     true => "yes",
                     _ => "no",
@@ -348,15 +396,18 @@ pub struct TlsFilePaths {
     ca_crt: PathBuf,
 }
 
-pub fn build_keys_and_certs_for_tls(tempdir: &TempDir) -> TlsFilePaths {
+/// Build and returns TLS file paths using the provided temp directory.
+pub fn build_tls_file_paths(tempdir: &tempfile::TempDir) -> TlsFilePaths {
     // Based on shell script in redis's server tests
     // https://github.com/redis/redis/blob/8c291b97b95f2e011977b522acf77ead23e26f55/utils/gen-test-certs.sh
-    let ca_crt = tempdir.path().join("ca.crt");
-    let ca_key = tempdir.path().join("ca.key");
-    let ca_serial = tempdir.path().join("ca.txt");
-    let redis_crt = tempdir.path().join("redis.crt");
-    let redis_key = tempdir.path().join("redis.key");
-    let ext_file = tempdir.path().join("openssl.cnf");
+
+    let temp_dir_path: &std::path::Path = tempdir.path();
+    let ca_crt = temp_dir_path.join("ca.crt");
+    let ca_key = temp_dir_path.join("ca.key");
+    let ca_serial = temp_dir_path.join("ca.txt");
+    let redis_crt = temp_dir_path.join("redis.crt");
+    let redis_key = temp_dir_path.join("redis.key");
+    let ext_file = temp_dir_path.join("openssl.cnf");
 
     fn make_key<S: AsRef<std::ffi::OsStr>>(name: S, size: usize) {
         process::Command::new("openssl")
@@ -373,7 +424,9 @@ pub fn build_keys_and_certs_for_tls(tempdir: &TempDir) -> TlsFilePaths {
     }
 
     // Build CA Key
-    make_key(&ca_key, 4096);
+    // 2048 bits is enough for a test CA and generates much faster than 4096 on
+    // entropy-constrained runners. Matches the Python cluster manager.
+    make_key(&ca_key, 2048);
 
     // Build redis key
     make_key(&redis_key, 2048);
@@ -400,9 +453,15 @@ pub fn build_keys_and_certs_for_tls(tempdir: &TempDir) -> TlsFilePaths {
         .wait()
         .expect("failed to create CA cert");
 
-    // Build x509v3 extensions file with SAN for 127.0.0.1
-    fs::write(&ext_file, b"keyUsage = digitalSignature, keyEncipherment\nsubjectAltName = IP:127.0.0.1,DNS:localhost")
-        .expect("failed to create x509v3 extensions file");
+    // Build x509v3 extensions file with SAN for IPv4, IPv6, localhost, and test hostname
+    fs::write(
+        &ext_file,
+        format!(
+            "keyUsage = digitalSignature, keyEncipherment\nsubjectAltName = IP:{},IP:{},DNS:localhost,DNS:{}",
+            IP_ADDRESS_V4, IP_ADDRESS_V6, HOSTNAME_TLS
+        ),
+    )
+    .expect("failed to create x509v3 extensions file");
 
     // Read redis key
     let mut key_cmd = process::Command::new("openssl")
@@ -463,6 +522,84 @@ impl TlsFilePaths {
     pub fn read_redis_key_as_bytes(&self) -> Vec<u8> {
         fs::read(&self.redis_key).expect("Failed to read redis private key file")
     }
+    pub fn ca_crt_path(&self) -> &PathBuf {
+        &self.ca_crt
+    }
+}
+
+/// Generate a fresh client certificate and private key, signed by the same CA
+/// that [`build_tls_file_paths`] created, and write them to `dest_crt` and
+/// `dest_key`. This simulates on-disk cert rotation (like cert-manager).
+pub fn rotate_client_cert_and_key(
+    tls_paths: &TlsFilePaths,
+    dest_crt: &std::path::Path,
+    dest_key: &std::path::Path,
+) {
+    let ca_crt = &tls_paths.ca_crt;
+    let ca_key = ca_crt.with_file_name("ca.key");
+    let ca_serial = ca_crt.with_file_name("ca.txt");
+    let ext_file = ca_crt.with_file_name("rotate_openssl.cnf");
+
+    process::Command::new("openssl")
+        .arg("genrsa")
+        .arg("-out")
+        .arg(dest_key)
+        .arg("2048")
+        .stdout(process::Stdio::null())
+        .stderr(process::Stdio::null())
+        .spawn()
+        .expect("failed to spawn openssl")
+        .wait()
+        .expect("failed to create rotated client key");
+
+    fs::write(
+        &ext_file,
+        format!(
+            "keyUsage = digitalSignature, keyEncipherment\nsubjectAltName = IP:{},IP:{},DNS:localhost,DNS:{}",
+            IP_ADDRESS_V4, IP_ADDRESS_V6, HOSTNAME_TLS
+        ),
+    )
+    .expect("failed to create x509v3 extensions file");
+
+    let mut csr_cmd = process::Command::new("openssl")
+        .arg("req")
+        .arg("-new")
+        .arg("-sha256")
+        .arg("-subj")
+        .arg("/O=Redis Test/CN=Generic-cert")
+        .arg("-key")
+        .arg(dest_key)
+        .stdout(process::Stdio::piped())
+        .stderr(process::Stdio::null())
+        .spawn()
+        .expect("failed to spawn openssl");
+
+    process::Command::new("openssl")
+        .arg("x509")
+        .arg("-req")
+        .arg("-sha256")
+        .arg("-CA")
+        .arg(ca_crt)
+        .arg("-CAkey")
+        .arg(&ca_key)
+        .arg("-CAserial")
+        .arg(&ca_serial)
+        .arg("-CAcreateserial")
+        .arg("-days")
+        .arg("365")
+        .arg("-extfile")
+        .arg(&ext_file)
+        .arg("-out")
+        .arg(dest_crt)
+        .stdin(csr_cmd.stdout.take().expect("should have stdout"))
+        .stdout(process::Stdio::null())
+        .stderr(process::Stdio::null())
+        .spawn()
+        .expect("failed to spawn openssl")
+        .wait()
+        .expect("failed to create rotated client cert");
+
+    csr_cmd.wait().expect("failed to create rotated client CSR");
 }
 
 pub async fn wait_for_server_to_become_ready(server_address: &ConnectionAddr) {
@@ -536,7 +673,7 @@ pub fn get_address_info(address: &ConnectionAddr) -> NodeAddress {
 }
 
 pub fn generate_random_string(length: usize) -> String {
-    rand::rng()
+    rand::thread_rng()
         .sample_iter(&Alphanumeric)
         .take(length)
         .map(char::from)
@@ -561,7 +698,7 @@ pub async fn send_set_and_get(mut client: Client, key: String) {
     let get_result = client.send_command(&mut get_command, None).await.unwrap();
 
     assert_eq!(set_result, Value::Okay);
-    assert_eq!(get_result, Value::BulkString(value.into_bytes()));
+    assert_eq!(get_result, Value::BulkString(value.into_bytes().into()));
 }
 
 pub struct TestBasics {
@@ -595,17 +732,29 @@ fn set_connection_info_to_connection_request(
     }
 }
 
-pub async fn repeat_try_create<T, Fut>(f: impl Fn() -> Fut) -> T
+/// Repeatedly calls `f` until it returns `Some`, using a default timeout of 3 seconds.
+/// Panics if the timeout is exceeded.
+pub async fn retry<T, Fut>(f: impl Fn() -> Fut) -> T
 where
     Fut: Future<Output = Option<T>>,
 {
-    for _ in 0..500 {
+    retry_until_timeout(f, std::time::Duration::from_millis(3000)).await
+}
+
+/// Repeatedly calls `f` every 5ms until it returns `Some` or the `timeout` is exceeded.
+/// Panics if the timeout is exceeded.
+pub async fn retry_until_timeout<T, Fut>(f: impl Fn() -> Fut, timeout: std::time::Duration) -> T
+where
+    Fut: Future<Output = Option<T>>,
+{
+    let start = tokio::time::Instant::now();
+    while start.elapsed() < timeout {
         if let Some(value) = f().await {
             return value;
         }
         tokio::time::sleep(std::time::Duration::from_millis(5)).await;
     }
-    panic!("Couldn't create object");
+    panic!("Timed out: retry exceeded {:?}", timeout);
 }
 
 pub async fn setup_acl(addr: &ConnectionAddr, connection_info: &RedisConnectionInfo) {
@@ -614,7 +763,7 @@ pub async fn setup_acl(addr: &ConnectionAddr, connection_info: &RedisConnectionI
         redis: RedisConnectionInfo::default(),
     })
     .unwrap();
-    let mut connection = repeat_try_create(|| async {
+    let mut connection = retry(|| async {
         client
             .get_multiplexed_async_connection(GlideConnectionOptions::default())
             .await
@@ -682,6 +831,33 @@ pub fn create_connection_request(
     }
     connection_request.lazy_connect = configuration.lazy_connect;
     connection_request.protocol = configuration.protocol.into();
+
+    connection_request.client_side_cache =
+        protobuf::MessageField::from_option(configuration.client_side_cache.clone());
+
+    if let Some(cert_path) = &configuration.client_cert_path {
+        connection_request.client_cert_path = Some(cert_path.clone().into());
+    }
+    if let Some(key_path) = &configuration.client_key_path {
+        connection_request.client_key_path = Some(key_path.clone().into());
+    }
+    if !configuration.root_certs.is_empty() {
+        connection_request.root_certs = configuration
+            .root_certs
+            .iter()
+            .map(|c| c.clone().into())
+            .collect();
+        connection_request.tls_mode = connection_request::TlsMode::SecureTls.into();
+    }
+    if let Some(interval) = configuration.cert_reload_interval_seconds {
+        connection_request.cert_reload =
+            protobuf::MessageField::some(connection_request::ClientCertReloadConfig {
+                enabled: true,
+                interval_seconds: Some(interval),
+                ..Default::default()
+            });
+    }
+
     connection_request
 }
 
@@ -699,6 +875,17 @@ pub struct TestConfiguration {
     pub client_az: Option<String>,
     pub protocol: ProtocolVersion,
     pub lazy_connect: bool,
+    pub client_side_cache: Option<connection_request::ClientSideCache>,
+    /// Skip ACL setup when creating a cluster client (use when ACL is already configured).
+    pub skip_acl_setup: bool,
+    /// Path to the mTLS client certificate file (PEM) for path-based cert reload.
+    pub client_cert_path: Option<String>,
+    /// Path to the mTLS client private key file (PEM) for path-based cert reload.
+    pub client_key_path: Option<String>,
+    /// Root/CA certificate bytes for SecureTls verification.
+    pub root_certs: Vec<Vec<u8>>,
+    /// Cert reload interval in seconds (enables periodic re-read of client cert/key).
+    pub cert_reload_interval_seconds: Option<u32>,
 }
 
 pub(crate) async fn setup_test_basics_internal(configuration: &TestConfiguration) -> TestBasics {
@@ -737,18 +924,72 @@ pub(crate) async fn setup_test_basics_internal(configuration: &TestConfiguration
     }
 }
 
-pub async fn setup_test_basics(use_tls: bool) -> TestBasics {
+pub async fn setup_test_basics_tls(use_tls: bool) -> TestBasics {
     setup_test_basics_internal(&TestConfiguration {
         use_tls,
         ..Default::default()
     })
     .await
 }
+pub(crate) struct TestClientBasics {
+    pub(crate) server: BackingServer,
+    pub(crate) client: Client,
+}
+pub(crate) async fn create_client(
+    server: &BackingServer,
+    configuration: TestConfiguration,
+) -> Client {
+    match server {
+        BackingServer::Standalone(server) => {
+            let connection_addr = server
+                .as_ref()
+                .map(|server| server.get_client_addr())
+                .unwrap_or(get_shared_server_address(configuration.use_tls));
+
+            // TODO - this is a patch, handling the situation where the new server
+            // still isn't available to connection. This should be fixed in [RedisServer].
+            retry(|| async {
+                Client::new(
+                    create_connection_request(
+                        std::slice::from_ref(&connection_addr),
+                        &configuration,
+                    )
+                    .into(),
+                    None,
+                )
+                .await
+                .ok()
+            })
+            .await
+        }
+        BackingServer::Cluster(cluster) => {
+            create_cluster_client(cluster.as_ref(), configuration).await
+        }
+    }
+}
+
+pub(crate) async fn setup_test_basics(
+    use_cluster: bool,
+    configuration: TestConfiguration,
+) -> TestClientBasics {
+    if use_cluster {
+        let cluster_basics = cluster::setup_test_basics_internal(configuration).await;
+        TestClientBasics {
+            server: BackingServer::Cluster(cluster_basics.cluster),
+            client: cluster_basics.client,
+        }
+    } else {
+        let test_basics: TestBasics = utilities::setup_test_basics_internal(&configuration).await;
+        let server = BackingServer::Standalone(test_basics.server);
+        let client = create_client(&server, configuration).await;
+        TestClientBasics { server, client }
+    }
+}
 
 #[cfg(test)]
-#[ctor::ctor(unsafe)]
+#[ctor::ctor]
 fn init() {
-    logger_core::init(Some(logger_core::Level::Debug), None);
+    glide_logger::init(Some(glide_logger::Level::Debug), None);
 
     // This needs to be done before any TLS connections are made
     let _ = rustls::crypto::CryptoProvider::install_default(
@@ -783,6 +1024,30 @@ pub async fn kill_connection_for_route(
         .send_command(&mut client_kill_cmd, Some(route))
         .await
         .unwrap();
+}
+
+/// Kill all connections on a server using a direct (non-glide) connection.
+/// Useful when the glide client connection is deauthed (e.g. after RESET) and
+/// cannot send commands itself.
+pub async fn kill_connection_via_addr(addr: &ConnectionAddr, password: Option<&str>) {
+    let client = redis::Client::open(redis::ConnectionInfo {
+        addr: addr.clone(),
+        redis: RedisConnectionInfo {
+            password: password.map(|p| p.to_string()),
+            ..Default::default()
+        },
+    })
+    .unwrap();
+    let mut conn = retry(|| async {
+        client
+            .get_multiplexed_async_connection(GlideConnectionOptions::default())
+            .await
+            .ok()
+    })
+    .await;
+    let mut cmd = redis::cmd("CLIENT");
+    cmd.arg("KILL").arg("SKIPME").arg("NO");
+    let _: redis::RedisResult<redis::Value> = conn.send_packed_command(&cmd).await;
 }
 
 pub enum BackingServer {
@@ -869,4 +1134,91 @@ pub fn extract_client_id(client_info: &str) -> Option<String> {
         .find(|part| part.starts_with("id="))
         .and_then(|id_part| id_part.strip_prefix("id="))
         .map(|id| id.to_string())
+}
+
+/// Assert that a client is connected by sending a PING command
+pub async fn assert_connected(client: &mut impl glide_core::client::GlideClientForTests) {
+    let mut ping_cmd = redis::cmd("PING");
+    let ping_result = client.send_command(&mut ping_cmd, None).await;
+    assert_eq!(
+        ping_result.unwrap(),
+        Value::SimpleString("PONG".to_string())
+    );
+}
+
+/// Helper function to assert that a specific command was called a certain number of times
+pub async fn assert_command_count(
+    client: &mut Client,
+    command: &str,
+    expected_count: usize,
+    use_cluster: bool,
+) {
+    let mut info_cmd = redis::Cmd::new();
+    info_cmd.arg("INFO").arg("commandstats");
+
+    // Execute INFO commandstats
+    let routing = if use_cluster {
+        Some(RoutingInfo::MultiNode((
+            MultipleNodeRoutingInfo::AllNodes,
+            None,
+        )))
+    } else {
+        None
+    };
+
+    let res = client
+        .send_command(&mut info_cmd, routing)
+        .await
+        .expect("INFO commandstats command failed");
+
+    // Parse the INFO output based on mode
+    let info_strings: Vec<String> = if use_cluster {
+        // Cluster mode: returns HashMap<String, String>
+        let info_result: HashMap<String, String> =
+            redis::from_owned_redis_value(res).expect("Failed to parse INFO command result");
+        info_result.into_values().collect()
+    } else {
+        // Standalone mode: returns a single string
+        let info_str: String =
+            redis::from_owned_redis_value(res).expect("Failed to parse INFO command result");
+        vec![info_str]
+    };
+
+    // Search for the specified command across all info outputs
+    let mut command_count: usize = 0;
+    let command_prefix = format!("cmdstat_{}:calls=", command.to_lowercase());
+
+    for info in info_strings {
+        for line in info.lines() {
+            if line.starts_with(&command_prefix)
+                && let Some(count_str) = line.strip_prefix(&command_prefix)
+            {
+                let count_val = count_str
+                    .split(',')
+                    .next()
+                    .unwrap_or("0")
+                    .parse::<usize>()
+                    .unwrap_or(0);
+                command_count += count_val;
+                break;
+            }
+        }
+    }
+
+    // Assert that the found count matches the expected count
+    assert_eq!(
+        command_count, expected_count,
+        "Expected {} count {} but found {}",
+        command, expected_count, command_count
+    );
+}
+
+/// Helper to check if a key is in cache
+pub fn is_key_cached(
+    cache_id: &str,
+    key: &[u8],
+    cache_key_type: redis::cache::glide_cache::CachedKeyType,
+) -> bool {
+    let cache = redis::cache::get_or_create_cache(cache_id, 1000, 0, None, true);
+    cache.get(key, cache_key_type).is_some()
 }

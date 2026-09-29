@@ -1,13 +1,23 @@
 // Copyright Valkey GLIDE Project Contributors - SPDX Identifier: Apache-2.0
 
+mod pool;
+
+use glide_core::client::{MonitorClient, MonitorLine, MonitorLineCallback, NodeAddress, TlsMode};
 use glide_core::cluster_scan_container::get_cluster_scan_cursor;
+use glide_core::compression::process_command_args_for_compression;
+use glide_core::connection_request;
 use glide_core::errors::{error_message, error_type};
+use glide_core::otel_db_semantics::{set_db_attributes, set_db_batch_attributes};
 use glide_core::{
     DEFAULT_FLUSH_SIGNAL_INTERVAL_MS, GlideOpenTelemetry, GlideOpenTelemetryConfigBuilder,
     GlideOpenTelemetrySignalsExporter, GlideSpan, Telemetry,
 };
+use glide_logger::{log_warn, log_warn_lazy};
+use glide_telemetry::GlideSpanStatus;
 use redis::cluster_routing::Routable;
-use redis::{ClusterScanArgs, PushInfo, ScanStateRC};
+use redis::{
+    Arg, ClusterScanArgs, Cmd, ErrorKind, PipelineRetryStrategy, PushInfo, RedisError, ScanStateRC,
+};
 
 #[cfg(not(target_env = "msvc"))]
 use tikv_jemallocator::Jemalloc;
@@ -32,7 +42,9 @@ use glide_core::request_type::RequestType;
 use napi::bindgen_prelude::BigInt;
 use napi::bindgen_prelude::Either;
 use napi::bindgen_prelude::Uint8Array;
-use napi::bindgen_prelude::{BufferSlice, Function, JsObjectValue, Null, Object, ToNapiValue};
+use napi::bindgen_prelude::{
+    BufferSlice, FnArgs, Function, JsObjectValue, Null, Object, ToNapiValue,
+};
 use napi::threadsafe_function::{ThreadsafeFunction, ThreadsafeFunctionCallMode};
 use napi::{Env, Error, Result, Status, Unknown};
 use napi_derive::napi;
@@ -44,10 +56,11 @@ use redis::cluster_routing::{
 };
 #[cfg(feature = "testing_utilities")]
 use std::collections::HashMap;
+use std::collections::HashMap as StdHashMap;
 use std::ptr::from_mut;
 use std::str::FromStr;
-use std::sync::atomic::{AtomicIsize, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::atomic::{AtomicIsize, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 use tokio::sync::mpsc;
 use tokio::task;
 use tokio_util::task::LocalPoolHandle;
@@ -113,14 +126,14 @@ pub struct RequestErrorNapi {
 }
 
 // ============================================================================
-// Response Ring Buffer - Shared between Rust workers and JS callback
+// Response Buffer - Shared between Rust workers and JS callback
 // ============================================================================
 
 use parking_lot::Mutex as PLMutex;
 use std::sync::atomic::AtomicBool;
 
 /// Per-client response buffer with batched wake-up.
-/// Each client has its OWN buffer to avoid contention between workers.
+/// Each client owns its response buffer to avoid contention between clients.
 /// Responses are accumulated in the buffer, and JS is notified once per batch.
 /// Uses Vec instead of VecDeque for better cache locality (we only push/drain).
 struct ResponseBuffer {
@@ -156,8 +169,7 @@ impl ResponseBuffer {
     }
 
     /// Push a response to the buffer and return whether a wake-up is needed.
-    /// This is called from the worker thread that owns this client.
-    /// Since each client has its own buffer, there's no contention between clients.
+    /// Called from worker tasks and synchronous error paths.
     /// Returns false if the buffer is closed (no wake-up needed).
     #[inline]
     fn push(&self, response: CommandResponse) -> bool {
@@ -195,7 +207,6 @@ impl ResponseBuffer {
         guard.drain(..).collect()
     }
 
-    /// Free all leaked Value pointers in pending responses.
     /// Free a leaked Value pointer from a single CommandResponse, if present.
     /// Called when a response is dropped without being consumed by JS
     /// (e.g., push() finds the buffer already closed).
@@ -240,6 +251,9 @@ struct WorkerPoolState {
 
 static WORKER_POOL_STATE: OnceLock<PLMutex2<WorkerPoolState>> = OnceLock::new();
 
+/// Global counter for unique client IDs (used for scope registry).
+static NEXT_CLIENT_ID: AtomicU64 = AtomicU64::new(1);
+
 fn get_worker_pool_state() -> &'static PLMutex2<WorkerPoolState> {
     WORKER_POOL_STATE.get_or_init(|| {
         PLMutex2::new(WorkerPoolState {
@@ -276,6 +290,31 @@ fn release_worker_pool() {
     }
 }
 
+/// RAII guard that clears the pool blocking flag when dropped.
+/// Ensures the flag is always unset on every exit path from a `spawn_local` task,
+/// including early returns, panics, and task cancellation.
+/// Also refreshes activity before decrementing so the abandon monitor never observes
+/// counter=0 with a stale `borrowed_at` timestamp.
+struct UnmarkOnDrop(
+    Option<std::sync::Arc<std::sync::atomic::AtomicU32>>,
+    Option<u64>,
+);
+impl Drop for UnmarkOnDrop {
+    fn drop(&mut self) {
+        if let Some(arc) = self.0.take() {
+            // Refresh activity BEFORE decrementing so the monitor sees current
+            // borrowed_at even if it observes counter=0 momentarily.
+            if let Some(client_id) = self.1 {
+                glide_core::pool::refresh_activity_by_client(client_id);
+            }
+            // Saturating decrement via CAS to avoid TOCTOU between load and fetch_sub.
+            let _ = arc.fetch_update(Ordering::AcqRel, Ordering::Acquire, |v| {
+                if v > 0 { Some(v - 1) } else { None }
+            });
+        }
+    }
+}
+
 /// Message sent from NAPI thread to pinned worker thread for command execution.
 /// Kept minimal to reduce per-command overhead - no Arc cloning per message.
 enum WorkerMessage {
@@ -291,12 +330,17 @@ enum WorkerMessage {
     UpdateConnectionPassword(UpdateConnectionPasswordMessage),
     /// Refresh IAM token
     RefreshIamToken(RefreshIamTokenMessage),
+    /// Get client-side cache metrics
+    GetCacheMetrics(GetCacheMetricsMessage),
 }
 
 struct SingleCommandMessage {
     callback_idx: u32,
     cmd: redis::Cmd,
     routing: Option<RoutingInfo>,
+    /// If this command was marked as blocking for pool abandon detection,
+    /// contains the client_id to unmark after completion.
+    pool_blocking_ids: Option<u64>,
 }
 
 /// Batch command message for pipeline or transaction execution.
@@ -309,6 +353,9 @@ struct BatchCommandMessage {
     retry_server_error: bool,
     retry_connection_error: bool,
     routing: Option<RoutingInfo>,
+    command_span: Option<GlideSpan>,
+    /// Pool client_id for blocking protection during batch execution.
+    pool_ids: Option<u64>,
 }
 
 /// Script invocation message (EVALSHA with auto-LOAD fallback)
@@ -318,6 +365,8 @@ struct ScriptInvocationMessage {
     keys: Vec<Bytes>,
     args: Vec<Bytes>,
     routing: Option<RoutingInfo>,
+    /// Pool client_id for blocking protection during script execution.
+    pool_ids: Option<u64>,
 }
 
 /// Cluster scan message
@@ -342,14 +391,28 @@ struct RefreshIamTokenMessage {
     callback_idx: u32,
 }
 
+/// Client-side cache metrics message
+struct GetCacheMetricsMessage {
+    callback_idx: u32,
+    metrics_type: u32,
+}
+
 // ============================================================================
 // Helper Functions for Response Building
 // ============================================================================
 
 /// Build a CommandResponse from a Redis result
-fn build_response(callback_idx: u32, result: redis::RedisResult<Value>) -> CommandResponse {
+fn build_response(
+    callback_idx: u32,
+    result: redis::RedisResult<Value>,
+    command_span: Option<GlideSpan>,
+) -> CommandResponse {
     match result {
         Ok(value) => {
+            if let Some(span) = &command_span {
+                span.set_status(GlideSpanStatus::Ok);
+            }
+
             if matches!(value, Value::Okay) {
                 CommandResponse {
                     callback_idx,
@@ -377,6 +440,9 @@ fn build_response(callback_idx: u32, result: redis::RedisResult<Value>) -> Comma
         Err(err) => {
             let err_type = error_type(&err);
             let err_msg = error_message(&err);
+            if let Some(span) = &command_span {
+                span.set_status(GlideSpanStatus::Error((&err_msg).into()));
+            }
             CommandResponse {
                 callback_idx,
                 resp_pointer_high: None,
@@ -393,24 +459,190 @@ fn build_response(callback_idx: u32, result: redis::RedisResult<Value>) -> Comma
     }
 }
 
+fn push_response_to_js(
+    response_buffer: &Arc<ResponseBuffer>,
+    wake_callback: &Option<Arc<ThreadsafeFunction<(), (), (), Status, false>>>,
+    response: CommandResponse,
+) {
+    if response_buffer.push(response)
+        && let Some(cb) = wake_callback
+    {
+        cb.call((), ThreadsafeFunctionCallMode::NonBlocking);
+    }
+}
+
+fn get_cache_metrics(client: &Client, metrics_type: u32) -> redis::RedisResult<Value> {
+    match metrics_type {
+        0 => client.cache_hit_rate(),
+        1 => client.cache_miss_rate(),
+        2 => client.cache_entry_count(),
+        3 => client.cache_evictions(),
+        4 => client.cache_expirations(),
+        5 => client.cache_total_lookups(),
+        _ => Err(redis::RedisError::from((
+            redis::ErrorKind::InvalidClientConfig,
+            "Invalid cache metrics type",
+        ))),
+    }
+}
+
+fn compression_error_to_redis(err: glide_core::compression::CompressionError) -> RedisError {
+    RedisError::from((ErrorKind::ClientError, "Compression error", err.to_string()))
+}
+
+fn process_batch_response_for_decompression(
+    response: Value,
+    client: &Client,
+) -> std::result::Result<Value, glide_core::compression::CompressionError> {
+    let compression_manager = client.compression_manager();
+    let Some(manager) = compression_manager.as_deref() else {
+        return Ok(response);
+    };
+
+    glide_core::compression::decompress_batch_response(response, manager)
+}
+
+fn process_command_for_compression(
+    cmd: &mut Cmd,
+    client: &Client,
+) -> std::result::Result<(), glide_core::compression::CompressionError> {
+    let compression_manager = client.compression_manager();
+    let compression_manager_ref = compression_manager.as_deref();
+
+    if compression_manager_ref
+        .map(|m| !m.is_enabled())
+        .unwrap_or(true)
+    {
+        return Ok(());
+    }
+
+    let all_args: Vec<Vec<u8>> = cmd
+        .args_iter()
+        .filter_map(|arg| match arg {
+            Arg::Simple(bytes) => Some(bytes.to_vec()),
+            Arg::Cursor => None,
+        })
+        .collect();
+
+    if all_args.is_empty() {
+        return Ok(());
+    }
+
+    let command_name = &all_args[0];
+    let command_str = String::from_utf8_lossy(command_name).to_uppercase();
+    let request_type = match command_str.as_str() {
+        "SET" => RequestType::Set,
+        "MSET" => RequestType::MSet,
+        "MSETNX" => RequestType::MSetNX,
+        "SETEX" => RequestType::SetEx,
+        "PSETEX" => RequestType::PSetEx,
+        "SETNX" => RequestType::SetNX,
+        "APPEND" => RequestType::Append,
+        "GETRANGE" => RequestType::GetRange,
+        "SETRANGE" => RequestType::SetRange,
+        "STRLEN" => RequestType::Strlen,
+        "LCS" => RequestType::LCS,
+        "SUBSTR" => RequestType::Substr,
+        "INCR" => RequestType::Incr,
+        "INCRBY" => RequestType::IncrBy,
+        "INCRBYFLOAT" => RequestType::IncrByFloat,
+        "DECR" => RequestType::Decr,
+        "DECRBY" => RequestType::DecrBy,
+        "GETBIT" => RequestType::GetBit,
+        "SETBIT" => RequestType::SetBit,
+        "BITCOUNT" => RequestType::BitCount,
+        "BITPOS" => RequestType::BitPos,
+        "BITFIELD" => RequestType::BitField,
+        "BITFIELD_RO" => RequestType::BitFieldReadOnly,
+        "BITOP" => RequestType::BitOp,
+        _ => return Ok(()),
+    };
+
+    glide_core::compression::validate_command_compression_compatibility(
+        request_type,
+        compression_manager_ref,
+    )?;
+
+    let mut args: Vec<Vec<u8>> = all_args[1..].to_vec();
+    process_command_args_for_compression(&mut args, request_type, compression_manager_ref)?;
+
+    let command_span = cmd.span();
+    *cmd = Cmd::new();
+    cmd.arg(command_name);
+    for arg in args {
+        cmd.arg(arg);
+    }
+    cmd.set_span(command_span);
+
+    Ok(())
+}
+
+fn prepare_command_for_execution(
+    cmd: &mut Cmd,
+    client: &Client,
+    context: &str,
+) -> redis::RedisResult<()> {
+    if client.is_compression_enabled()
+        && let Err(err) = process_command_for_compression(cmd, client)
+    {
+        if err.is_incompatible_command() {
+            return Err(compression_error_to_redis(err));
+        }
+
+        log_warn(
+            context,
+            format!("Compression processing failed: {err}, continuing with original command"),
+        );
+    }
+
+    Ok(())
+}
+
+fn span_from_bigint(span_ptr: Option<BigInt>) -> Option<GlideSpan> {
+    let span_ptr = span_ptr?;
+    let (is_negative, span_ptr, lossless) = span_ptr.get_u64();
+    if is_negative || !lossless || span_ptr == 0 {
+        log_warn(
+            "OpenTelemetry",
+            "Invalid span pointer passed to direct NAPI command",
+        );
+        return None;
+    }
+
+    unsafe { GlideOpenTelemetry::span_from_pointer(span_ptr).ok() }
+}
+
+fn mark_span_error(command_span: &Option<GlideSpan>, message: &str) {
+    if let Some(span) = command_span {
+        span.set_status(GlideSpanStatus::Error(message.into()));
+    }
+}
+
+fn invalid_route_error(message: impl Into<String>) -> RedisError {
+    RedisError::from((ErrorKind::ClientError, "Invalid route", message.into()))
+}
+
 /// Convert SlotTypes enum to SlotAddr for routing
-fn get_slot_addr(slot_type: &protobuf::EnumOrUnknown<SlotTypes>) -> Option<SlotAddr> {
+fn get_slot_addr(slot_type: &protobuf::EnumOrUnknown<SlotTypes>) -> redis::RedisResult<SlotAddr> {
     match slot_type.enum_value() {
-        Ok(SlotTypes::Primary) => Some(SlotAddr::Master),
-        Ok(SlotTypes::Replica) => Some(SlotAddr::ReplicaRequired),
-        Err(_) => None,
+        Ok(SlotTypes::Primary) => Ok(SlotAddr::Master),
+        Ok(SlotTypes::Replica) => Ok(SlotAddr::ReplicaRequired),
+        Err(_) => Err(invalid_route_error("Unknown slot route type")),
     }
 }
 
 /// Parse protobuf route bytes into RoutingInfo for cluster routing.
 /// This mirrors the get_route function in socket_listener.rs.
-fn parse_route_bytes(route_bytes: &[u8], cmd: Option<&redis::Cmd>) -> Option<RoutingInfo> {
-    let routes: ProtobufRoutes = match ProtobufRoutes::parse_from_bytes(route_bytes) {
-        Ok(r) => r,
-        Err(_) => return None,
-    };
+fn parse_route_bytes(
+    route_bytes: &[u8],
+    cmd: Option<&redis::Cmd>,
+) -> redis::RedisResult<Option<RoutingInfo>> {
+    let routes: ProtobufRoutes = ProtobufRoutes::parse_from_bytes(route_bytes)
+        .map_err(|err| invalid_route_error(format!("Failed to parse route bytes: {err}")))?;
 
-    let route_value = routes.value?;
+    let route_value = routes
+        .value
+        .ok_or_else(|| invalid_route_error("Missing route value"))?;
 
     // Helper to get response policy for multi-node commands
     let get_response_policy = |cmd: Option<&redis::Cmd>| {
@@ -422,46 +654,48 @@ fn parse_route_bytes(route_bytes: &[u8], cmd: Option<&redis::Cmd>) -> Option<Rou
 
     match route_value {
         RoutesValue::SimpleRoutes(simple_route) => match simple_route.enum_value() {
-            Ok(SimpleRoutes::AllNodes) => Some(RoutingInfo::MultiNode((
+            Ok(SimpleRoutes::AllNodes) => Ok(Some(RoutingInfo::MultiNode((
                 MultipleNodeRoutingInfo::AllNodes,
                 get_response_policy(cmd),
-            ))),
-            Ok(SimpleRoutes::AllPrimaries) => Some(RoutingInfo::MultiNode((
+            )))),
+            Ok(SimpleRoutes::AllPrimaries) => Ok(Some(RoutingInfo::MultiNode((
                 MultipleNodeRoutingInfo::AllMasters,
                 get_response_policy(cmd),
-            ))),
+            )))),
             Ok(SimpleRoutes::Random) => {
-                Some(RoutingInfo::SingleNode(SingleNodeRoutingInfo::Random))
+                Ok(Some(RoutingInfo::SingleNode(SingleNodeRoutingInfo::Random)))
             }
-            Err(_) => None,
+            Err(_) => Err(invalid_route_error("Unknown simple route type")),
         },
         RoutesValue::SlotKeyRoute(slot_key_route) => {
             let slot_addr = get_slot_addr(&slot_key_route.slot_type)?;
-            Some(RoutingInfo::SingleNode(
+            Ok(Some(RoutingInfo::SingleNode(
                 SingleNodeRoutingInfo::SpecificNode(Route::new(
                     redis::cluster_topology::get_slot(slot_key_route.slot_key.as_bytes()),
                     slot_addr,
                 )),
-            ))
+            )))
         }
         RoutesValue::SlotIdRoute(slot_id_route) => {
             let slot_addr = get_slot_addr(&slot_id_route.slot_type)?;
-            Some(RoutingInfo::SingleNode(
+            Ok(Some(RoutingInfo::SingleNode(
                 SingleNodeRoutingInfo::SpecificNode(Route::new(
                     slot_id_route.slot_id as u16,
                     slot_addr,
                 )),
-            ))
+            )))
         }
         RoutesValue::ByAddressRoute(by_address_route) => {
-            let port = u16::try_from(by_address_route.port).ok()?;
-            Some(RoutingInfo::SingleNode(SingleNodeRoutingInfo::ByAddress {
-                host: by_address_route.host.to_string(),
-                port,
-            }))
+            let port = u16::try_from(by_address_route.port)
+                .map_err(|_| invalid_route_error("Route port is out of range"))?;
+            Ok(Some(RoutingInfo::SingleNode(
+                SingleNodeRoutingInfo::ByAddress {
+                    host: by_address_route.host.to_string(),
+                    port,
+                },
+            )))
         }
-        // Handle any future route types gracefully
-        _ => None,
+        _ => Err(invalid_route_error("Unsupported route type")),
     }
 }
 
@@ -476,8 +710,9 @@ async fn execute_batch(
     retry_server_error: bool,
     retry_connection_error: bool,
     routing: Option<RoutingInfo>,
+    command_span: Option<GlideSpan>,
 ) -> redis::RedisResult<Value> {
-    use redis::{Pipeline, PipelineRetryStrategy};
+    use redis::Pipeline;
 
     // Build the pipeline from commands
     let mut pipeline = if is_atomic {
@@ -485,19 +720,30 @@ async fn execute_batch(
     } else {
         Pipeline::new()
     };
+    pipeline.set_pipeline_span(command_span);
 
     // Add MULTI for transactions
     if is_atomic {
         pipeline.atomic();
     }
 
+    let mut redis_cmds = Vec::with_capacity(commands.len());
+    for mut cmd in commands {
+        prepare_command_for_execution(&mut cmd, client, "batch_command_compression")?;
+        redis_cmds.push(cmd);
+    }
+
+    if let Some(ref span) = pipeline.span() {
+        set_db_batch_attributes(span, &redis_cmds, client);
+    }
+
     // Add all commands to the pipeline
-    for cmd in commands {
+    for cmd in redis_cmds {
         pipeline.add_command(cmd);
     }
 
     // Execute based on type
-    if is_atomic {
+    let result = if is_atomic {
         client
             .send_transaction(&pipeline, routing, timeout, raise_on_error)
             .await
@@ -509,6 +755,20 @@ async fn execute_batch(
         client
             .send_pipeline(&pipeline, routing, raise_on_error, timeout, retry_strategy)
             .await
+    };
+
+    match result {
+        Ok(value) => match process_batch_response_for_decompression(value.clone(), client) {
+            Ok(processed_value) => Ok(processed_value),
+            Err(err) => {
+                log_warn(
+                    "batch_response_decompression",
+                    format!("Failed to decompress batch response: {err}"),
+                );
+                Ok(value)
+            }
+        },
+        Err(err) => Err(err),
     }
 }
 
@@ -517,7 +777,7 @@ async fn execute_batch(
 // ============================================================================
 
 /// A handle to a Glide client that allows sending commands directly via NAPI.
-/// The client is pinned to a dedicated worker thread for lock-free concurrent execution.
+/// The client is pinned to a dedicated worker thread for thread-local command execution.
 /// Commands are sent via channel to the worker thread which executes them via spawn_local.
 ///
 /// Response Buffering Architecture:
@@ -536,6 +796,9 @@ pub struct GlideClientHandle {
     /// Wake-up callback to notify JS when responses are available.
     /// Wrapped in Option to allow explicit drop during close(), which allows Node.js to exit.
     wake_callback: Option<Arc<ThreadsafeFunction<(), (), (), Status, false>>>,
+    /// Unique client ID registered in the glide-core scope registry.
+    /// Used for scope operations (try_acquire, execute, release).
+    client_id: u64,
 }
 
 /// Creates a new direct NAPI client connection with response buffering.
@@ -555,6 +818,336 @@ pub struct GlideClientHandle {
 ///
 /// # Returns
 /// A Promise that resolves to a GlideClientHandle on success
+/// Wrap an already-created [`Client`] in a [`GlideClientHandle`] with a dedicated
+/// pinned worker thread, command channel, and response buffer.
+///
+/// This is the factored-out "step 2" of [`create_direct_client`], reused by the
+/// pool warmup path so that pool-managed connections get the same full N-API
+/// client handle (worker thread + response buffer) as standalone connections.
+///
+/// The function spawns a pinned task on the worker pool and returns a future
+/// that resolves to the handle once the worker has initialised.  Callers must
+/// `.await` the returned future from a context that can drive the oneshot
+/// receive — the pool runtime's `spawn` context works correctly.
+///
+/// `push_receiver` must be the receiving end of the channel that was passed
+/// (as `push_sender`) to [`Client::new`] when `client` was created.
+pub(crate) async fn create_handle_for_client(
+    client: glide_core::client::Client,
+    mut push_receiver: mpsc::UnboundedReceiver<PushInfo>,
+    wake_tsfn: Arc<ThreadsafeFunction<(), (), (), Status, false>>,
+    inflight_requests_limit: isize,
+    provided_client_id: Option<u64>,
+) -> std::result::Result<GlideClientHandle, napi::Error> {
+    // Shared response buffer for this handle.
+    let response_buffer = Arc::new(ResponseBuffer::new());
+    let response_buffer_worker = Arc::clone(&response_buffer);
+
+    // Command channel: JS → worker thread.
+    let (command_tx, mut command_rx) = mpsc::unbounded_channel::<WorkerMessage>();
+
+    // Weak wake handles for the worker / push listener.
+    let wake_tsfn_worker = Arc::downgrade(&wake_tsfn);
+
+    // Acquire a worker-pool slot (released when the handle's message loop exits).
+    let worker_pool = acquire_worker_pool();
+
+    let response_buffer_push = Arc::clone(&response_buffer);
+    let wake_tsfn_push = Arc::downgrade(&wake_tsfn);
+
+    // Oneshot channel: worker → caller, delivers the constructed GlideClientHandle.
+    let (handle_tx, handle_rx) = tokio::sync::oneshot::channel::<GlideClientHandle>();
+
+    worker_pool.spawn_pinned(move || async move {
+        // Clone command_tx for the handle; drop the original so the channel
+        // closes when the handle is dropped, letting the message loop exit.
+        let command_tx_for_handle = command_tx.clone();
+        drop(command_tx);
+
+        let inflight_counter = Arc::new(AtomicIsize::new(inflight_requests_limit));
+        let client_id =
+            provided_client_id.unwrap_or_else(|| NEXT_CLIENT_ID.fetch_add(1, Ordering::Relaxed));
+
+        // Register client in the scope registry.
+        glide_core::scope::register_client(client_id, client.clone());
+
+        let handle = GlideClientHandle {
+            command_tx: Some(command_tx_for_handle),
+            inflight_requests: inflight_counter.clone(),
+            response_buffer: Arc::clone(&response_buffer_worker),
+            wake_callback: Some(Arc::clone(&wake_tsfn)),
+            client_id,
+        };
+
+        // Store worker-local references to avoid Arc::clone per command.
+        // These are cloned ONCE here and reused for all commands.
+        let worker_inflight = inflight_counter;
+
+        // Spawn a local task to listen for push notifications (pub/sub).
+        // NOTE: push listener is spawned BEFORE sending the handle so that
+        // cluster-mode push notifications cannot arrive in the window between
+        // the caller receiving the handle and the listener being scheduled.
+        task::spawn_local(async move {
+            while let Some(push_info) = push_receiver.recv().await {
+                let push_value = Value::Push {
+                    kind: push_info.kind,
+                    data: push_info.data,
+                };
+                let value_ptr = from_mut(Box::leak(Box::new(push_value)));
+                let [low, high] = split_pointer(value_ptr);
+                let response = CommandResponse {
+                    callback_idx: 0,
+                    resp_pointer_high: Some(high),
+                    resp_pointer_low: Some(low),
+                    constant_response: None,
+                    request_error: None,
+                    closing_error: None,
+                    is_push: true,
+                };
+                if response_buffer_push.push(response)
+                    && let Some(wake_callback) = wake_tsfn_push.upgrade()
+                {
+                    wake_callback.call((), ThreadsafeFunctionCallMode::NonBlocking);
+                }
+            }
+        });
+
+        // Send the handle to the awaiting caller; if the receiver has gone away
+        // (caller dropped the future) we continue running the message loop anyway
+        // so that the client is not orphaned.
+        let _ = handle_tx.send(handle);
+
+        // Process messages from the channel.
+        // Each message spawns a local task for concurrent execution within this thread.
+        while let Some(msg) = command_rx.recv().await {
+            run_worker_message(
+                msg,
+                &client,
+                &worker_inflight,
+                &response_buffer_worker,
+                &wake_tsfn_worker,
+            );
+        }
+
+        // Message loop has exited (channel closed by handle.close()).
+        release_worker_pool();
+    });
+
+    handle_rx
+        .await
+        .map_err(|_| napi::Error::new(Status::Unknown, "Worker thread failed to initialise"))
+}
+
+/// Dispatch a single [`WorkerMessage`] received by a pinned worker task.
+///
+/// Extracted from the monolithic `spawn_pinned` closure so that both
+/// [`create_direct_client`] and [`create_handle_for_client`] share identical
+/// dispatch logic without duplication.
+fn run_worker_message(
+    msg: WorkerMessage,
+    client: &glide_core::client::Client,
+    worker_inflight: &Arc<AtomicIsize>,
+    response_buffer_worker: &Arc<ResponseBuffer>,
+    wake_tsfn_worker: &std::sync::Weak<ThreadsafeFunction<(), (), (), Status, false>>,
+) {
+    match msg {
+        WorkerMessage::Command(cmd_msg) => {
+            let mut client_clone = client.clone();
+            let mut cmd = cmd_msg.cmd;
+            let callback_idx = cmd_msg.callback_idx;
+            let routing = cmd_msg.routing;
+            let pool_blocking_ids = cmd_msg.pool_blocking_ids;
+            let inflight = Arc::clone(worker_inflight);
+            let buffer = Arc::clone(response_buffer_worker);
+            let wake = wake_tsfn_worker.clone();
+
+            task::spawn_local(async move {
+                // RAII guard: refreshes activity and clears the blocking flag on all exit
+                // paths (normal completion, early return, and task cancellation/drop).
+                let _unmark_guard = pool_blocking_ids
+                    .and_then(|cid| glide_core::pool::get_blocking_flag(cid).map(|arc| (cid, arc)))
+                    .map(|(cid, arc)| UnmarkOnDrop(Some(arc), Some(cid)));
+                if let Some(ref span) = cmd.span() {
+                    set_db_attributes(span, &cmd, &client_clone);
+                }
+                let result =
+                    match prepare_command_for_execution(&mut cmd, &client_clone, "send_command") {
+                        Ok(()) => client_clone.send_command(&mut cmd, routing).await,
+                        Err(err) => Err(err),
+                    };
+                let response = build_response(callback_idx, result, cmd.span());
+                inflight.fetch_add(1, Ordering::Release);
+                if buffer.push(response)
+                    && let Some(wake_callback) = wake.upgrade()
+                {
+                    wake_callback.call((), ThreadsafeFunctionCallMode::NonBlocking);
+                }
+            });
+        }
+        WorkerMessage::Batch(batch_msg) => {
+            let mut client_clone = client.clone();
+            let callback_idx = batch_msg.callback_idx;
+            let pool_ids = batch_msg.pool_ids;
+            let inflight = Arc::clone(worker_inflight);
+            let buffer = Arc::clone(response_buffer_worker);
+            let wake = wake_tsfn_worker.clone();
+
+            task::spawn_local(async move {
+                // RAII guard: refreshes activity and clears the blocking flag on all exit
+                // paths (normal completion, early return, and task cancellation/drop).
+                let _unmark_guard = pool_ids
+                    .and_then(|cid| glide_core::pool::get_blocking_flag(cid).map(|arc| (cid, arc)))
+                    .map(|(cid, arc)| UnmarkOnDrop(Some(arc), Some(cid)));
+                let command_span = batch_msg.command_span.clone();
+                let result = execute_batch(
+                    &mut client_clone,
+                    batch_msg.commands,
+                    batch_msg.is_atomic,
+                    batch_msg.raise_on_error,
+                    batch_msg.timeout,
+                    batch_msg.retry_server_error,
+                    batch_msg.retry_connection_error,
+                    batch_msg.routing,
+                    batch_msg.command_span,
+                )
+                .await;
+                let response = build_response(callback_idx, result, command_span);
+                inflight.fetch_add(1, Ordering::Release);
+                if buffer.push(response)
+                    && let Some(wake_callback) = wake.upgrade()
+                {
+                    wake_callback.call((), ThreadsafeFunctionCallMode::NonBlocking);
+                }
+            });
+        }
+        WorkerMessage::ScriptInvocation(script_msg) => {
+            let mut client_clone = client.clone();
+            let callback_idx = script_msg.callback_idx;
+            let pool_ids = script_msg.pool_ids;
+            let inflight = Arc::clone(worker_inflight);
+            let buffer = Arc::clone(response_buffer_worker);
+            let wake = wake_tsfn_worker.clone();
+
+            task::spawn_local(async move {
+                // RAII guard: refreshes activity and clears the blocking flag on all exit
+                // paths (normal completion, early return, and task cancellation/drop).
+                let _unmark_guard = pool_ids
+                    .and_then(|cid| glide_core::pool::get_blocking_flag(cid).map(|arc| (cid, arc)))
+                    .map(|(cid, arc)| UnmarkOnDrop(Some(arc), Some(cid)));
+                let keys: Vec<&[u8]> = script_msg.keys.iter().map(|k| k.as_ref()).collect();
+                let args: Vec<&[u8]> = script_msg.args.iter().map(|a| a.as_ref()).collect();
+                let result = client_clone
+                    .invoke_script(&script_msg.hash, &keys, &args, script_msg.routing)
+                    .await;
+                let response = build_response(callback_idx, result, None);
+                inflight.fetch_add(1, Ordering::Release);
+                if buffer.push(response)
+                    && let Some(wake_callback) = wake.upgrade()
+                {
+                    wake_callback.call((), ThreadsafeFunctionCallMode::NonBlocking);
+                }
+            });
+        }
+        WorkerMessage::ClusterScan(scan_msg) => {
+            let mut client_clone = client.clone();
+            let callback_idx = scan_msg.callback_idx;
+            let inflight = Arc::clone(worker_inflight);
+            let buffer = Arc::clone(response_buffer_worker);
+            let wake = wake_tsfn_worker.clone();
+
+            task::spawn_local(async move {
+                let cursor_result = if scan_msg.cursor.is_empty() {
+                    Ok(ScanStateRC::new())
+                } else {
+                    get_cluster_scan_cursor(scan_msg.cursor)
+                };
+
+                let result = match cursor_result {
+                    Ok(scan_cursor) => {
+                        let mut args_builder = ClusterScanArgs::builder()
+                            .allow_non_covered_slots(scan_msg.allow_non_covered_slots);
+                        if let Some(pattern) = scan_msg.match_pattern {
+                            args_builder = args_builder.with_match_pattern::<Bytes>(pattern);
+                        }
+                        if let Some(count) = scan_msg.count {
+                            args_builder = args_builder.with_count(count as u32);
+                        }
+                        if let Some(obj_type) = scan_msg.object_type {
+                            args_builder = args_builder.with_object_type(obj_type.into());
+                        }
+                        let scan_args = args_builder.build();
+                        client_clone.cluster_scan(&scan_cursor, scan_args).await
+                    }
+                    Err(e) => Err(e),
+                };
+                let response = build_response(callback_idx, result, None);
+                inflight.fetch_add(1, Ordering::Release);
+                if buffer.push(response)
+                    && let Some(wake_callback) = wake.upgrade()
+                {
+                    wake_callback.call((), ThreadsafeFunctionCallMode::NonBlocking);
+                }
+            });
+        }
+        WorkerMessage::UpdateConnectionPassword(pwd_msg) => {
+            let mut client_clone = client.clone();
+            let callback_idx = pwd_msg.callback_idx;
+            let inflight = Arc::clone(worker_inflight);
+            let buffer = Arc::clone(response_buffer_worker);
+            let wake = wake_tsfn_worker.clone();
+
+            task::spawn_local(async move {
+                let result = client_clone
+                    .update_connection_password(pwd_msg.password, pwd_msg.immediate_auth)
+                    .await;
+                let response = build_response(callback_idx, result, None);
+                inflight.fetch_add(1, Ordering::Release);
+                if buffer.push(response)
+                    && let Some(wake_callback) = wake.upgrade()
+                {
+                    wake_callback.call((), ThreadsafeFunctionCallMode::NonBlocking);
+                }
+            });
+        }
+        WorkerMessage::RefreshIamToken(iam_msg) => {
+            let mut client_clone = client.clone();
+            let callback_idx = iam_msg.callback_idx;
+            let inflight = Arc::clone(worker_inflight);
+            let buffer = Arc::clone(response_buffer_worker);
+            let wake = wake_tsfn_worker.clone();
+
+            task::spawn_local(async move {
+                let result = client_clone.refresh_iam_token().await.map(|()| Value::Okay);
+                let response = build_response(callback_idx, result, None);
+                inflight.fetch_add(1, Ordering::Release);
+                if buffer.push(response)
+                    && let Some(wake_callback) = wake.upgrade()
+                {
+                    wake_callback.call((), ThreadsafeFunctionCallMode::NonBlocking);
+                }
+            });
+        }
+        WorkerMessage::GetCacheMetrics(metrics_msg) => {
+            let client_clone = client.clone();
+            let callback_idx = metrics_msg.callback_idx;
+            let inflight = Arc::clone(worker_inflight);
+            let buffer = Arc::clone(response_buffer_worker);
+            let wake = wake_tsfn_worker.clone();
+
+            task::spawn_local(async move {
+                let result = get_cache_metrics(&client_clone, metrics_msg.metrics_type);
+                let response = build_response(callback_idx, result, None);
+                inflight.fetch_add(1, Ordering::Release);
+                if buffer.push(response)
+                    && let Some(wake_callback) = wake.upgrade()
+                {
+                    wake_callback.call((), ThreadsafeFunctionCallMode::NonBlocking);
+                }
+            });
+        }
+    }
+}
+
 #[napi(
     js_name = "CreateDirectClient",
     ts_return_type = "Promise<GlideClientHandle>"
@@ -582,6 +1175,11 @@ pub fn create_direct_client<'a>(
                 ));
             }
         };
+    let resolver_key = proto_connection_request
+        .address_resolver_key
+        .as_ref()
+        .filter(|key| !key.is_empty())
+        .map(ToString::to_string);
 
     // Get the inflight requests limit from the protobuf connection request
     let inflight_requests_limit = if proto_connection_request.inflight_requests_limit > 0 {
@@ -591,7 +1189,12 @@ pub fn create_direct_client<'a>(
     };
 
     // Convert protobuf ConnectionRequest to internal ConnectionRequest
-    let connection_request: ConnectionRequest = proto_connection_request.into();
+    let mut connection_request: ConnectionRequest = proto_connection_request.into();
+    if let Some(key) = resolver_key
+        && let Some(resolver) = glide_core::address_resolver_registry::remove(&key)
+    {
+        connection_request.address_resolver = Some(resolver);
+    }
 
     // Create shared response buffer
     let response_buffer = Arc::new(ResponseBuffer::new());
@@ -613,8 +1216,12 @@ pub fn create_direct_client<'a>(
     let response_buffer_push = Arc::clone(&response_buffer);
     let wake_tsfn_push = Arc::downgrade(&wake_tsfn);
 
-    // Spawn a pinned worker task that owns the Client and processes commands
-    // This task will run on a dedicated thread and never migrate
+    // Spawn a pinned worker task that owns the Client and processes commands.
+    // Client::new is called INSIDE spawn_pinned so the push listener is set up
+    // atomically with the connection — this prevents a race where PubSub push
+    // notifications (subscription confirmations) arrive before the listener task
+    // is running, which would cause them to buffer silently with no wake_callback
+    // fired, resulting in PubSub tests timing out.
     worker_pool.spawn_pinned(move || async move {
         // Create the client on this worker thread
         let client = match Client::new(connection_request, Some(push_sender)).await {
@@ -630,33 +1237,39 @@ pub fn create_direct_client<'a>(
             }
         };
 
-        // Create handle to return to JavaScript
-        // Clone command_tx for the handle - the original will be dropped after this
-        let command_tx_for_handle = command_tx.clone();
-
-        // Drop the original command_tx so only the handle holds a sender.
+        // Create handle to return to JavaScript.
+        // Clone command_tx for the handle — the original will be dropped after this.
         // This ensures the channel closes when the handle is dropped,
         // which allows the message loop below to exit.
+        let command_tx_for_handle = command_tx.clone();
         drop(command_tx);
 
         let inflight_counter = Arc::new(AtomicIsize::new(inflight_requests_limit));
+        let client_id = NEXT_CLIENT_ID.fetch_add(1, Ordering::Relaxed);
+
+        // Register client in scope registry so scoped connections can find
+        // their parent client for compression, timeout, IAM, and CB checks.
+        glide_core::scope::register_client(client_id, client.clone());
+
         let handle = GlideClientHandle {
             command_tx: Some(command_tx_for_handle),
             inflight_requests: inflight_counter.clone(),
             response_buffer: Arc::clone(&response_buffer_worker),
             wake_callback: Some(Arc::clone(&wake_tsfn)),
+            client_id,
         };
 
-        // Resolve the promise with the handle
-        deferred.resolve(|_| Ok(handle));
-
-        // Store worker-local references to avoid Arc::clone per command
-        // These are cloned ONCE here and reused for all commands
+        // Store worker-local references to avoid Arc::clone per command.
+        // These are cloned ONCE here and reused for all commands.
         let worker_inflight = inflight_counter;
 
         // Spawn a local task to listen for push notifications (pub/sub).
         // Use a weak wake handle to avoid extending callback lifetime after close().
-        // Push messages arrive from glide-core via the push_receiver channel
+        // Push messages arrive from glide-core via the push_receiver channel.
+        // NOTE: push listener is spawned BEFORE resolving the promise so that
+        // cluster-mode push notifications (e.g. subscription confirmations)
+        // cannot arrive in the window between promise resolution and listener
+        // scheduling.
         task::spawn_local(async move {
             while let Some(push_info) = push_receiver.recv().await {
                 let push_value = Value::Push {
@@ -682,176 +1295,23 @@ pub fn create_direct_client<'a>(
             }
         });
 
-        // Process messages from the channel
-        // Each message spawns a local task for concurrent execution within this thread
+        // Resolve the promise with the handle — push listener is now scheduled,
+        // so no push notifications can be missed after this point.
+        deferred.resolve(|_| Ok(handle));
+
+        // Process messages from the channel.
+        // Each message spawns a local task for concurrent execution within this thread.
         while let Some(msg) = command_rx.recv().await {
-            match msg {
-                WorkerMessage::Command(cmd_msg) => {
-                    let mut client_clone = client.clone();
-                    let mut cmd = cmd_msg.cmd;
-                    let callback_idx = cmd_msg.callback_idx;
-                    let routing = cmd_msg.routing;
-                    let inflight = Arc::clone(&worker_inflight);
-                    let buffer = Arc::clone(&response_buffer_worker);
-                    let wake = wake_tsfn_worker.clone();
-
-                    // Spawn local task for this command
-                    task::spawn_local(async move {
-                        let result = client_clone.send_command(&mut cmd, routing).await;
-                        let response = build_response(callback_idx, result);
-                        inflight.fetch_add(1, Ordering::Release);
-                        if buffer.push(response)
-                            && let Some(wake_callback) = wake.upgrade()
-                        {
-                            wake_callback.call((), ThreadsafeFunctionCallMode::NonBlocking);
-                        }
-                    });
-                }
-                WorkerMessage::Batch(batch_msg) => {
-                    let mut client_clone = client.clone();
-                    let callback_idx = batch_msg.callback_idx;
-                    let inflight = Arc::clone(&worker_inflight);
-                    let buffer = Arc::clone(&response_buffer_worker);
-                    let wake = wake_tsfn_worker.clone();
-
-                    // Spawn local task for batch execution
-                    task::spawn_local(async move {
-                        let result = execute_batch(
-                            &mut client_clone,
-                            batch_msg.commands,
-                            batch_msg.is_atomic,
-                            batch_msg.raise_on_error,
-                            batch_msg.timeout,
-                            batch_msg.retry_server_error,
-                            batch_msg.retry_connection_error,
-                            batch_msg.routing,
-                        )
-                        .await;
-                        let response = build_response(callback_idx, result);
-                        inflight.fetch_add(1, Ordering::Release);
-                        if buffer.push(response)
-                            && let Some(wake_callback) = wake.upgrade()
-                        {
-                            wake_callback.call((), ThreadsafeFunctionCallMode::NonBlocking);
-                        }
-                    });
-                }
-                WorkerMessage::ScriptInvocation(script_msg) => {
-                    let mut client_clone = client.clone();
-                    let callback_idx = script_msg.callback_idx;
-                    let inflight = Arc::clone(&worker_inflight);
-                    let buffer = Arc::clone(&response_buffer_worker);
-                    let wake = wake_tsfn_worker.clone();
-
-                    task::spawn_local(async move {
-                        let keys: Vec<&[u8]> = script_msg.keys.iter().map(|k| k.as_ref()).collect();
-                        let args: Vec<&[u8]> = script_msg.args.iter().map(|a| a.as_ref()).collect();
-                        let result = client_clone
-                            .invoke_script(&script_msg.hash, &keys, &args, script_msg.routing)
-                            .await;
-                        let response = build_response(callback_idx, result);
-                        inflight.fetch_add(1, Ordering::Release);
-                        if buffer.push(response)
-                            && let Some(wake_callback) = wake.upgrade()
-                        {
-                            wake_callback.call((), ThreadsafeFunctionCallMode::NonBlocking);
-                        }
-                    });
-                }
-                WorkerMessage::ClusterScan(scan_msg) => {
-                    let mut client_clone = client.clone();
-                    let callback_idx = scan_msg.callback_idx;
-                    let inflight = Arc::clone(&worker_inflight);
-                    let buffer = Arc::clone(&response_buffer_worker);
-                    let wake = wake_tsfn_worker.clone();
-
-                    task::spawn_local(async move {
-                        // Get or create scan cursor
-                        let cursor_result = if scan_msg.cursor.is_empty() {
-                            Ok(ScanStateRC::new())
-                        } else {
-                            get_cluster_scan_cursor(scan_msg.cursor)
-                        };
-
-                        let result = match cursor_result {
-                            Ok(scan_cursor) => {
-                                // Build scan args
-                                let mut args_builder = ClusterScanArgs::builder()
-                                    .allow_non_covered_slots(scan_msg.allow_non_covered_slots);
-                                if let Some(pattern) = scan_msg.match_pattern {
-                                    args_builder =
-                                        args_builder.with_match_pattern::<Bytes>(pattern);
-                                }
-                                if let Some(count) = scan_msg.count {
-                                    args_builder = args_builder.with_count(count as u32);
-                                }
-                                if let Some(obj_type) = scan_msg.object_type {
-                                    args_builder = args_builder.with_object_type(obj_type.into());
-                                }
-                                let scan_args = args_builder.build();
-                                client_clone.cluster_scan(&scan_cursor, scan_args).await
-                            }
-                            Err(e) => Err(e),
-                        };
-                        let response = build_response(callback_idx, result);
-                        inflight.fetch_add(1, Ordering::Release);
-                        if buffer.push(response)
-                            && let Some(wake_callback) = wake.upgrade()
-                        {
-                            wake_callback.call((), ThreadsafeFunctionCallMode::NonBlocking);
-                        }
-                    });
-                }
-                WorkerMessage::UpdateConnectionPassword(pwd_msg) => {
-                    let mut client_clone = client.clone();
-                    let callback_idx = pwd_msg.callback_idx;
-                    let inflight = Arc::clone(&worker_inflight);
-                    let buffer = Arc::clone(&response_buffer_worker);
-                    let wake = wake_tsfn_worker.clone();
-
-                    task::spawn_local(async move {
-                        let result = client_clone
-                            .update_connection_password(pwd_msg.password, pwd_msg.immediate_auth)
-                            .await;
-                        let response = build_response(callback_idx, result);
-                        inflight.fetch_add(1, Ordering::Release);
-                        if buffer.push(response)
-                            && let Some(wake_callback) = wake.upgrade()
-                        {
-                            wake_callback.call((), ThreadsafeFunctionCallMode::NonBlocking);
-                        }
-                    });
-                }
-                WorkerMessage::RefreshIamToken(iam_msg) => {
-                    let mut client_clone = client.clone();
-                    let callback_idx = iam_msg.callback_idx;
-                    let inflight = Arc::clone(&worker_inflight);
-                    let buffer = Arc::clone(&response_buffer_worker);
-                    let wake = wake_tsfn_worker.clone();
-
-                    task::spawn_local(async move {
-                        let result = client_clone.refresh_iam_token().await.map(|()| Value::Okay);
-                        let response = build_response(callback_idx, result);
-                        inflight.fetch_add(1, Ordering::Release);
-                        if buffer.push(response)
-                            && let Some(wake_callback) = wake.upgrade()
-                        {
-                            wake_callback.call((), ThreadsafeFunctionCallMode::NonBlocking);
-                        }
-                    });
-                }
-            }
+            run_worker_message(
+                msg,
+                &client,
+                &worker_inflight,
+                &response_buffer_worker,
+                &wake_tsfn_worker,
+            );
         }
 
-        // Message loop has exited (channel closed by client.close()).
-        // Close the sockets now. In-flight tasks still hold Client clones, and a blocking
-        // command would otherwise keep the connection attached to the server until it
-        // replies, delivering data (stream entries, list elements) to a closed client.
-        client.kill().await;
-
-        // Release our reference to the worker pool.
-        // When all clients have released their references, the pool will be dropped,
-        // allowing worker threads to exit and Node.js to terminate cleanly.
+        // Message loop has exited (channel closed by handle.close()).
         release_worker_pool();
     });
 
@@ -873,6 +1333,7 @@ impl GlideClientHandle {
     /// * `request_type` - The type of Redis command (maps to RequestType enum)
     /// * `args_pointer_high` - High 32 bits of the args `Vec<Bytes>` pointer
     /// * `args_pointer_low` - Low 32 bits of the args `Vec<Bytes>` pointer
+    /// * `span_ptr` - Optional OpenTelemetry span pointer
     /// * `route_bytes` - Optional routing information for cluster mode
     ///
     /// # Returns
@@ -886,6 +1347,7 @@ impl GlideClientHandle {
         request_type: u32,
         args_pointer_high: u32,
         args_pointer_low: u32,
+        span_ptr: Option<BigInt>,
         route_bytes: Option<Uint8Array>,
     ) -> Result<bool> {
         // Reconstruct the args pointer from high/low bits (simple bit ops, no allocation)
@@ -917,6 +1379,7 @@ impl GlideClientHandle {
         let proto_request_type =
             protobuf::EnumOrUnknown::<ProtobufRequestType>::from_i32(request_type as i32);
         let request_type_enum: RequestType = proto_request_type.into();
+        let command_span = span_from_bigint(span_ptr);
 
         // Get the base command for this request type
         let mut cmd = match request_type_enum.get_command() {
@@ -924,23 +1387,21 @@ impl GlideClientHandle {
             None => {
                 // Invalid request type - push error to buffer
                 self.inflight_requests.fetch_add(1, Ordering::Relaxed);
+                let error_message = format!("Invalid request type: {request_type}");
+                mark_span_error(&command_span, &error_message);
                 let response = CommandResponse {
                     callback_idx,
                     resp_pointer_high: None,
                     resp_pointer_low: None,
                     constant_response: None,
                     request_error: Some(RequestErrorNapi {
-                        message: format!("Invalid request type: {request_type}"),
+                        message: error_message,
                         error_type: 0, // Unspecified
                     }),
                     closing_error: None,
                     is_push: false,
                 };
-                if self.response_buffer.push(response)
-                    && let Some(cb) = &self.wake_callback
-                {
-                    cb.call((), ThreadsafeFunctionCallMode::NonBlocking);
-                }
+                push_response_to_js(&self.response_buffer, &self.wake_callback, response);
                 return Ok(true);
             }
         };
@@ -950,14 +1411,43 @@ impl GlideClientHandle {
             cmd.arg(arg.as_ref());
         }
 
+        cmd.set_span(command_span);
+
         // Parse routing information if provided
-        let routing = route_bytes.and_then(|bytes| parse_route_bytes(&bytes, Some(&cmd)));
+        let routing = match route_bytes {
+            Some(bytes) => match parse_route_bytes(&bytes, Some(&cmd)) {
+                Ok(routing) => routing,
+                Err(err) => {
+                    self.inflight_requests.fetch_add(1, Ordering::Relaxed);
+                    let response = build_response(callback_idx, Err(err), cmd.span());
+                    push_response_to_js(&self.response_buffer, &self.wake_callback, response);
+                    return Ok(true);
+                }
+            },
+            None => None,
+        };
+        let command_span_for_error = cmd.span();
+
+        // Pool abandon detection: refresh activity and mark blocking commands
+        let pool_blocking_ids = if glide_core::pool::is_pool_client(self.client_id) {
+            glide_core::pool::refresh_activity_by_client(self.client_id);
+            if glide_core::client::is_blocking_command(&cmd)
+                && pool::mark_blocking(self.client_id, true)
+            {
+                Some(self.client_id)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
 
         // Send command to the pinned worker thread via channel
         let msg = WorkerMessage::Command(SingleCommandMessage {
             callback_idx,
             cmd,
             routing,
+            pool_blocking_ids,
         });
 
         // Send via channel (non-blocking)
@@ -968,6 +1458,11 @@ impl GlideClientHandle {
         if send_failed {
             // Channel closed - client was shut down
             self.inflight_requests.fetch_add(1, Ordering::Relaxed);
+            // Release blocking mark — the worker will never run
+            if let Some(client_id) = pool_blocking_ids {
+                pool::mark_blocking(client_id, false);
+            }
+            mark_span_error(&command_span_for_error, "Client connection closed");
             let response = CommandResponse {
                 callback_idx,
                 resp_pointer_high: None,
@@ -977,11 +1472,7 @@ impl GlideClientHandle {
                 closing_error: Some("Client connection closed".to_string()),
                 is_push: false,
             };
-            if self.response_buffer.push(response)
-                && let Some(cb) = &self.wake_callback
-            {
-                cb.call((), ThreadsafeFunctionCallMode::NonBlocking);
-            }
+            push_response_to_js(&self.response_buffer, &self.wake_callback, response);
         }
 
         Ok(true)
@@ -1005,6 +1496,9 @@ impl GlideClientHandle {
         // This prevents segfaults when the ThreadsafeFunction is dropped while tasks are running
         self.response_buffer.mark_closed();
 
+        // Unregister from scope registry
+        glide_core::scope::unregister_client(self.client_id);
+
         // Free any leaked Value pointers in pending responses that were never consumed by JS
         self.response_buffer.free_leaked_values();
 
@@ -1022,11 +1516,51 @@ impl GlideClientHandle {
         Ok(())
     }
 
+    /// Stop this handle's worker thread WITHOUT removing the client from the
+    /// scope registry.
+    ///
+    /// Used by pool clients: when a pool client is released back to the pool,
+    /// its underlying [`glide_core::client::Client`] must remain registered in
+    /// the scope registry so that the next `pool_build_handle` call can find it
+    /// and spin up a new worker for the next borrower.
+    ///
+    /// For standalone (non-pool) clients, call `close()` instead.
+    #[napi]
+    pub fn close_for_pool_release(&mut self) -> Result<()> {
+        // Mark buffer closed first — prevents callbacks after this point.
+        self.response_buffer.mark_closed();
+
+        // Do NOT unregister from scope registry: the Client must stay registered
+        // so that the next pool_build_handle() call can find it.
+
+        // Do NOT call unregister_pool_client here: release_client_async (called
+        // by pool_release after this) already calls unregister_pool_client, so
+        // calling it here would result in a double-unregister.
+
+        // Free any leaked Value pointers.
+        self.response_buffer.free_leaked_values();
+
+        // Drop command_tx to signal the worker loop to exit.
+        drop(self.command_tx.take());
+
+        // Drop the wake callback reference.
+        drop(self.wake_callback.take());
+
+        Ok(())
+    }
+
     /// Returns the number of available inflight request slots.
     /// This can be used to check if more commands can be sent.
     #[napi]
     pub fn available_inflight_slots(&self) -> i32 {
         self.inflight_requests.load(Ordering::Relaxed) as i32
+    }
+
+    /// Returns the client ID registered in the scope registry.
+    /// Used by IsolatedScope to acquire/execute/release scoped connections.
+    #[napi(getter)]
+    pub fn client_id(&self) -> i64 {
+        self.client_id as i64
     }
 
     /// Sends a batch of commands to the Valkey/Redis server.
@@ -1052,6 +1586,7 @@ impl GlideClientHandle {
         timeout: Option<u32>,
         retry_server_error: Option<bool>,
         retry_connection_error: Option<bool>,
+        span_ptr: Option<BigInt>,
         route_bytes: Option<Uint8Array>,
     ) -> Result<bool> {
         // Check inflight limit synchronously
@@ -1069,6 +1604,7 @@ impl GlideClientHandle {
         }
 
         // Convert BatchCommand array to Vec<redis::Cmd>
+        let command_span = span_from_bigint(span_ptr);
         let mut cmds = Vec::with_capacity(commands.len());
         let mut commands_iter = commands.into_iter();
         while let Some(batch_cmd) = commands_iter.next() {
@@ -1098,23 +1634,21 @@ impl GlideClientHandle {
                     }
                 }
                 self.inflight_requests.fetch_add(1, Ordering::Relaxed);
+                let error_message = format!("Invalid request type: {}", batch_cmd.request_type);
+                mark_span_error(&command_span, &error_message);
                 let response = CommandResponse {
                     callback_idx,
                     resp_pointer_high: None,
                     resp_pointer_low: None,
                     constant_response: None,
                     request_error: Some(RequestErrorNapi {
-                        message: format!("Invalid request type: {}", batch_cmd.request_type),
+                        message: error_message,
                         error_type: 0,
                     }),
                     closing_error: None,
                     is_push: false,
                 };
-                if self.response_buffer.push(response)
-                    && let Some(cb) = &self.wake_callback
-                {
-                    cb.call((), ThreadsafeFunctionCallMode::NonBlocking);
-                }
+                push_response_to_js(&self.response_buffer, &self.wake_callback, response);
                 return Ok(true);
             };
 
@@ -1127,7 +1661,34 @@ impl GlideClientHandle {
         }
 
         // Parse routing information if provided
-        let routing = route_bytes.and_then(|bytes| parse_route_bytes(&bytes, None));
+        let routing = match route_bytes {
+            Some(bytes) => match parse_route_bytes(&bytes, None) {
+                Ok(routing) => routing,
+                Err(err) => {
+                    self.inflight_requests.fetch_add(1, Ordering::Relaxed);
+                    let response = build_response(callback_idx, Err(err), command_span);
+                    push_response_to_js(&self.response_buffer, &self.wake_callback, response);
+                    return Ok(true);
+                }
+            },
+            None => None,
+        };
+        let command_span_for_error = command_span.clone();
+
+        // Pool abandon detection: refresh activity for batch duration
+        let pool_ids = if glide_core::pool::is_pool_client(self.client_id) {
+            glide_core::pool::refresh_activity_by_client(self.client_id);
+            Some(self.client_id)
+        } else {
+            None
+        };
+
+        // Set is_blocking synchronously on the sender thread BEFORE channel send,
+        // so the abandon monitor cannot observe is_blocking=false in the window
+        // between enqueue and the worker thread dequeuing the message (#6971).
+        if let Some(client_id) = pool_ids {
+            pool::mark_blocking(client_id, true);
+        }
 
         // Send batch message to worker
         let msg = WorkerMessage::Batch(BatchCommandMessage {
@@ -1139,6 +1700,8 @@ impl GlideClientHandle {
             retry_server_error: retry_server_error.unwrap_or(false),
             retry_connection_error: retry_connection_error.unwrap_or(false),
             routing,
+            command_span,
+            pool_ids,
         });
 
         let send_failed = match &self.command_tx {
@@ -1146,7 +1709,12 @@ impl GlideClientHandle {
             None => true,
         };
         if send_failed {
+            // Sender-side mark was already applied; undo it since the message was never delivered.
+            if let Some(client_id) = pool_ids {
+                pool::mark_blocking(client_id, false);
+            }
             self.inflight_requests.fetch_add(1, Ordering::Relaxed);
+            mark_span_error(&command_span_for_error, "Client connection closed");
             let response = CommandResponse {
                 callback_idx,
                 resp_pointer_high: None,
@@ -1156,11 +1724,7 @@ impl GlideClientHandle {
                 closing_error: Some("Client connection closed".to_string()),
                 is_push: false,
             };
-            if self.response_buffer.push(response)
-                && let Some(cb) = &self.wake_callback
-            {
-                cb.call((), ThreadsafeFunctionCallMode::NonBlocking);
-            }
+            push_response_to_js(&self.response_buffer, &self.wake_callback, response);
         }
 
         Ok(true)
@@ -1207,7 +1771,33 @@ impl GlideClientHandle {
         }
 
         // Parse routing information if provided
-        let routing = route_bytes.and_then(|bytes| parse_route_bytes(&bytes, None));
+        let routing = match route_bytes {
+            Some(bytes) => match parse_route_bytes(&bytes, None) {
+                Ok(routing) => routing,
+                Err(err) => {
+                    self.inflight_requests.fetch_add(1, Ordering::Relaxed);
+                    let response = build_response(callback_idx, Err(err), None);
+                    push_response_to_js(&self.response_buffer, &self.wake_callback, response);
+                    return Ok(true);
+                }
+            },
+            None => None,
+        };
+
+        // Pool abandon detection: refresh activity for script execution
+        let pool_ids = if glide_core::pool::is_pool_client(self.client_id) {
+            glide_core::pool::refresh_activity_by_client(self.client_id);
+            Some(self.client_id)
+        } else {
+            None
+        };
+
+        // Set is_blocking synchronously on the sender thread BEFORE channel send,
+        // so the abandon monitor cannot observe is_blocking=false in the window
+        // between enqueue and the worker thread dequeuing the message (#6971).
+        if let Some(client_id) = pool_ids {
+            pool::mark_blocking(client_id, true);
+        }
 
         let msg = WorkerMessage::ScriptInvocation(ScriptInvocationMessage {
             callback_idx,
@@ -1215,6 +1805,7 @@ impl GlideClientHandle {
             keys,
             args,
             routing,
+            pool_ids,
         });
 
         let send_failed = match &self.command_tx {
@@ -1222,6 +1813,10 @@ impl GlideClientHandle {
             None => true,
         };
         if send_failed {
+            // Sender-side mark was already applied; undo it since the message was never delivered.
+            if let Some(client_id) = pool_ids {
+                pool::mark_blocking(client_id, false);
+            }
             self.inflight_requests.fetch_add(1, Ordering::Relaxed);
             let response = CommandResponse {
                 callback_idx,
@@ -1268,6 +1863,11 @@ impl GlideClientHandle {
             object_type,
             allow_non_covered_slots: allow_non_covered_slots.unwrap_or(false),
         });
+
+        // Pool abandon detection: refresh activity for scan
+        if glide_core::pool::is_pool_client(self.client_id) {
+            glide_core::pool::refresh_activity_by_client(self.client_id);
+        }
 
         let send_failed = match &self.command_tx {
             Some(tx) => tx.send(msg).is_err(),
@@ -1351,6 +1951,45 @@ impl GlideClientHandle {
         }
 
         let msg = WorkerMessage::RefreshIamToken(RefreshIamTokenMessage { callback_idx });
+
+        let send_failed = match &self.command_tx {
+            Some(tx) => tx.send(msg).is_err(),
+            None => true,
+        };
+        if send_failed {
+            self.inflight_requests.fetch_add(1, Ordering::Relaxed);
+            let response = CommandResponse {
+                callback_idx,
+                resp_pointer_high: None,
+                resp_pointer_low: None,
+                constant_response: None,
+                request_error: None,
+                closing_error: Some("Client connection closed".to_string()),
+                is_push: false,
+            };
+            if self.response_buffer.push(response)
+                && let Some(cb) = &self.wake_callback
+            {
+                cb.call((), ThreadsafeFunctionCallMode::NonBlocking);
+            }
+        }
+
+        Ok(true)
+    }
+
+    /// Gets client-side cache metrics.
+    #[napi]
+    pub fn get_cache_metrics(&self, callback_idx: u32, metrics_type: u32) -> Result<bool> {
+        let prev = self.inflight_requests.fetch_sub(1, Ordering::AcqRel);
+        if prev <= 0 {
+            self.inflight_requests.fetch_add(1, Ordering::Relaxed);
+            return Ok(false);
+        }
+
+        let msg = WorkerMessage::GetCacheMetrics(GetCacheMetricsMessage {
+            callback_idx,
+            metrics_type,
+        });
 
         let send_failed = match &self.command_tx {
             Some(tx) => tx.send(msg).is_err(),
@@ -1538,56 +2177,53 @@ pub fn init_open_telemetry(open_telemetry_config: OpenTelemetryConfig) -> Result
     Ok(())
 }
 
-impl From<logger_core::Level> for Level {
-    fn from(level: logger_core::Level) -> Self {
+impl From<glide_logger::Level> for Level {
+    fn from(level: glide_logger::Level) -> Self {
         match level {
-            logger_core::Level::Error => Level::Error,
-            logger_core::Level::Warn => Level::Warn,
-            logger_core::Level::Info => Level::Info,
-            logger_core::Level::Debug => Level::Debug,
-            logger_core::Level::Trace => Level::Trace,
-            logger_core::Level::Off => Level::Off,
+            glide_logger::Level::Error => Level::Error,
+            glide_logger::Level::Warn => Level::Warn,
+            glide_logger::Level::Info => Level::Info,
+            glide_logger::Level::Debug => Level::Debug,
+            glide_logger::Level::Trace => Level::Trace,
+            glide_logger::Level::Off => Level::Off,
         }
     }
 }
 
-impl From<Level> for logger_core::Level {
-    fn from(level: Level) -> logger_core::Level {
+impl From<Level> for glide_logger::Level {
+    fn from(level: Level) -> glide_logger::Level {
         match level {
-            Level::Error => logger_core::Level::Error,
-            Level::Warn => logger_core::Level::Warn,
-            Level::Info => logger_core::Level::Info,
-            Level::Debug => logger_core::Level::Debug,
-            Level::Trace => logger_core::Level::Trace,
-            Level::Off => logger_core::Level::Off,
+            Level::Error => glide_logger::Level::Error,
+            Level::Warn => glide_logger::Level::Warn,
+            Level::Info => glide_logger::Level::Info,
+            Level::Debug => glide_logger::Level::Debug,
+            Level::Trace => glide_logger::Level::Trace,
+            Level::Off => glide_logger::Level::Off,
         }
     }
 }
 
 #[napi]
 pub fn log(log_level: Level, log_identifier: String, message: String) {
-    logger_core::log(log_level.into(), log_identifier, message);
+    glide_logger::log(log_level.into(), log_identifier, message);
 }
 
 #[napi(js_name = "InitInternalLogger")]
 pub fn init(level: Option<Level>, file_name: Option<String>) -> Level {
-    let logger_level = logger_core::init(level.map(|level| level.into()), file_name.as_deref());
+    let logger_level = glide_logger::init(level.map(|level| level.into()), file_name.as_deref());
     logger_level.into()
 }
 
 fn resp_value_to_js<'a>(val: Value, js_env: &'a Env, string_decoder: bool) -> Result<Unknown<'a>> {
     match val {
-        Value::Nil => {
-            // Use ToNapiValue trait's into_unknown which wraps the unsafe calls
-            Null.into_unknown(js_env)
-        }
+        Value::Nil => Null.into_unknown(js_env),
         Value::SimpleString(str) => {
             if string_decoder {
                 js_env
                     .create_string_from_std(str)
                     .and_then(|val| val.into_unknown(js_env))
             } else {
-                BufferSlice::from_data(js_env, str.as_bytes().to_vec())?.into_unknown(js_env)
+                BufferSlice::from_data(js_env, str.into_bytes())?.into_unknown(js_env)
             }
         }
         Value::Okay => js_env
@@ -1603,7 +2239,7 @@ fn resp_value_to_js<'a>(val: Value, js_env: &'a Env, string_decoder: bool) -> Re
                     .create_string(str)
                     .and_then(|val| val.into_unknown(js_env))
             } else {
-                BufferSlice::from_data(js_env, data.to_vec())?.into_unknown(js_env)
+                BufferSlice::from_data(js_env, data)?.into_unknown(js_env)
             }
         }
         Value::Array(array) => {
@@ -1632,10 +2268,7 @@ fn resp_value_to_js<'a>(val: Value, js_env: &'a Env, string_decoder: bool) -> Re
         Value::Double(float) => js_env
             .create_double(float)
             .and_then(|val| val.into_unknown(js_env)),
-        Value::Boolean(b) => {
-            // Use ToNapiValue trait's into_unknown which wraps the unsafe calls
-            b.into_unknown(js_env)
-        }
+        Value::Boolean(bool) => bool.into_unknown(js_env),
         // format is ignored, as per the RESP3 recommendations -
         // "Normal client libraries may ignore completely the difference between this"
         // "type and the String type, and return a string in both cases.""
@@ -1647,7 +2280,7 @@ fn resp_value_to_js<'a>(val: Value, js_env: &'a Env, string_decoder: bool) -> Re
                     .and_then(|val| val.into_unknown(js_env))
             } else {
                 // VerbatimString is binary safe -> convert it into such
-                BufferSlice::from_data(js_env, text.as_bytes().to_vec())?.into_unknown(js_env)
+                BufferSlice::from_data(js_env, text.into_bytes())?.into_unknown(js_env)
             }
         }
         Value::BigNumber(num) => {
@@ -1699,6 +2332,32 @@ fn resp_value_to_js<'a>(val: Value, js_env: &'a Env, string_decoder: bool) -> Re
     }
 }
 
+/// Dereference a response pointer passed as a single JS number.
+///
+/// napi-rs marshals `i64` via `napi_get_value_int64`, which preserves all
+/// bits for values within the safe integer range. User-space heap addresses
+/// on current 64-bit platforms (48-bit on arm64 macOS, 47-bit on x86-64
+/// Linux) are well within this range. Using a single integer avoids the
+/// high/low u32 split and eliminates the class of bugs where the caller
+/// passes the wrong high bits.
+#[napi(
+    ts_return_type = "null | string | Uint8Array | number | {} | Boolean | BigInt | Set<any> | any[] | Buffer"
+)]
+pub fn value_from_pointer<'a>(
+    js_env: &'a Env,
+    pointer_number: i64,
+    string_decoder: bool,
+) -> Result<Unknown<'a>> {
+    if pointer_number == 0 {
+        return Err(napi::Error::new(
+            Status::InvalidArg,
+            "Null pointer passed to value_from_pointer",
+        ));
+    }
+    let value = unsafe { Box::from_raw(pointer_number as *mut Value) };
+    resp_value_to_js(*value, js_env, string_decoder)
+}
+
 #[napi(
     ts_return_type = "null | string | Uint8Array | number | {} | Boolean | BigInt | Set<any> | any[] | Buffer"
 )]
@@ -1726,8 +2385,7 @@ pub fn value_from_split_pointer<'a>(
     resp_value_to_js(*value, js_env, string_decoder)
 }
 
-// Pointers are split because JS cannot represent a full usize using its `number` object.
-// The pointer is split into 2 `number`s, and then combined back in `value_from_split_pointer`.
+// Split a pointer into [low, high] u32 pair for testing utilities.
 fn split_pointer<T>(pointer: *mut T) -> [u32; 2] {
     let pointer = pointer as usize;
     let bytes = usize::to_le_bytes(pointer);
@@ -1850,6 +2508,39 @@ pub fn create_leaked_double(float: f64) -> [u32; 2] {
 #[napi(ts_return_type = "[number, number]")]
 pub fn create_leaked_otel_span(name: String) -> [u32; 2] {
     let span = GlideOpenTelemetry::new_span(&name);
+    let s = Arc::into_raw(Arc::new(span)) as *mut GlideSpan;
+    split_pointer(s)
+}
+
+/// Creates an open telemetry span with the given name as a child of a remote span context.
+/// Falls back to creating a standalone span if the trace context is invalid.
+#[napi(ts_return_type = "[number, number]")]
+pub fn create_otel_span_with_trace_context(
+    name: String,
+    trace_id: String,
+    span_id: String,
+    trace_flags: u8,
+    trace_state: Option<String>,
+) -> [u32; 2] {
+    let span = match GlideSpan::new_with_remote_context(
+        &name,
+        &trace_id,
+        &span_id,
+        trace_flags,
+        trace_state.as_deref(),
+    ) {
+        Ok(s) => s,
+        Err(e) => {
+            log(
+                Level::Warn,
+                "OpenTelemetry".to_string(),
+                format!(
+                    "Failed to create span with remote context, falling back to standalone span: {e}"
+                ),
+            );
+            GlideOpenTelemetry::new_span(&name)
+        }
+    };
     let s = Arc::into_raw(Arc::new(span)) as *mut GlideSpan;
     split_pointer(s)
 }
@@ -1989,6 +2680,9 @@ pub fn get_statistics<'a>(env: &'a Env) -> Result<Object<'a>> {
     let total_bytes_compressed = Telemetry::total_bytes_compressed().to_string();
     let total_bytes_decompressed = Telemetry::total_bytes_decompressed().to_string();
     let compression_skipped_count = Telemetry::compression_skipped_count().to_string();
+    let subscription_out_of_sync_count = Telemetry::subscription_out_of_sync_count().to_string();
+    let subscription_last_sync_timestamp =
+        Telemetry::subscription_last_sync_timestamp().to_string();
 
     let mut stats = Object::new(env)?;
     stats.set_named_property("total_connections", total_connections)?;
@@ -1999,6 +2693,241 @@ pub fn get_statistics<'a>(env: &'a Env) -> Result<Object<'a>> {
     stats.set_named_property("total_bytes_compressed", total_bytes_compressed)?;
     stats.set_named_property("total_bytes_decompressed", total_bytes_decompressed)?;
     stats.set_named_property("compression_skipped_count", compression_skipped_count)?;
+    stats.set_named_property(
+        "subscription_out_of_sync_count",
+        subscription_out_of_sync_count,
+    )?;
+    stats.set_named_property(
+        "subscription_last_sync_timestamp",
+        subscription_last_sync_timestamp,
+    )?;
 
     Ok(stats)
+}
+
+/// A Node.js address resolver wrapper that implements the `AddressResolver` trait.
+/// It holds a `ThreadsafeFunction` reference to a wrapper JavaScript function that
+/// calls the user's resolver and sends the result through a channel.
+type AddressResolverTsfn =
+    ThreadsafeFunction<ResolveRequest, (String, u32), FnArgs<(String, u32)>, Status, false, true>;
+
+struct NodeAddressResolver {
+    tsfn: AddressResolverTsfn,
+}
+
+/// Internal request type passed to the JS address resolver callback.
+struct ResolveRequest {
+    host: String,
+    port: u32,
+}
+
+impl std::fmt::Debug for NodeAddressResolver {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "NodeAddressResolver {{ callback: <JS function> }}")
+    }
+}
+
+// SAFETY: ThreadsafeFunction is designed to be called from any thread.
+unsafe impl Send for NodeAddressResolver {}
+unsafe impl Sync for NodeAddressResolver {}
+
+impl redis::AddressResolver for NodeAddressResolver {
+    fn resolve(&self, host: &str, port: u16) -> (String, u16) {
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        let original_host = host.to_string();
+        let fallback_host = original_host.clone();
+
+        let request = ResolveRequest {
+            host: original_host.clone(),
+            port: port as u32,
+        };
+
+        // Schedule the JS callback on the main thread and block until it completes
+        let status = self.tsfn.call_with_return_value(
+            request,
+            ThreadsafeFunctionCallMode::Blocking,
+            move |resolved, _env| {
+                let resolved = resolved
+                    .and_then(|(resolved_host, resolved_port)| {
+                        u16::try_from(resolved_port)
+                            .map(|port| (resolved_host, port))
+                            .map_err(|_| {
+                                Error::new(
+                                    Status::InvalidArg,
+                                    format!(
+                                        "Address resolver returned port outside u16 range: {resolved_port}"
+                                    ),
+                                )
+                            })
+                    })
+                    .unwrap_or_else(|e| {
+                        log_warn_lazy!(
+                            "address_resolver",
+                            format!(
+                                "Address resolver failed, falling back to original address: {e}"
+                            )
+                        );
+                        (fallback_host, port)
+                    });
+
+                let _ = tx.send(resolved);
+                Ok(())
+            },
+        );
+
+        if status != Status::Ok {
+            log_warn_lazy!(
+                "address_resolver",
+                format!("Address resolver failed, falling back to original address: {status:?}")
+            );
+            return (original_host, port);
+        }
+
+        // Wait for the JS callback to send back the resolved address
+        rx.recv().unwrap_or_else(|e| {
+            log_warn_lazy!(
+                "address_resolver",
+                format!("Address resolver failed, falling back to original address: {e}")
+            );
+            (host.to_string(), port)
+        })
+    }
+}
+
+/// Register a JavaScript address resolver callback in the global registry.
+/// Returns the registry key (UUID) that must be set in the ConnectionRequest's
+/// `address_resolver_key` field so the socket listener can look it up.
+///
+/// The JS callback signature is: `(host: string, port: number) => [string, number]`
+#[napi(js_name = "registerAddressResolver")]
+pub fn register_address_resolver(
+    #[napi(ts_arg_type = "(host: string, port: number) => [string, number]")] callback: Function<
+        '_,
+        FnArgs<(String, u32)>,
+        (String, u32),
+    >,
+) -> Result<String> {
+    let tsfn = callback
+        .build_threadsafe_function::<ResolveRequest>()
+        .callee_handled::<false>()
+        .weak::<true>()
+        .build_callback(|ctx| Ok(FnArgs::from((ctx.value.host, ctx.value.port))))?;
+
+    let key = uuid::Uuid::new_v4().to_string();
+    let resolver = Arc::new(NodeAddressResolver { tsfn });
+    glide_core::address_resolver_registry::register(key.clone(), resolver);
+    Ok(key)
+}
+
+/// Remove an address resolver from the global registry by key.
+#[napi(js_name = "removeAddressResolver")]
+pub fn remove_address_resolver(key: String) {
+    glide_core::address_resolver_registry::remove(&key);
+}
+
+static NEXT_MONITOR_HANDLE: AtomicU64 = AtomicU64::new(1);
+
+type MonitorCallbackArgs = (f64, i64, String, String, Vec<String>);
+type MonitorCallback<'a> = Function<'a, FnArgs<MonitorCallbackArgs>, ()>;
+
+fn monitor_store() -> &'static Mutex<StdHashMap<u64, MonitorClient>> {
+    static STORE: OnceLock<Mutex<StdHashMap<u64, MonitorClient>>> = OnceLock::new();
+    STORE.get_or_init(|| Mutex::new(StdHashMap::new()))
+}
+
+#[napi(js_name = "createMonitorClient", ts_return_type = "Promise<number>")]
+pub fn create_monitor_client<'a>(
+    env: &'a Env,
+    connection_request_bytes: Uint8Array,
+    #[napi(
+        ts_arg_type = "(timestamp: number, db: number, clientAddr: string, command: string, args: string[]) => void"
+    )]
+    callback: MonitorCallback<'_>,
+) -> Result<Object<'a>> {
+    let (deferred, promise) = env.create_deferred()?;
+    let conn_req =
+        connection_request::ConnectionRequest::parse_from_bytes(&connection_request_bytes)
+            .map_err(|e| napi::Error::new(Status::InvalidArg, e.to_string()))?;
+    let proto_addr = conn_req
+        .addresses
+        .first()
+        .ok_or_else(|| napi::Error::new(Status::InvalidArg, "No addresses provided"))?;
+    let address = NodeAddress {
+        host: proto_addr.host.to_string(),
+        port: proto_addr.port as u16,
+    };
+    let tls_mode = match conn_req.tls_mode.enum_value_or_default() {
+        connection_request::TlsMode::NoTls => TlsMode::NoTls,
+        connection_request::TlsMode::SecureTls => TlsMode::SecureTls,
+        connection_request::TlsMode::InsecureTls => TlsMode::InsecureTls,
+    };
+    let redis_conn_info = redis::RedisConnectionInfo {
+        db: conn_req.database_id as i64,
+        username: conn_req.authentication_info.as_ref().and_then(|a| {
+            let u = a.username.to_string();
+            if u.is_empty() { None } else { Some(u) }
+        }),
+        password: conn_req.authentication_info.as_ref().and_then(|a| {
+            let p = a.password.to_string();
+            if p.is_empty() { None } else { Some(p) }
+        }),
+        // MONITOR streams plain-text inline responses, which are incompatible with RESP3 push
+        // messages. RESP2 must always be used for monitor connections regardless of user config.
+        protocol: redis::ProtocolVersion::RESP2,
+        lib_name: if conn_req.lib_name.is_empty() {
+            None
+        } else {
+            Some(conn_req.lib_name.to_string())
+        },
+        ..Default::default()
+    };
+    let _client_name = conn_req.client_name.to_string(); // TODO: pass to MonitorClient::new once its signature supports it
+    // Weak mode calls napi_unref_threadsafe_function, so monitor callbacks do not keep
+    // the Node.js event loop alive while the monitor client is open.
+    let tsfn = callback
+        .build_threadsafe_function::<MonitorLine>()
+        .callee_handled::<false>()
+        .weak::<true>()
+        .build_callback(|ctx| {
+            let line = ctx.value;
+            Ok(FnArgs::from((
+                line.timestamp,
+                line.db,
+                line.client_addr,
+                line.command,
+                line.args,
+            )))
+        })?;
+    let on_line: MonitorLineCallback = Arc::new(move |line: MonitorLine| {
+        tsfn.call(
+            line,
+            napi::threadsafe_function::ThreadsafeFunctionCallMode::NonBlocking,
+        );
+    });
+    let glide_rt = get_or_init_runtime().map_err(|e| napi::Error::new(Status::Unknown, e))?;
+    glide_rt.runtime.spawn(async move {
+        match MonitorClient::new(&address, redis_conn_info, tls_mode, on_line).await {
+            Ok(client) => {
+                let handle_id = NEXT_MONITOR_HANDLE.fetch_add(1, Ordering::Relaxed);
+                monitor_store().lock().unwrap().insert(handle_id, client);
+                deferred.resolve(move |_| Ok(handle_id as i64));
+            }
+            Err(e) => deferred.reject(napi::Error::new(Status::Unknown, e.to_string())),
+        }
+    });
+    Ok(promise)
+}
+
+#[napi(js_name = "closeMonitorClient", ts_return_type = "Promise<void>")]
+pub fn close_monitor_client(env: &Env, handle_id: i64) -> Result<Object<'_>> {
+    let (deferred, promise) = env.create_deferred()?;
+    let client = monitor_store().lock().unwrap().remove(&(handle_id as u64));
+    let glide_rt = get_or_init_runtime().map_err(|e| napi::Error::new(Status::Unknown, e))?;
+    glide_rt.runtime.spawn(async move {
+        if let Some(c) = client {
+            c.stop_async().await;
+        }
+        deferred.resolve(|_| Ok(()));
+    });
+    Ok(promise)
 }

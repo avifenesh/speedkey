@@ -1,19 +1,19 @@
 {
-    "name": "@glidemq/speedkey-darwin-arm64",
+    "name": "@valkey/valkey-glide-darwin-arm64",
     "version": "0.0.0",
     "repository": {
         "type": "git",
-        "url": "git+https://github.com/avifenesh/speedkey.git"
+        "url": "git+https://github.com/valkey-io/valkey-glide.git"
     },
-    "homepage": "https://github.com/avifenesh/speedkey",
+    "homepage": "https://valkey.io/valkey-glide/node/",
     "author": "Valkey GLIDE Maintainers",
     "publishConfig": {
         "access": "public"
     },
-    "description": "Native bindings for speedkey on darwin-arm64",
-    "main": "speedkey.darwin-arm64.node",
+    "description": "Native bindings for valkey-glide on darwin-arm64",
+    "main": "valkey-glide.darwin-arm64.node",
     "files": [
-        "speedkey.darwin-arm64.node"
+        "valkey-glide.darwin-arm64.node"
     ],
     "os": [
         "darwin"
@@ -41,6 +41,6 @@
         "distributed",
         "scalable",
         "resilient",
-        "speedkey"
+        "valkey-glide"
     ]
 }

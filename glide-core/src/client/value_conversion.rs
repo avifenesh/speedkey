@@ -28,6 +28,7 @@ pub(crate) enum ExpectedReturnType<'a> {
     ArrayOfDoubleOrNull,
     FTAggregateReturnType,
     FTSearchReturnType,
+    FTSearchWithSortKeysReturnType,
     FTProfileReturnType(&'a Option<ExpectedReturnType<'a>>),
     FTInfoReturnType,
     Lolwut,
@@ -43,7 +44,9 @@ pub(crate) enum ExpectedReturnType<'a> {
     GeoSearchReturnType,
     SimpleString,
     XAutoClaimReturnType,
+    ClientTrackingInfoReturnType,
     XInfoStreamFullReturnType,
+    MemoryStatsReturnType,
 }
 
 pub(crate) fn convert_to_expected_type(
@@ -56,6 +59,16 @@ pub(crate) fn convert_to_expected_type(
 
     // If the value is a server error, return it as is, without conversion.
     if let Value::ServerError(_) = value {
+        return Ok(value);
+    }
+
+    // If the value is the RESP "QUEUED" status reply (sent for any command issued
+    // while the connection is inside a MULTI transaction, before EXEC), return it
+    // as-is without attempting per-command type coercion - the real reply doesn't
+    // exist yet until EXEC runs, so e.g. coercing it to Boolean would incorrectly fail.
+    if let Value::SimpleString(ref s) = value
+        && s == "QUEUED"
+    {
         return Ok(value);
     }
 
@@ -292,7 +305,7 @@ pub(crate) fn convert_to_expected_type(
                 Value::BulkString(bytes) => {
                     let text = std::str::from_utf8(&bytes).unwrap();
                     let res = convert_lolwut_string(text);
-                    Ok(Value::BulkString(Vec::from(res)))
+                    Ok(Value::BulkString(Vec::from(res).into()))
                 }
                 // RESP 3 response
                 Value::VerbatimString {
@@ -300,7 +313,7 @@ pub(crate) fn convert_to_expected_type(
                     ref text,
                 } => {
                     let res = convert_lolwut_string(text);
-                    Ok(Value::BulkString(Vec::from(res)))
+                    Ok(Value::BulkString(Vec::from(res).into()))
                 }
                 _ => Err((
                     ErrorKind::TypeError,
@@ -953,7 +966,7 @@ pub(crate) fn convert_to_expected_type(
         },
         ExpectedReturnType::FTSearchReturnType => match value {
             /*
-            Example of the response
+            Normal response (with field content):
                 1) (integer) 2
                 2) "json:2"
                 3) 1) "__VEC_score"
@@ -975,20 +988,46 @@ pub(crate) fn convert_to_expected_type(
                       1# "__VEC_score" => "91"
                       2# "$" => "{\"vec\":[1,2,3,4,5,6]}"
 
-            Response may contain only 1 element, no conversion in that case.
+            NOCONTENT response (key names only):
+                1) (integer) 2
+                2) "json:2"
+                3) "json:0"
+
+            Converting to:
+                1) (integer) 2
+                2) 1# "json:2" => (empty map)
+                   2# "json:0" => (empty map)
+
+            Response may contain only 1 element (COUNT option), no conversion in that case.
             */
             Value::Array(ref array) if array.len() == 1 => Ok(value),
             Value::Array(mut array) => {
-                Ok(Value::Array(vec![
-                    array.remove(0),
-                    convert_to_expected_type(Value::Array(array), Some(ExpectedReturnType::Map {
-                        key_type: &Some(ExpectedReturnType::BulkString),
-                        value_type: &Some(ExpectedReturnType::Map {
+                let count = array.remove(0);
+                if array.is_empty() {
+                    // Empty result set — return count with an empty map.
+                    Ok(Value::Array(vec![count, Value::Map(vec![])]))
+                } else if array.iter().all(|v| matches!(v, Value::BulkString(_) | Value::SimpleString(_))) {
+                    // NOCONTENT response: every element after count is a key name (BulkString or SimpleString).
+                    // Normal responses alternate key (BulkString) and fields (Array), so at
+                    // least one Array element would be present. If all elements are strings,
+                    // this is a NOCONTENT response — build key -> empty map pairs.
+                    let pairs: Vec<(Value, Value)> = array
+                        .into_iter()
+                        .map(|key| (key, Value::Map(vec![])))
+                        .collect();
+                    Ok(Value::Array(vec![count, Value::Map(pairs)]))
+                } else {
+                    Ok(Value::Array(vec![
+                        count,
+                        convert_to_expected_type(Value::Array(array), Some(ExpectedReturnType::Map {
                             key_type: &Some(ExpectedReturnType::BulkString),
-                            value_type: &Some(ExpectedReturnType::BulkString),
-                        }),
-                    }))?
-                ]))
+                            value_type: &Some(ExpectedReturnType::Map {
+                                key_type: &Some(ExpectedReturnType::BulkString),
+                                value_type: &Some(ExpectedReturnType::BulkString),
+                            }),
+                        }))?
+                    ]))
+                }
             },
             _ => Err((
                 ErrorKind::TypeError,
@@ -996,6 +1035,144 @@ pub(crate) fn convert_to_expected_type(
                 format!("(response was {:?})", get_value_type(&value)),
             )
                 .into())
+        },
+        ExpectedReturnType::FTSearchWithSortKeysReturnType => match value {
+            /*
+            WITHSORTKEYS response (with field content):
+                1) (integer) 2
+                2) "key1"
+                3) "sortval1"
+                4) 1) "field1"
+                   2) "value1"
+                5) "key2"
+                6) "sortval2"
+                7) 1) "field2"
+                   2) "value2"
+
+            Converting response to:
+                1) (integer) 2
+                2) 1# "key1" =>
+                      1) "sortval1"
+                      2) 1# "field1" => "value1"
+                   2# "key2" =>
+                      1) "sortval2"
+                      2) 1# "field2" => "value2"
+
+            WITHSORTKEYS + NOCONTENT response:
+                1) (integer) 2
+                2) "key1"
+                3) "sortval1"
+                4) "key2"
+                5) (nil)
+
+            Converting to:
+                1) (integer) 2
+                2) 1# "key1" =>
+                      1) "sortval1"
+                      2) (empty map)
+                   2# "key2" =>
+                      1) (nil)
+                      2) (empty map)
+
+            Response may contain only 1 element (COUNT option), no conversion in that case.
+            */
+            Value::Array(ref array) if array.len() == 1 => Ok(value),
+            Value::Array(mut array) => {
+                let count = array.remove(0);
+                if array.is_empty() {
+                    // Empty result set — return count with an empty map.
+                    return Ok(Value::Array(vec![count, Value::Map(vec![])]));
+                }
+
+                // Determine if this is a NOCONTENT response (no field arrays).
+                // With WITHSORTKEYS + NOCONTENT, the layout is:
+                //   key1, sortkey1, key2, sortkey2, ...
+                // All elements are strings/nil (no Array elements).
+                let has_field_arrays = array.iter().any(|v| matches!(v, Value::Array(_)));
+
+                let mut pairs: Vec<(Value, Value)> = Vec::new();
+                let mut iter = array.into_iter();
+
+                if has_field_arrays {
+                    // Normal WITHSORTKEYS: triplets of (key, sortkey, fields_array)
+                    while let Some(key) = iter.next() {
+                        let Some(sort_key) = iter.next() else {
+                            return Err((
+                                ErrorKind::TypeError,
+                                "WITHSORTKEYS response: missing sort key after document key",
+                            )
+                                .into());
+                        };
+                        let Some(fields) = iter.next() else {
+                            return Err((
+                                ErrorKind::TypeError,
+                                "WITHSORTKEYS response: missing fields array after sort key",
+                            )
+                                .into());
+                        };
+                        // Convert the flat field array into a map of field name → value.
+                        let field_map = convert_to_expected_type(
+                            fields,
+                            Some(ExpectedReturnType::Map {
+                                key_type: &Some(ExpectedReturnType::BulkString),
+                                value_type: &Some(ExpectedReturnType::BulkString),
+                            }),
+                        )?;
+                        pairs.push((key, Value::Array(vec![sort_key, field_map])));
+                    }
+                } else {
+                    // NOCONTENT + WITHSORTKEYS: pairs of (key, sortkey)
+                    while let Some(key) = iter.next() {
+                        let Some(sort_key) = iter.next() else {
+                            return Err((
+                                ErrorKind::TypeError,
+                                "WITHSORTKEYS NOCONTENT response: missing sort key after document key",
+                            )
+                                .into());
+                        };
+                        pairs.push((key, Value::Array(vec![sort_key, Value::Map(vec![])])));
+                    }
+                }
+
+                Ok(Value::Array(vec![count, Value::Map(pairs)]))
+            }
+            _ => Err((
+                ErrorKind::TypeError,
+                "Response couldn't be converted for FT.SEARCH WITHSORTKEYS",
+                format!("(response was {:?})", get_value_type(&value)),
+            )
+                .into())
+        },
+        ExpectedReturnType::ClientTrackingInfoReturnType => match value {
+            Value::Array(_) => {
+                // RESP2: flat [k,v,...] -> Map, then convert "flags" Array -> Set
+                let Value::Map(mut map) = convert_to_expected_type(
+                    value,
+                    Some(ExpectedReturnType::Map {
+                        key_type: &None,
+                        value_type: &None,
+                    }),
+                )? else {
+                    unreachable!()
+                };
+                if let Some(pair) = map.iter_mut().find(|(k, _)| {
+                    matches!(k, Value::BulkString(b) if b.as_ref() == b"flags")
+                }) {
+                    let val = std::mem::replace(&mut pair.1, Value::Nil);
+                    pair.1 = convert_to_expected_type(val, Some(ExpectedReturnType::Set))?;
+                }
+                Ok(Value::Map(map))
+            }
+            Value::Map(_) => {
+                // RESP3: already a map, "flags" is already Value::Set — pass through
+                Ok(value)
+            }
+            _ => Err((
+                ErrorKind::TypeError,
+                "Response couldn't be converted for CLIENT TRACKINGINFO",
+                format!("(response was {:?})", get_value_type(&value)),
+            )
+                .into()),
         },
         ExpectedReturnType::FTInfoReturnType => match value {
             /*
@@ -1148,6 +1325,35 @@ pub(crate) fn convert_to_expected_type(
                     None => convert_to_expected_type(value, Some(ExpectedReturnType::Map { key_type: &None, value_type })),
                 }
             _ => convert_to_expected_type(value, *value_type),
+        }
+        ExpectedReturnType::MemoryStatsReturnType => {
+            // Convert the top-level response to a map, then recursively convert nested db.<N> entries into maps as well.
+            let map_value = convert_to_expected_type(value, Some(ExpectedReturnType::Map {
+                key_type: &None,
+                value_type: &None,
+            }))?;
+            match map_value {
+                Value::Map(map) => {
+                    let converted = map.into_iter().map(|(k, v)| {
+                        let converted_v = match &v {
+                            // Convert RESP2 two-dimensional arrays to maps.
+                            Value::Array(arr) => {
+                                convert_array_to_map_by_type(arr.clone(), None, None)
+                                    .unwrap_or(v)
+                            }
+                            // Convert RESP2 bulk strings to doubles.
+                            Value::BulkString(_) => {
+                                convert_to_expected_type(v.clone(), Some(ExpectedReturnType::Double))
+                                    .unwrap_or(v)
+                            }
+                            _ => v,
+                        };
+                        (k, converted_v)
+                    }).collect();
+                    Ok(Value::Map(converted))
+                }
+                other => Ok(other),
+            }
         }
     }
 }
@@ -1401,6 +1607,10 @@ pub(crate) fn expected_type_for_cmd(cmd: &Cmd) -> Option<ExpectedReturnType<'_>>
 
     // TODO use enum to avoid mistakes
     match command.as_slice() {
+        b"CLIENT TRACKINGINFO" => Some(ExpectedReturnType::SingleOrMultiNode(
+            &Some(ExpectedReturnType::ClientTrackingInfoReturnType),
+            Some(&is_array),
+        )),
         b"HGETALL" | b"FT.CONFIG GET" | b"FT._ALIASLIST" | b"HELLO" => {
             Some(ExpectedReturnType::Map {
                 key_type: &None,
@@ -1533,12 +1743,26 @@ pub(crate) fn expected_type_for_cmd(cmd: &Cmd) -> Option<ExpectedReturnType<'_>>
             key_type: &None,
             value_type: &None,
         }),
+        b"MEMORY STATS" => Some(ExpectedReturnType::SingleOrMultiNode(
+            &Some(ExpectedReturnType::MemoryStatsReturnType),
+            Some(&is_array),
+        )),
         b"FT.AGGREGATE" => Some(ExpectedReturnType::FTAggregateReturnType),
-        b"FT.SEARCH" => Some(ExpectedReturnType::FTSearchReturnType),
+        b"FT.SEARCH" => {
+            if cmd.position(b"WITHSORTKEYS").is_some() {
+                Some(ExpectedReturnType::FTSearchWithSortKeysReturnType)
+            } else {
+                Some(ExpectedReturnType::FTSearchReturnType)
+            }
+        }
         // TODO replace with tuple
         b"FT.PROFILE" => Some(ExpectedReturnType::FTProfileReturnType(
             if cmd.arg_idx(2).is_some_and(|a| a == b"SEARCH") {
-                &Some(ExpectedReturnType::FTSearchReturnType)
+                if cmd.position(b"WITHSORTKEYS").is_some() {
+                    &Some(ExpectedReturnType::FTSearchWithSortKeysReturnType)
+                } else {
+                    &Some(ExpectedReturnType::FTSearchReturnType)
+                }
             } else {
                 &Some(ExpectedReturnType::FTAggregateReturnType)
             },
@@ -1593,42 +1817,42 @@ mod tests {
     fn convert_xinfo_stream() {
         // Only a partial response is represented here for brevity - the rest of the response follows the same format.
         let groups_resp2_response = Value::Array(vec![
-            Value::BulkString("length".to_string().into_bytes()),
+            Value::BulkString("length".to_string().into_bytes().into()),
             Value::Int(2),
-            Value::BulkString("entries".to_string().into_bytes()),
+            Value::BulkString("entries".to_string().into_bytes().into()),
             Value::Array(vec![Value::Array(vec![
-                Value::BulkString("1-0".to_string().into_bytes()),
+                Value::BulkString("1-0".to_string().into_bytes().into()),
                 Value::Array(vec![
-                    Value::BulkString("a".to_string().into_bytes()),
-                    Value::BulkString("b".to_string().into_bytes()),
-                    Value::BulkString("c".to_string().into_bytes()),
-                    Value::BulkString("d".to_string().into_bytes()),
+                    Value::BulkString("a".to_string().into_bytes().into()),
+                    Value::BulkString("b".to_string().into_bytes().into()),
+                    Value::BulkString("c".to_string().into_bytes().into()),
+                    Value::BulkString("d".to_string().into_bytes().into()),
                 ]),
             ])]),
-            Value::BulkString("groups".to_string().into_bytes()),
+            Value::BulkString("groups".to_string().into_bytes().into()),
             Value::Array(vec![
                 Value::Array(vec![
-                    Value::BulkString("name".to_string().into_bytes()),
-                    Value::BulkString("group1".to_string().into_bytes()),
-                    Value::BulkString("consumers".to_string().into_bytes()),
+                    Value::BulkString("name".to_string().into_bytes().into()),
+                    Value::BulkString("group1".to_string().into_bytes().into()),
+                    Value::BulkString("consumers".to_string().into_bytes().into()),
                     Value::Array(vec![
                         Value::Array(vec![
-                            Value::BulkString("name".to_string().into_bytes()),
-                            Value::BulkString("consumer1".to_string().into_bytes()),
-                            Value::BulkString("pending".to_string().into_bytes()),
+                            Value::BulkString("name".to_string().into_bytes().into()),
+                            Value::BulkString("consumer1".to_string().into_bytes().into()),
+                            Value::BulkString("pending".to_string().into_bytes().into()),
                             Value::Array(vec![Value::Array(vec![
-                                Value::BulkString("1-0".to_string().into_bytes()),
+                                Value::BulkString("1-0".to_string().into_bytes().into()),
                                 Value::Int(1),
                             ])]),
                         ]),
                         Value::Array(vec![
-                            Value::BulkString("pending".to_string().into_bytes()),
+                            Value::BulkString("pending".to_string().into_bytes().into()),
                             Value::Array(vec![]),
                         ]),
                     ]),
                 ]),
                 Value::Array(vec![
-                    Value::BulkString("consumers".to_string().into_bytes()),
+                    Value::BulkString("consumers".to_string().into_bytes().into()),
                     Value::Array(vec![]),
                 ]),
             ]),
@@ -1636,54 +1860,60 @@ mod tests {
 
         let groups_resp3_response = Value::Map(vec![
             (
-                Value::BulkString("length".to_string().into_bytes()),
+                Value::BulkString("length".to_string().into_bytes().into()),
                 Value::Int(2),
             ),
             (
-                Value::BulkString("entries".to_string().into_bytes()),
+                Value::BulkString("entries".to_string().into_bytes().into()),
                 Value::Array(vec![Value::Array(vec![
-                    Value::BulkString("1-0".to_string().into_bytes()),
+                    Value::BulkString("1-0".to_string().into_bytes().into()),
                     Value::Array(vec![
-                        Value::BulkString("a".to_string().into_bytes()),
-                        Value::BulkString("b".to_string().into_bytes()),
-                        Value::BulkString("c".to_string().into_bytes()),
-                        Value::BulkString("d".to_string().into_bytes()),
+                        Value::BulkString("a".to_string().into_bytes().into()),
+                        Value::BulkString("b".to_string().into_bytes().into()),
+                        Value::BulkString("c".to_string().into_bytes().into()),
+                        Value::BulkString("d".to_string().into_bytes().into()),
                     ]),
                 ])]),
             ),
             (
-                Value::BulkString("groups".to_string().into_bytes()),
+                Value::BulkString("groups".to_string().into_bytes().into()),
                 Value::Array(vec![
                     Value::Map(vec![
                         (
-                            Value::BulkString("name".to_string().into_bytes()),
-                            Value::BulkString("group1".to_string().into_bytes()),
+                            Value::BulkString("name".to_string().into_bytes().into()),
+                            Value::BulkString("group1".to_string().into_bytes().into()),
                         ),
                         (
-                            Value::BulkString("consumers".to_string().into_bytes()),
+                            Value::BulkString("consumers".to_string().into_bytes().into()),
                             Value::Array(vec![
                                 Value::Map(vec![
                                     (
-                                        Value::BulkString("name".to_string().into_bytes()),
-                                        Value::BulkString("consumer1".to_string().into_bytes()),
+                                        Value::BulkString("name".to_string().into_bytes().into()),
+                                        Value::BulkString(
+                                            "consumer1".to_string().into_bytes().into(),
+                                        ),
                                     ),
                                     (
-                                        Value::BulkString("pending".to_string().into_bytes()),
+                                        Value::BulkString(
+                                            "pending".to_string().into_bytes().into(),
+                                        ),
                                         Value::Array(vec![Value::Array(vec![
-                                            Value::BulkString("1-0".to_string().into_bytes()),
+                                            Value::BulkString(
+                                                "1-0".to_string().into_bytes().into(),
+                                            ),
                                             Value::Int(1),
                                         ])]),
                                     ),
                                 ]),
                                 Value::Map(vec![(
-                                    Value::BulkString("pending".to_string().into_bytes()),
+                                    Value::BulkString("pending".to_string().into_bytes().into()),
                                     Value::Array(vec![]),
                                 )]),
                             ]),
                         ),
                     ]),
                     Value::Map(vec![(
-                        Value::BulkString("consumers".to_string().into_bytes()),
+                        Value::BulkString("consumers".to_string().into_bytes().into()),
                         Value::Array(vec![]),
                     )]),
                 ]),
@@ -1711,12 +1941,12 @@ mod tests {
         );
 
         let resp2_empty_groups = Value::Array(vec![
-            Value::BulkString("groups".to_string().into_bytes()),
+            Value::BulkString("groups".to_string().into_bytes().into()),
             Value::Array(vec![]),
         ]);
 
         let resp3_empty_groups = Value::Map(vec![(
-            Value::BulkString("groups".to_string().into_bytes()),
+            Value::BulkString("groups".to_string().into_bytes().into()),
             Value::Array(vec![]),
         )]);
 
@@ -1761,15 +1991,15 @@ mod tests {
         // follows the same format.
         let groups_resp2_response = Value::Array(vec![
             Value::Array(vec![
-                Value::BulkString("name".to_string().into_bytes()),
-                Value::BulkString("mygroup".to_string().into_bytes()),
-                Value::BulkString("lag".to_string().into_bytes()),
+                Value::BulkString("name".to_string().into_bytes().into()),
+                Value::BulkString("mygroup".to_string().into_bytes().into()),
+                Value::BulkString("lag".to_string().into_bytes().into()),
                 Value::Int(0),
             ]),
             Value::Array(vec![
-                Value::BulkString("name".to_string().into_bytes()),
-                Value::BulkString("some-other-group".to_string().into_bytes()),
-                Value::BulkString("lag".to_string().into_bytes()),
+                Value::BulkString("name".to_string().into_bytes().into()),
+                Value::BulkString("some-other-group".to_string().into_bytes().into()),
+                Value::BulkString("lag".to_string().into_bytes().into()),
                 Value::Nil,
             ]),
         ]);
@@ -1777,21 +2007,21 @@ mod tests {
         let groups_resp3_response = Value::Array(vec![
             Value::Map(vec![
                 (
-                    Value::BulkString("name".to_string().into_bytes()),
-                    Value::BulkString("mygroup".to_string().into_bytes()),
+                    Value::BulkString("name".to_string().into_bytes().into()),
+                    Value::BulkString("mygroup".to_string().into_bytes().into()),
                 ),
                 (
-                    Value::BulkString("lag".to_string().into_bytes()),
+                    Value::BulkString("lag".to_string().into_bytes().into()),
                     Value::Int(0),
                 ),
             ]),
             Value::Map(vec![
                 (
-                    Value::BulkString("name".to_string().into_bytes()),
-                    Value::BulkString("some-other-group".to_string().into_bytes()),
+                    Value::BulkString("name".to_string().into_bytes().into()),
+                    Value::BulkString("some-other-group".to_string().into_bytes().into()),
                 ),
                 (
-                    Value::BulkString("lag".to_string().into_bytes()),
+                    Value::BulkString("lag".to_string().into_bytes().into()),
                     Value::Nil,
                 ),
             ]),
@@ -1831,86 +2061,86 @@ mod tests {
 
         let resp2_response = Value::Array(vec![
             Value::Array(vec![
-                Value::BulkString("library_name".to_string().into_bytes()),
-                Value::BulkString("mylib1".to_string().into_bytes()),
-                Value::BulkString("engine".to_string().into_bytes()),
-                Value::BulkString("LUA".to_string().into_bytes()),
-                Value::BulkString("functions".to_string().into_bytes()),
+                Value::BulkString("library_name".to_string().into_bytes().into()),
+                Value::BulkString("mylib1".to_string().into_bytes().into()),
+                Value::BulkString("engine".to_string().into_bytes().into()),
+                Value::BulkString("LUA".to_string().into_bytes().into()),
+                Value::BulkString("functions".to_string().into_bytes().into()),
                 Value::Array(vec![
                     Value::Array(vec![
-                        Value::BulkString("name".to_string().into_bytes()),
-                        Value::BulkString("myfunc1".to_string().into_bytes()),
-                        Value::BulkString("description".to_string().into_bytes()),
+                        Value::BulkString("name".to_string().into_bytes().into()),
+                        Value::BulkString("myfunc1".to_string().into_bytes().into()),
+                        Value::BulkString("description".to_string().into_bytes().into()),
                         Value::Nil,
-                        Value::BulkString("flags".to_string().into_bytes()),
+                        Value::BulkString("flags".to_string().into_bytes().into()),
                         Value::Array(vec![
-                            Value::BulkString("read".to_string().into_bytes()),
-                            Value::BulkString("write".to_string().into_bytes()),
+                            Value::BulkString("read".to_string().into_bytes().into()),
+                            Value::BulkString("write".to_string().into_bytes().into()),
                         ]),
                     ]),
                     Value::Array(vec![
-                        Value::BulkString("name".to_string().into_bytes()),
-                        Value::BulkString("myfunc2".to_string().into_bytes()),
-                        Value::BulkString("description".to_string().into_bytes()),
-                        Value::BulkString("blahblah".to_string().into_bytes()),
-                        Value::BulkString("flags".to_string().into_bytes()),
+                        Value::BulkString("name".to_string().into_bytes().into()),
+                        Value::BulkString("myfunc2".to_string().into_bytes().into()),
+                        Value::BulkString("description".to_string().into_bytes().into()),
+                        Value::BulkString("blahblah".to_string().into_bytes().into()),
+                        Value::BulkString("flags".to_string().into_bytes().into()),
                         Value::Array(vec![]),
                     ]),
                 ]),
             ]),
             Value::Array(vec![
-                Value::BulkString("library_name".to_string().into_bytes()),
-                Value::BulkString("mylib2".to_string().into_bytes()),
-                Value::BulkString("engine".to_string().into_bytes()),
-                Value::BulkString("LUA".to_string().into_bytes()),
-                Value::BulkString("functions".to_string().into_bytes()),
+                Value::BulkString("library_name".to_string().into_bytes().into()),
+                Value::BulkString("mylib2".to_string().into_bytes().into()),
+                Value::BulkString("engine".to_string().into_bytes().into()),
+                Value::BulkString("LUA".to_string().into_bytes().into()),
+                Value::BulkString("functions".to_string().into_bytes().into()),
                 Value::Array(vec![]),
-                Value::BulkString("library_code".to_string().into_bytes()),
-                Value::BulkString("<code>".to_string().into_bytes()),
+                Value::BulkString("library_code".to_string().into_bytes().into()),
+                Value::BulkString("<code>".to_string().into_bytes().into()),
             ]),
         ]);
 
         let resp3_response = Value::Array(vec![
             Value::Map(vec![
                 (
-                    Value::BulkString("library_name".to_string().into_bytes()),
-                    Value::BulkString("mylib1".to_string().into_bytes()),
+                    Value::BulkString("library_name".to_string().into_bytes().into()),
+                    Value::BulkString("mylib1".to_string().into_bytes().into()),
                 ),
                 (
-                    Value::BulkString("engine".to_string().into_bytes()),
-                    Value::BulkString("LUA".to_string().into_bytes()),
+                    Value::BulkString("engine".to_string().into_bytes().into()),
+                    Value::BulkString("LUA".to_string().into_bytes().into()),
                 ),
                 (
-                    Value::BulkString("functions".to_string().into_bytes()),
+                    Value::BulkString("functions".to_string().into_bytes().into()),
                     Value::Array(vec![
                         Value::Map(vec![
                             (
-                                Value::BulkString("name".to_string().into_bytes()),
-                                Value::BulkString("myfunc1".to_string().into_bytes()),
+                                Value::BulkString("name".to_string().into_bytes().into()),
+                                Value::BulkString("myfunc1".to_string().into_bytes().into()),
                             ),
                             (
-                                Value::BulkString("description".to_string().into_bytes()),
+                                Value::BulkString("description".to_string().into_bytes().into()),
                                 Value::Nil,
                             ),
                             (
-                                Value::BulkString("flags".to_string().into_bytes()),
+                                Value::BulkString("flags".to_string().into_bytes().into()),
                                 Value::Set(vec![
-                                    Value::BulkString("read".to_string().into_bytes()),
-                                    Value::BulkString("write".to_string().into_bytes()),
+                                    Value::BulkString("read".to_string().into_bytes().into()),
+                                    Value::BulkString("write".to_string().into_bytes().into()),
                                 ]),
                             ),
                         ]),
                         Value::Map(vec![
                             (
-                                Value::BulkString("name".to_string().into_bytes()),
-                                Value::BulkString("myfunc2".to_string().into_bytes()),
+                                Value::BulkString("name".to_string().into_bytes().into()),
+                                Value::BulkString("myfunc2".to_string().into_bytes().into()),
                             ),
                             (
-                                Value::BulkString("description".to_string().into_bytes()),
-                                Value::BulkString("blahblah".to_string().into_bytes()),
+                                Value::BulkString("description".to_string().into_bytes().into()),
+                                Value::BulkString("blahblah".to_string().into_bytes().into()),
                             ),
                             (
-                                Value::BulkString("flags".to_string().into_bytes()),
+                                Value::BulkString("flags".to_string().into_bytes().into()),
                                 Value::Set(vec![]),
                             ),
                         ]),
@@ -1919,20 +2149,20 @@ mod tests {
             ]),
             Value::Map(vec![
                 (
-                    Value::BulkString("library_name".to_string().into_bytes()),
-                    Value::BulkString("mylib2".to_string().into_bytes()),
+                    Value::BulkString("library_name".to_string().into_bytes().into()),
+                    Value::BulkString("mylib2".to_string().into_bytes().into()),
                 ),
                 (
-                    Value::BulkString("engine".to_string().into_bytes()),
-                    Value::BulkString("LUA".to_string().into_bytes()),
+                    Value::BulkString("engine".to_string().into_bytes().into()),
+                    Value::BulkString("LUA".to_string().into_bytes().into()),
                 ),
                 (
-                    Value::BulkString("functions".to_string().into_bytes()),
+                    Value::BulkString("functions".to_string().into_bytes().into()),
                     Value::Array(vec![]),
                 ),
                 (
-                    Value::BulkString("library_code".to_string().into_bytes()),
-                    Value::BulkString("<code>".to_string().into_bytes()),
+                    Value::BulkString("library_code".to_string().into_bytes().into()),
+                    Value::BulkString("<code>".to_string().into_bytes().into()),
                 ),
             ]),
         ]);
@@ -1982,11 +2212,11 @@ mod tests {
         let conversion_type = expected_type_for_cmd(cmd.arg("version").arg("42"));
 
         let converted_1 = convert_to_expected_type(
-            Value::BulkString(unconverted_string.clone().into_bytes()),
+            Value::BulkString(unconverted_string.clone().into_bytes().into()),
             conversion_type,
         );
         assert_eq!(
-            Value::BulkString(expected.clone().into_bytes()),
+            Value::BulkString(expected.clone().into_bytes().into()),
             converted_1.unwrap()
         );
 
@@ -1998,7 +2228,7 @@ mod tests {
             conversion_type,
         );
         assert_eq!(
-            Value::BulkString(expected.clone().into_bytes()),
+            Value::BulkString(expected.clone().into_bytes().into()),
             converted_2.unwrap()
         );
 
@@ -2006,11 +2236,11 @@ mod tests {
             Value::Map(vec![
                 (
                     Value::SimpleString("node 1".into()),
-                    Value::BulkString(unconverted_string.clone().into_bytes()),
+                    Value::BulkString(unconverted_string.clone().into_bytes().into()),
                 ),
                 (
                     Value::SimpleString("node 2".into()),
-                    Value::BulkString(unconverted_string.clone().into_bytes()),
+                    Value::BulkString(unconverted_string.clone().into_bytes().into()),
                 ),
             ]),
             conversion_type,
@@ -2019,11 +2249,11 @@ mod tests {
             Value::Map(vec![
                 (
                     Value::SimpleString("node 1".into()),
-                    Value::BulkString(expected.clone().into_bytes())
+                    Value::BulkString(expected.clone().into_bytes().into())
                 ),
                 (
                     Value::SimpleString("node 2".into()),
-                    Value::BulkString(expected.clone().into_bytes())
+                    Value::BulkString(expected.clone().into_bytes().into())
                 ),
             ]),
             converted_3.unwrap()
@@ -2149,49 +2379,49 @@ mod tests {
         ));
 
         let v6_response = Value::Array(vec![
-            Value::BulkString("0-0".to_string().into_bytes()),
+            Value::BulkString("0-0".to_string().into_bytes().into()),
             Value::Array(vec![
                 Value::Array(vec![
-                    Value::BulkString("1-0".to_string().into_bytes()),
+                    Value::BulkString("1-0".to_string().into_bytes().into()),
                     Value::Array(vec![
-                        Value::BulkString("field1".to_string().into_bytes()),
-                        Value::BulkString("value1".to_string().into_bytes()),
-                        Value::BulkString("field2".to_string().into_bytes()),
-                        Value::BulkString("value2".to_string().into_bytes()),
+                        Value::BulkString("field1".to_string().into_bytes().into()),
+                        Value::BulkString("value1".to_string().into_bytes().into()),
+                        Value::BulkString("field2".to_string().into_bytes().into()),
+                        Value::BulkString("value2".to_string().into_bytes().into()),
                     ]),
                 ]),
                 Value::Nil, // Entry IDs that were in the Pending Entry List but no longer in the stream get a nil value.
                 Value::Array(vec![
-                    Value::BulkString("1-1".to_string().into_bytes()),
+                    Value::BulkString("1-1".to_string().into_bytes().into()),
                     Value::Array(vec![
-                        Value::BulkString("field3".to_string().into_bytes()),
-                        Value::BulkString("value3".to_string().into_bytes()),
+                        Value::BulkString("field3".to_string().into_bytes().into()),
+                        Value::BulkString("value3".to_string().into_bytes().into()),
                     ]),
                 ]),
             ]),
         ]);
 
         let expected_v6_response = Value::Array(vec![
-            Value::BulkString("0-0".to_string().into_bytes()),
+            Value::BulkString("0-0".to_string().into_bytes().into()),
             Value::Map(vec![
                 (
-                    Value::BulkString("1-0".to_string().into_bytes()),
+                    Value::BulkString("1-0".to_string().into_bytes().into()),
                     Value::Array(vec![
                         Value::Array(vec![
-                            Value::BulkString("field1".to_string().into_bytes()),
-                            Value::BulkString("value1".to_string().into_bytes()),
+                            Value::BulkString("field1".to_string().into_bytes().into()),
+                            Value::BulkString("value1".to_string().into_bytes().into()),
                         ]),
                         Value::Array(vec![
-                            Value::BulkString("field2".to_string().into_bytes()),
-                            Value::BulkString("value2".to_string().into_bytes()),
+                            Value::BulkString("field2".to_string().into_bytes().into()),
+                            Value::BulkString("value2".to_string().into_bytes().into()),
                         ]),
                     ]),
                 ),
                 (
-                    Value::BulkString("1-1".to_string().into_bytes()),
+                    Value::BulkString("1-1".to_string().into_bytes().into()),
                     Value::Array(vec![Value::Array(vec![
-                        Value::BulkString("field3".to_string().into_bytes()),
-                        Value::BulkString("value3".to_string().into_bytes()),
+                        Value::BulkString("field3".to_string().into_bytes().into()),
+                        Value::BulkString("value3".to_string().into_bytes().into()),
                     ])]),
                 ),
             ]),
@@ -2207,53 +2437,57 @@ mod tests {
         );
 
         let v7_response = Value::Array(vec![
-            Value::BulkString("0-0".to_string().into_bytes()),
+            Value::BulkString("0-0".to_string().into_bytes().into()),
             Value::Array(vec![
                 Value::Array(vec![
-                    Value::BulkString("1-0".to_string().into_bytes()),
+                    Value::BulkString("1-0".to_string().into_bytes().into()),
                     Value::Array(vec![
-                        Value::BulkString("field1".to_string().into_bytes()),
-                        Value::BulkString("value1".to_string().into_bytes()),
-                        Value::BulkString("field2".to_string().into_bytes()),
-                        Value::BulkString("value2".to_string().into_bytes()),
+                        Value::BulkString("field1".to_string().into_bytes().into()),
+                        Value::BulkString("value1".to_string().into_bytes().into()),
+                        Value::BulkString("field2".to_string().into_bytes().into()),
+                        Value::BulkString("value2".to_string().into_bytes().into()),
                     ]),
                 ]),
                 Value::Array(vec![
-                    Value::BulkString("1-1".to_string().into_bytes()),
+                    Value::BulkString("1-1".to_string().into_bytes().into()),
                     Value::Array(vec![
-                        Value::BulkString("field3".to_string().into_bytes()),
-                        Value::BulkString("value3".to_string().into_bytes()),
+                        Value::BulkString("field3".to_string().into_bytes().into()),
+                        Value::BulkString("value3".to_string().into_bytes().into()),
                     ]),
                 ]),
             ]),
-            Value::Array(vec![Value::BulkString("1-2".to_string().into_bytes())]),
+            Value::Array(vec![Value::BulkString(
+                "1-2".to_string().into_bytes().into(),
+            )]),
         ]);
 
         let expected_v7_response = Value::Array(vec![
-            Value::BulkString("0-0".to_string().into_bytes()),
+            Value::BulkString("0-0".to_string().into_bytes().into()),
             Value::Map(vec![
                 (
-                    Value::BulkString("1-0".to_string().into_bytes()),
+                    Value::BulkString("1-0".to_string().into_bytes().into()),
                     Value::Array(vec![
                         Value::Array(vec![
-                            Value::BulkString("field1".to_string().into_bytes()),
-                            Value::BulkString("value1".to_string().into_bytes()),
+                            Value::BulkString("field1".to_string().into_bytes().into()),
+                            Value::BulkString("value1".to_string().into_bytes().into()),
                         ]),
                         Value::Array(vec![
-                            Value::BulkString("field2".to_string().into_bytes()),
-                            Value::BulkString("value2".to_string().into_bytes()),
+                            Value::BulkString("field2".to_string().into_bytes().into()),
+                            Value::BulkString("value2".to_string().into_bytes().into()),
                         ]),
                     ]),
                 ),
                 (
-                    Value::BulkString("1-1".to_string().into_bytes()),
+                    Value::BulkString("1-1".to_string().into_bytes().into()),
                     Value::Array(vec![Value::Array(vec![
-                        Value::BulkString("field3".to_string().into_bytes()),
-                        Value::BulkString("value3".to_string().into_bytes()),
+                        Value::BulkString("field3".to_string().into_bytes().into()),
+                        Value::BulkString("value3".to_string().into_bytes().into()),
                     ])]),
                 ),
             ]),
-            Value::Array(vec![Value::BulkString("1-2".to_string().into_bytes())]),
+            Value::Array(vec![Value::BulkString(
+                "1-2".to_string().into_bytes().into(),
+            )]),
         ]);
 
         assert_eq!(
@@ -2282,11 +2516,14 @@ mod tests {
     fn test_convert_array_to_map_with_none() {
         let unconverted_map = vec![
             (
-                Value::BulkString(b"key1".to_vec()),
-                Value::BulkString(b"10.5".to_vec()),
+                Value::BulkString(b"key1".to_vec().into()),
+                Value::BulkString(b"10.5".to_vec().into()),
             ),
             (Value::Double(20.5), Value::Double(19.5)),
-            (Value::Double(18.5), Value::BulkString(b"30.2".to_vec())),
+            (
+                Value::Double(18.5),
+                Value::BulkString(b"30.2".to_vec().into()),
+            ),
         ];
 
         let converted_type = ExpectedReturnType::Map {
@@ -2305,8 +2542,8 @@ mod tests {
         assert_eq!(converted_map.len(), 3);
 
         let (key, value) = &converted_map[0];
-        assert_eq!(*key, Value::BulkString(b"key1".to_vec()));
-        assert_eq!(*value, Value::BulkString(b"10.5".to_vec()));
+        assert_eq!(*key, Value::BulkString(b"key1".to_vec().into()));
+        assert_eq!(*value, Value::BulkString(b"10.5".to_vec().into()));
 
         let (key, value) = &converted_map[1];
         assert_eq!(*key, Value::Double(20.5));
@@ -2314,7 +2551,7 @@ mod tests {
 
         let (key, value) = &converted_map[2];
         assert_eq!(*key, Value::Double(18.5));
-        assert_eq!(*value, Value::BulkString(b"30.2".to_vec()));
+        assert_eq!(*value, Value::BulkString(b"30.2".to_vec().into()));
     }
 
     #[test]
@@ -2331,32 +2568,32 @@ mod tests {
         //
         let array_of_arrays = vec![
             Value::Array(vec![
-                Value::BulkString(b"key1".to_vec()),
+                Value::BulkString(b"key1".to_vec().into()),
                 Value::Array(vec![Value::Array(vec![
-                    Value::BulkString(b"streamid-1".to_vec()),
+                    Value::BulkString(b"streamid-1".to_vec().into()),
                     Value::Array(vec![
-                        Value::BulkString(b"field1".to_vec()),
-                        Value::BulkString(b"value1".to_vec()),
+                        Value::BulkString(b"field1".to_vec().into()),
+                        Value::BulkString(b"value1".to_vec().into()),
                     ]),
                 ])]),
             ]),
             Value::Array(vec![
-                Value::BulkString(b"key2".to_vec()),
+                Value::BulkString(b"key2".to_vec().into()),
                 Value::Array(vec![
                     Value::Array(vec![
-                        Value::BulkString(b"streamid-2".to_vec()),
+                        Value::BulkString(b"streamid-2".to_vec().into()),
                         Value::Array(vec![
-                            Value::BulkString(b"field21".to_vec()),
-                            Value::BulkString(b"value21".to_vec()),
-                            Value::BulkString(b"field22".to_vec()),
-                            Value::BulkString(b"value22".to_vec()),
+                            Value::BulkString(b"field21".to_vec().into()),
+                            Value::BulkString(b"value21".to_vec().into()),
+                            Value::BulkString(b"field22".to_vec().into()),
+                            Value::BulkString(b"value22".to_vec().into()),
                         ]),
                     ]),
                     Value::Array(vec![
-                        Value::BulkString(b"streamid-3".to_vec()),
+                        Value::BulkString(b"streamid-3".to_vec().into()),
                         Value::Array(vec![
-                            Value::BulkString(b"field3".to_vec()),
-                            Value::BulkString(b"value3".to_vec()),
+                            Value::BulkString(b"field3".to_vec().into()),
+                            Value::BulkString(b"value3".to_vec().into()),
                         ]),
                     ]),
                 ]),
@@ -2388,40 +2625,40 @@ mod tests {
         assert_eq!(converted_map.len(), 2);
 
         let (key, value) = &converted_map[0];
-        assert_eq!(Value::BulkString(b"key1".to_vec()), *key);
+        assert_eq!(Value::BulkString(b"key1".to_vec().into()), *key);
         assert_eq!(
             Value::Map(vec![(
-                Value::BulkString(b"streamid-1".to_vec()),
+                Value::BulkString(b"streamid-1".to_vec().into()),
                 Value::Array(vec![Value::Array(vec![
-                    Value::BulkString(b"field1".to_vec()),
-                    Value::BulkString(b"value1".to_vec()),
+                    Value::BulkString(b"field1".to_vec().into()),
+                    Value::BulkString(b"value1".to_vec().into()),
                 ]),]),
             ),]),
             *value,
         );
 
         let (key, value) = &converted_map[1];
-        assert_eq!(*key, Value::BulkString(b"key2".to_vec()));
+        assert_eq!(*key, Value::BulkString(b"key2".to_vec().into()));
         assert_eq!(
             Value::Map(vec![
                 (
-                    Value::BulkString(b"streamid-2".to_vec()),
+                    Value::BulkString(b"streamid-2".to_vec().into()),
                     Value::Array(vec![
                         Value::Array(vec![
-                            Value::BulkString(b"field21".to_vec()),
-                            Value::BulkString(b"value21".to_vec()),
+                            Value::BulkString(b"field21".to_vec().into()),
+                            Value::BulkString(b"value21".to_vec().into()),
                         ]),
                         Value::Array(vec![
-                            Value::BulkString(b"field22".to_vec()),
-                            Value::BulkString(b"value22".to_vec()),
+                            Value::BulkString(b"field22".to_vec().into()),
+                            Value::BulkString(b"value22".to_vec().into()),
                         ]),
                     ]),
                 ),
                 (
-                    Value::BulkString(b"streamid-3".to_vec()),
+                    Value::BulkString(b"streamid-3".to_vec().into()),
                     Value::Array(vec![Value::Array(vec![
-                        Value::BulkString(b"field3".to_vec()),
-                        Value::BulkString(b"value3".to_vec()),
+                        Value::BulkString(b"field3".to_vec().into()),
+                        Value::BulkString(b"value3".to_vec().into()),
                     ]),]),
                 ),
             ]),
@@ -2445,10 +2682,10 @@ mod tests {
             (
                 Value::BulkString("key1".into()),
                 Value::Array(vec![Value::Array(vec![
-                    Value::BulkString(b"streamid-1".to_vec()),
+                    Value::BulkString(b"streamid-1".to_vec().into()),
                     Value::Array(vec![
-                        Value::BulkString(b"field1".to_vec()),
-                        Value::BulkString(b"value1".to_vec()),
+                        Value::BulkString(b"field1".to_vec().into()),
+                        Value::BulkString(b"value1".to_vec().into()),
                     ]),
                 ])]),
             ),
@@ -2456,19 +2693,19 @@ mod tests {
                 Value::BulkString("key2".into()),
                 Value::Array(vec![
                     Value::Array(vec![
-                        Value::BulkString(b"streamid-2".to_vec()),
+                        Value::BulkString(b"streamid-2".to_vec().into()),
                         Value::Array(vec![
-                            Value::BulkString(b"field21".to_vec()),
-                            Value::BulkString(b"value21".to_vec()),
-                            Value::BulkString(b"field22".to_vec()),
-                            Value::BulkString(b"value22".to_vec()),
+                            Value::BulkString(b"field21".to_vec().into()),
+                            Value::BulkString(b"value21".to_vec().into()),
+                            Value::BulkString(b"field22".to_vec().into()),
+                            Value::BulkString(b"value22".to_vec().into()),
                         ]),
                     ]),
                     Value::Array(vec![
-                        Value::BulkString(b"streamid-3".to_vec()),
+                        Value::BulkString(b"streamid-3".to_vec().into()),
                         Value::Array(vec![
-                            Value::BulkString(b"field3".to_vec()),
-                            Value::BulkString(b"value3".to_vec()),
+                            Value::BulkString(b"field3".to_vec().into()),
+                            Value::BulkString(b"value3".to_vec().into()),
                         ]),
                     ]),
                 ]),
@@ -2500,40 +2737,40 @@ mod tests {
         assert_eq!(converted_map.len(), 2);
 
         let (key, value) = &converted_map[0];
-        assert_eq!(Value::BulkString(b"key1".to_vec()), *key);
+        assert_eq!(Value::BulkString(b"key1".to_vec().into()), *key);
         assert_eq!(
             Value::Map(vec![(
-                Value::BulkString(b"streamid-1".to_vec()),
+                Value::BulkString(b"streamid-1".to_vec().into()),
                 Value::Array(vec![Value::Array(vec![
-                    Value::BulkString(b"field1".to_vec()),
-                    Value::BulkString(b"value1".to_vec()),
+                    Value::BulkString(b"field1".to_vec().into()),
+                    Value::BulkString(b"value1".to_vec().into()),
                 ]),]),
             ),]),
             *value,
         );
 
         let (key, value) = &converted_map[1];
-        assert_eq!(*key, Value::BulkString(b"key2".to_vec()));
+        assert_eq!(*key, Value::BulkString(b"key2".to_vec().into()));
         assert_eq!(
             Value::Map(vec![
                 (
-                    Value::BulkString(b"streamid-2".to_vec()),
+                    Value::BulkString(b"streamid-2".to_vec().into()),
                     Value::Array(vec![
                         Value::Array(vec![
-                            Value::BulkString(b"field21".to_vec()),
-                            Value::BulkString(b"value21".to_vec()),
+                            Value::BulkString(b"field21".to_vec().into()),
+                            Value::BulkString(b"value21".to_vec().into()),
                         ]),
                         Value::Array(vec![
-                            Value::BulkString(b"field22".to_vec()),
-                            Value::BulkString(b"value22".to_vec()),
+                            Value::BulkString(b"field22".to_vec().into()),
+                            Value::BulkString(b"value22".to_vec().into()),
                         ]),
                     ]),
                 ),
                 (
-                    Value::BulkString(b"streamid-3".to_vec()),
+                    Value::BulkString(b"streamid-3".to_vec().into()),
                     Value::Array(vec![Value::Array(vec![
-                        Value::BulkString(b"field3".to_vec()),
-                        Value::BulkString(b"value3".to_vec()),
+                        Value::BulkString(b"field3".to_vec().into()),
+                        Value::BulkString(b"value3".to_vec().into()),
                     ]),]),
                 ),
             ]),
@@ -2544,32 +2781,34 @@ mod tests {
     #[test]
     fn convert_function_stats() {
         let resp2_response_non_empty_first_part_data = vec![
-            Value::BulkString(b"running_script".into()),
+            Value::BulkString(bytes::Bytes::from_static(b"running_script")),
             Value::Array(vec![
-                Value::BulkString(b"name".into()),
-                Value::BulkString(b"<function name>".into()),
-                Value::BulkString(b"command".into()),
+                Value::BulkString(bytes::Bytes::from_static(b"name")),
+                Value::BulkString(bytes::Bytes::from_static(b"<function name>")),
+                Value::BulkString(bytes::Bytes::from_static(b"command")),
                 Value::Array(vec![
-                    Value::BulkString(b"fcall".into()),
-                    Value::BulkString(b"<function name>".into()),
-                    Value::BulkString(b"... rest `fcall` args ...".into()),
+                    Value::BulkString(bytes::Bytes::from_static(b"fcall")),
+                    Value::BulkString(bytes::Bytes::from_static(b"<function name>")),
+                    Value::BulkString(bytes::Bytes::from_static(b"... rest `fcall` args ...")),
                 ]),
-                Value::BulkString(b"duration_ms".into()),
+                Value::BulkString(bytes::Bytes::from_static(b"duration_ms")),
                 Value::Int(24529),
             ]),
         ];
 
-        let resp2_response_empty_first_part_data =
-            vec![Value::BulkString(b"running_script".into()), Value::Nil];
+        let resp2_response_empty_first_part_data = vec![
+            Value::BulkString(bytes::Bytes::from_static(b"running_script")),
+            Value::Nil,
+        ];
 
         let resp2_response_second_part_data = vec![
-            Value::BulkString(b"engines".into()),
+            Value::BulkString(bytes::Bytes::from_static(b"engines")),
             Value::Array(vec![
-                Value::BulkString(b"LUA".into()),
+                Value::BulkString(bytes::Bytes::from_static(b"LUA")),
                 Value::Array(vec![
-                    Value::BulkString(b"libraries_count".into()),
+                    Value::BulkString(bytes::Bytes::from_static(b"libraries_count")),
                     Value::Int(3),
-                    Value::BulkString(b"functions_count".into()),
+                    Value::BulkString(bytes::Bytes::from_static(b"functions_count")),
                     Value::Int(5),
                 ]),
             ]),
@@ -2592,48 +2831,59 @@ mod tests {
 
         let resp2_cluster_response = Value::Map(vec![
             (
-                Value::BulkString(b"node1".into()),
+                Value::BulkString(bytes::Bytes::from_static(b"node1")),
                 resp2_response_with_non_empty_first_part.clone(),
             ),
             (
-                Value::BulkString(b"node2".into()),
+                Value::BulkString(bytes::Bytes::from_static(b"node2")),
                 resp2_response_with_empty_first_part.clone(),
             ),
             (
-                Value::BulkString(b"node3".into()),
+                Value::BulkString(bytes::Bytes::from_static(b"node3")),
                 resp2_response_with_empty_first_part.clone(),
             ),
         ]);
 
         let resp3_response_non_empty_first_part_data = vec![(
-            Value::BulkString(b"running_script".into()),
+            Value::BulkString(bytes::Bytes::from_static(b"running_script")),
             Value::Map(vec![
                 (
-                    Value::BulkString(b"name".into()),
-                    Value::BulkString(b"<function name>".into()),
+                    Value::BulkString(bytes::Bytes::from_static(b"name")),
+                    Value::BulkString(bytes::Bytes::from_static(b"<function name>")),
                 ),
                 (
-                    Value::BulkString(b"command".into()),
+                    Value::BulkString(bytes::Bytes::from_static(b"command")),
                     Value::Array(vec![
-                        Value::BulkString(b"fcall".into()),
-                        Value::BulkString(b"<function name>".into()),
-                        Value::BulkString(b"... rest `fcall` args ...".into()),
+                        Value::BulkString(bytes::Bytes::from_static(b"fcall")),
+                        Value::BulkString(bytes::Bytes::from_static(b"<function name>")),
+                        Value::BulkString(bytes::Bytes::from_static(b"... rest `fcall` args ...")),
                     ]),
                 ),
-                (Value::BulkString(b"duration_ms".into()), Value::Int(24529)),
+                (
+                    Value::BulkString(bytes::Bytes::from_static(b"duration_ms")),
+                    Value::Int(24529),
+                ),
             ]),
         )];
 
-        let resp3_response_empty_first_part_data =
-            vec![(Value::BulkString(b"running_script".into()), Value::Nil)];
+        let resp3_response_empty_first_part_data = vec![(
+            Value::BulkString(bytes::Bytes::from_static(b"running_script")),
+            Value::Nil,
+        )];
 
         let resp3_response_second_part_data = vec![(
-            Value::BulkString(b"engines".into()),
+            Value::BulkString(bytes::Bytes::from_static(b"engines")),
             Value::Map(vec![(
-                Value::BulkString(b"LUA".into()),
+                Value::BulkString(bytes::Bytes::from_static(b"LUA")),
                 Value::Map(vec![
-                    (Value::BulkString(b"libraries_count".into()), Value::Int(3)),
-                    (Value::BulkString(b"functions_count".into()), Value::Int(5)),
+                    (
+                        Value::BulkString(bytes::Bytes::from_static(b"libraries_count")),
+                        Value::Int(3),
+                    ),
+                    (
+                        Value::BulkString(bytes::Bytes::from_static(b"functions_count")),
+                        Value::Int(5),
+                    ),
                 ]),
             )]),
         )];
@@ -2656,15 +2906,15 @@ mod tests {
 
         let resp3_cluster_response = Value::Map(vec![
             (
-                Value::BulkString(b"node1".into()),
+                Value::BulkString(bytes::Bytes::from_static(b"node1")),
                 resp3_response_with_non_empty_first_part.clone(),
             ),
             (
-                Value::BulkString(b"node2".into()),
+                Value::BulkString(bytes::Bytes::from_static(b"node2")),
                 resp3_response_with_empty_first_part.clone(),
             ),
             (
-                Value::BulkString(b"node3".into()),
+                Value::BulkString(bytes::Bytes::from_static(b"node3")),
                 resp3_response_with_empty_first_part.clone(),
             ),
         ]);
@@ -2745,19 +2995,19 @@ mod tests {
         assert!(expected_type_for_cmd(redis::cmd("HRANDFIELD").arg("key")).is_none());
 
         let flat_array = Value::Array(vec![
-            Value::BulkString(b"key1".to_vec()),
-            Value::BulkString(b"value1".to_vec()),
-            Value::BulkString(b"key2".to_vec()),
-            Value::BulkString(b"value2".to_vec()),
+            Value::BulkString(b"key1".to_vec().into()),
+            Value::BulkString(b"value1".to_vec().into()),
+            Value::BulkString(b"key2".to_vec().into()),
+            Value::BulkString(b"value2".to_vec().into()),
         ]);
         let two_dimensional_array = Value::Array(vec![
             Value::Array(vec![
-                Value::BulkString(b"key1".to_vec()),
-                Value::BulkString(b"value1".to_vec()),
+                Value::BulkString(b"key1".to_vec().into()),
+                Value::BulkString(b"value1".to_vec().into()),
             ]),
             Value::Array(vec![
-                Value::BulkString(b"key2".to_vec()),
-                Value::BulkString(b"value2".to_vec()),
+                Value::BulkString(b"key2".to_vec().into()),
+                Value::BulkString(b"value2".to_vec().into()),
             ]),
         ]);
         let converted_flat_array =
@@ -2778,7 +3028,7 @@ mod tests {
         assert_eq!(empty_array, converted_empty_array);
 
         let flat_array_unexpected_length =
-            Value::Array(vec![Value::BulkString(b"somekey".to_vec())]);
+            Value::Array(vec![Value::BulkString(b"somekey".to_vec().into())]);
         assert!(
             convert_to_expected_type(
                 flat_array_unexpected_length,
@@ -2843,14 +3093,20 @@ mod tests {
         // and ArrayOfMemberScorePairs is mostly the same. Here we also test that the scores are converted to double
         // when the server response was a RESP2 flat array.
         let flat_array = Value::Array(vec![
-            Value::BulkString(b"one".to_vec()),
-            Value::BulkString(b"1.0".to_vec()),
-            Value::BulkString(b"two".to_vec()),
-            Value::BulkString(b"2.0".to_vec()),
+            Value::BulkString(b"one".to_vec().into()),
+            Value::BulkString(b"1.0".to_vec().into()),
+            Value::BulkString(b"two".to_vec().into()),
+            Value::BulkString(b"2.0".to_vec().into()),
         ]);
         let expected_response = Value::Array(vec![
-            Value::Array(vec![Value::BulkString(b"one".to_vec()), Value::Double(1.0)]),
-            Value::Array(vec![Value::BulkString(b"two".to_vec()), Value::Double(2.0)]),
+            Value::Array(vec![
+                Value::BulkString(b"one".to_vec().into()),
+                Value::Double(1.0),
+            ]),
+            Value::Array(vec![
+                Value::BulkString(b"two".to_vec().into()),
+                Value::Double(2.0),
+            ]),
         ]);
         let converted_flat_array = convert_to_expected_type(
             flat_array,
@@ -2869,12 +3125,12 @@ mod tests {
 
         // testing value conversion
         let flat_array = Value::Array(vec![
-            Value::BulkString(b"1".to_vec()),
-            Value::Array(vec![Value::BulkString(b"one".to_vec())]),
+            Value::BulkString(b"1".to_vec().into()),
+            Value::Array(vec![Value::BulkString(b"one".to_vec().into())]),
         ]);
         let expected_response = Value::Map(vec![(
             Value::BulkString("1".into()),
-            Value::Array(vec![Value::BulkString(b"one".to_vec())]),
+            Value::Array(vec![Value::BulkString(b"one".to_vec().into())]),
         )]);
         let converted_flat_array =
             convert_to_expected_type(flat_array, Some(ExpectedReturnType::ArrayOfStringAndArrays))
@@ -3060,8 +3316,8 @@ mod tests {
         ));
 
         let array_with_double_score = Value::Array(vec![
-            Value::BulkString(b"key1".to_vec()),
-            Value::BulkString(b"member1".to_vec()),
+            Value::BulkString(b"key1".to_vec().into()),
+            Value::BulkString(b"member1".to_vec().into()),
             Value::Double(2.0),
         ]);
         let result = convert_to_expected_type(
@@ -3072,9 +3328,9 @@ mod tests {
         assert_eq!(array_with_double_score, result);
 
         let array_with_string_score = Value::Array(vec![
-            Value::BulkString(b"key1".to_vec()),
-            Value::BulkString(b"member1".to_vec()),
-            Value::BulkString(b"2.0".to_vec()),
+            Value::BulkString(b"key1".to_vec().into()),
+            Value::BulkString(b"member1".to_vec().into()),
+            Value::BulkString(b"2.0".to_vec().into()),
         ]);
         let result = convert_to_expected_type(
             array_with_string_score.clone(),
@@ -3089,8 +3345,8 @@ mod tests {
         assert_eq!(Value::Nil, converted_nil_value);
 
         let array_with_unexpected_length = Value::Array(vec![
-            Value::BulkString(b"key1".to_vec()),
-            Value::BulkString(b"member1".to_vec()),
+            Value::BulkString(b"key1".to_vec().into()),
+            Value::BulkString(b"member1".to_vec().into()),
             Value::Double(2.0),
             Value::Double(2.0),
         ]);
@@ -3140,7 +3396,7 @@ mod tests {
         let array_response = Value::Array(vec![
             Value::Nil,
             Value::Double(1.5),
-            Value::BulkString(b"2.5".to_vec()),
+            Value::BulkString(b"2.5".to_vec().into()),
         ]);
         let converted_response = convert_to_expected_type(
             array_response,
@@ -3185,14 +3441,17 @@ mod tests {
         );
         let unconverted_map = vec![
             (
-                Value::BulkString(b"key1".to_vec()),
-                Value::BulkString(b"10.5".to_vec()),
+                Value::BulkString(b"key1".to_vec().into()),
+                Value::BulkString(b"10.5".to_vec().into()),
             ),
             (
-                Value::BulkString(b"key2".to_vec()),
-                Value::BulkString(b"20.8".to_vec()),
+                Value::BulkString(b"key2".to_vec().into()),
+                Value::BulkString(b"20.8".to_vec().into()),
             ),
-            (Value::Double(20.5), Value::BulkString(b"30.2".to_vec())),
+            (
+                Value::Double(20.5),
+                Value::BulkString(b"30.2".to_vec().into()),
+            ),
         ];
 
         let converted_map = convert_to_expected_type(
@@ -3210,24 +3469,24 @@ mod tests {
         assert_eq!(converted_map.len(), 3);
 
         let (key, value) = &converted_map[0];
-        assert_eq!(*key, Value::BulkString(b"key1".to_vec()));
+        assert_eq!(*key, Value::BulkString(b"key1".to_vec().into()));
         assert_eq!(*value, Value::Double(10.5));
 
         let (key, value) = &converted_map[1];
-        assert_eq!(*key, Value::BulkString(b"key2".to_vec()));
+        assert_eq!(*key, Value::BulkString(b"key2".to_vec().into()));
         assert_eq!(*value, Value::Double(20.8));
 
         let (key, value) = &converted_map[2];
-        assert_eq!(*key, Value::BulkString(b"20.5".to_vec()));
+        assert_eq!(*key, Value::BulkString(b"20.5".to_vec().into()));
         assert_eq!(*value, Value::Double(30.2));
 
         let array_of_arrays = vec![
             Value::Array(vec![
-                Value::BulkString(b"key1".to_vec()),
-                Value::BulkString(b"10.5".to_vec()),
+                Value::BulkString(b"key1".to_vec().into()),
+                Value::BulkString(b"10.5".to_vec().into()),
             ]),
             Value::Array(vec![
-                Value::BulkString(b"key2".to_vec()),
+                Value::BulkString(b"key2".to_vec().into()),
                 Value::Double(20.5),
             ]),
         ];
@@ -3247,17 +3506,17 @@ mod tests {
         assert_eq!(converted_map.len(), 2);
 
         let (key, value) = &converted_map[0];
-        assert_eq!(*key, Value::BulkString(b"key1".to_vec()));
+        assert_eq!(*key, Value::BulkString(b"key1".to_vec().into()));
         assert_eq!(*value, Value::Double(10.5));
 
         let (key, value) = &converted_map[1];
-        assert_eq!(*key, Value::BulkString(b"key2".to_vec()));
+        assert_eq!(*key, Value::BulkString(b"key2".to_vec().into()));
         assert_eq!(*value, Value::Double(20.5));
 
         let array_of_arrays_err: Vec<Value> = vec![Value::Array(vec![
-            Value::BulkString(b"key".to_vec()),
-            Value::BulkString(b"value".to_vec()),
-            Value::BulkString(b"10.5".to_vec()),
+            Value::BulkString(b"key".to_vec().into()),
+            Value::BulkString(b"value".to_vec().into()),
+            Value::BulkString(b"10.5".to_vec().into()),
         ])];
 
         assert!(
@@ -3277,8 +3536,8 @@ mod tests {
         );
 
         let array = vec![
-            Value::BulkString(b"key".to_vec()),
-            Value::BulkString(b"20.5".to_vec()),
+            Value::BulkString(b"key".to_vec().into()),
+            Value::BulkString(b"20.5".to_vec().into()),
         ];
 
         let array_result = convert_to_expected_type(
@@ -3294,10 +3553,10 @@ mod tests {
         };
         assert_eq!(array_result.len(), 2);
 
-        assert_eq!(array_result[0], Value::BulkString(b"key".to_vec()));
+        assert_eq!(array_result[0], Value::BulkString(b"key".to_vec().into()));
         assert_eq!(array_result[1], Value::Double(20.5));
 
-        let array_err = vec![Value::BulkString(b"key".to_vec())];
+        let array_err = vec![Value::BulkString(b"key".to_vec().into())];
         assert!(
             convert_to_expected_type(
                 Value::Array(array_err),
@@ -3343,6 +3602,39 @@ mod tests {
     }
 
     #[test]
+    fn test_convert_to_expected_type_passes_through_queued_reply() {
+        // While a connection is mid-MULTI, the server replies with the "QUEUED"
+        // status for any command, regardless of that command's real reply type.
+        // convert_to_expected_type must return it as-is, not attempt coercion.
+        let queued = Value::SimpleString("QUEUED".to_string());
+
+        assert_eq!(
+            convert_to_expected_type(queued.clone(), Some(ExpectedReturnType::Boolean)).unwrap(),
+            queued
+        );
+        assert_eq!(
+            convert_to_expected_type(queued.clone(), Some(ExpectedReturnType::Double)).unwrap(),
+            queued
+        );
+        assert_eq!(
+            convert_to_expected_type(queued.clone(), Some(ExpectedReturnType::Set)).unwrap(),
+            queued
+        );
+        assert_eq!(
+            convert_to_expected_type(queued.clone(), None).unwrap(),
+            queued
+        );
+
+        // A real "QUEUED"-looking value should still coerce normally once it's
+        // not standing in for a queued reply - i.e. any other command's actual
+        // Boolean-coercible reply is unaffected by this guard.
+        assert_eq!(
+            convert_to_expected_type(Value::Int(1), Some(ExpectedReturnType::Boolean)).unwrap(),
+            Value::Boolean(true)
+        );
+    }
+
+    #[test]
     fn test_convert_spop_to_set_for_spop_count() {
         assert!(matches!(
             expected_type_for_cmd(redis::cmd("SPOP").arg("key1").arg("3")),
@@ -3354,21 +3646,21 @@ mod tests {
     fn test_convert_to_geo_search_return_type() {
         let array = Value::Array(vec![
             Value::Array(vec![
-                Value::BulkString(b"name1".to_vec()),
-                Value::BulkString(b"1.23".to_vec()), // dist (float)
-                Value::Int(123456),                  // hash (int)
+                Value::BulkString(b"name1".to_vec().into()),
+                Value::BulkString(b"1.23".to_vec().into()), // dist (float)
+                Value::Int(123456),                         // hash (int)
                 Value::Array(vec![
-                    Value::BulkString(b"10.0".to_vec()), // lon (float)
-                    Value::BulkString(b"20.0".to_vec()), // lat (float)
+                    Value::BulkString(b"10.0".to_vec().into()), // lon (float)
+                    Value::BulkString(b"20.0".to_vec().into()), // lat (float)
                 ]),
             ]),
             Value::Array(vec![
-                Value::BulkString(b"name2".to_vec()),
-                Value::BulkString(b"2.34".to_vec()), // dist (float)
-                Value::Int(654321),                  // hash (int)
+                Value::BulkString(b"name2".to_vec().into()),
+                Value::BulkString(b"2.34".to_vec().into()), // dist (float)
+                Value::Int(654321),                         // hash (int)
                 Value::Array(vec![
-                    Value::BulkString(b"30.0".to_vec()), // lon (float)
-                    Value::BulkString(b"40.0".to_vec()), // lat (float)
+                    Value::BulkString(b"30.0".to_vec().into()), // lon (float)
+                    Value::BulkString(b"40.0".to_vec().into()), // lat (float)
                 ]),
             ]),
         ]);
@@ -3376,7 +3668,7 @@ mod tests {
         // Expected output value after conversion
         let expected_result = Value::Array(vec![
             Value::Array(vec![
-                Value::BulkString(b"name1".to_vec()),
+                Value::BulkString(b"name1".to_vec().into()),
                 Value::Array(vec![
                     Value::Double(1.23), // dist (float)
                     Value::Int(123456),  // hash (int)
@@ -3387,7 +3679,7 @@ mod tests {
                 ]),
             ]),
             Value::Array(vec![
-                Value::BulkString(b"name2".to_vec()),
+                Value::BulkString(b"name2".to_vec().into()),
                 Value::Array(vec![
                     Value::Double(2.34), // dist (float)
                     Value::Int(654321),  // hash (int)
@@ -3437,5 +3729,288 @@ mod tests {
                 value_type: &None,
             })
         ));
+    }
+
+    #[test]
+    fn convert_ft_search_withsortkeys() {
+        // expected_type_for_cmd: FT.SEARCH without WITHSORTKEYS → FTSearchReturnType
+        assert!(matches!(
+            expected_type_for_cmd(
+                redis::cmd("FT.SEARCH")
+                    .arg("idx")
+                    .arg("*")
+                    .arg("SORTBY")
+                    .arg("price")
+                    .arg("ASC")
+            ),
+            Some(ExpectedReturnType::FTSearchReturnType)
+        ));
+
+        // expected_type_for_cmd: FT.SEARCH with WITHSORTKEYS → FTSearchWithSortKeysReturnType
+        assert!(matches!(
+            expected_type_for_cmd(
+                redis::cmd("FT.SEARCH")
+                    .arg("idx")
+                    .arg("*")
+                    .arg("SORTBY")
+                    .arg("price")
+                    .arg("ASC")
+                    .arg("WITHSORTKEYS")
+            ),
+            Some(ExpectedReturnType::FTSearchWithSortKeysReturnType)
+        ));
+
+        // expected_type_for_cmd: FT.PROFILE SEARCH with WITHSORTKEYS
+        assert!(matches!(
+            expected_type_for_cmd(
+                redis::cmd("FT.PROFILE")
+                    .arg("idx")
+                    .arg("SEARCH")
+                    .arg("QUERY")
+                    .arg("*")
+                    .arg("SORTBY")
+                    .arg("price")
+                    .arg("WITHSORTKEYS")
+            ),
+            Some(ExpectedReturnType::FTProfileReturnType(&Some(
+                ExpectedReturnType::FTSearchWithSortKeysReturnType
+            )))
+        ));
+
+        // Normal WITHSORTKEYS response: triplets of (key, sortkey, fields_array)
+        //   1) (integer) 2
+        //   2) "key1"
+        //   3) "sortval1"
+        //   4) ["field1", "value1"]
+        //   5) "key2"
+        //   6) "sortval2"
+        //   7) ["field2", "value2"]
+        let response = Value::Array(vec![
+            Value::Int(2),
+            Value::BulkString(b"key1".to_vec().into()),
+            Value::BulkString(b"sortval1".to_vec().into()),
+            Value::Array(vec![
+                Value::BulkString(b"field1".to_vec().into()),
+                Value::BulkString(b"value1".to_vec().into()),
+            ]),
+            Value::BulkString(b"key2".to_vec().into()),
+            Value::BulkString(b"sortval2".to_vec().into()),
+            Value::Array(vec![
+                Value::BulkString(b"field2".to_vec().into()),
+                Value::BulkString(b"value2".to_vec().into()),
+            ]),
+        ]);
+
+        let converted = convert_to_expected_type(
+            response,
+            Some(ExpectedReturnType::FTSearchWithSortKeysReturnType),
+        )
+        .unwrap();
+
+        assert_eq!(
+            converted,
+            Value::Array(vec![
+                Value::Int(2),
+                Value::Map(vec![
+                    (
+                        Value::BulkString(b"key1".to_vec().into()),
+                        Value::Array(vec![
+                            Value::BulkString(b"sortval1".to_vec().into()),
+                            Value::Map(vec![(
+                                Value::BulkString(b"field1".to_vec().into()),
+                                Value::BulkString(b"value1".to_vec().into()),
+                            )]),
+                        ]),
+                    ),
+                    (
+                        Value::BulkString(b"key2".to_vec().into()),
+                        Value::Array(vec![
+                            Value::BulkString(b"sortval2".to_vec().into()),
+                            Value::Map(vec![(
+                                Value::BulkString(b"field2".to_vec().into()),
+                                Value::BulkString(b"value2".to_vec().into()),
+                            )]),
+                        ]),
+                    ),
+                ]),
+            ])
+        );
+
+        // NOCONTENT + WITHSORTKEYS response: pairs of (key, sortkey)
+        //   1) (integer) 2
+        //   2) "key1"
+        //   3) "sortval1"
+        //   4) "key2"
+        //   5) (nil)
+        let nocontent_response = Value::Array(vec![
+            Value::Int(2),
+            Value::BulkString(b"key1".to_vec().into()),
+            Value::BulkString(b"sortval1".to_vec().into()),
+            Value::BulkString(b"key2".to_vec().into()),
+            Value::Nil,
+        ]);
+
+        let converted_nocontent = convert_to_expected_type(
+            nocontent_response,
+            Some(ExpectedReturnType::FTSearchWithSortKeysReturnType),
+        )
+        .unwrap();
+
+        assert_eq!(
+            converted_nocontent,
+            Value::Array(vec![
+                Value::Int(2),
+                Value::Map(vec![
+                    (
+                        Value::BulkString(b"key1".to_vec().into()),
+                        Value::Array(vec![
+                            Value::BulkString(b"sortval1".to_vec().into()),
+                            Value::Map(vec![]),
+                        ]),
+                    ),
+                    (
+                        Value::BulkString(b"key2".to_vec().into()),
+                        Value::Array(vec![Value::Nil, Value::Map(vec![])]),
+                    ),
+                ]),
+            ])
+        );
+
+        // Empty result set: just count
+        let empty_response = Value::Array(vec![Value::Int(0)]);
+
+        let converted_empty = convert_to_expected_type(
+            empty_response,
+            Some(ExpectedReturnType::FTSearchWithSortKeysReturnType),
+        )
+        .unwrap();
+
+        assert_eq!(converted_empty, Value::Array(vec![Value::Int(0)]));
+
+        // COUNT-only response: single element array
+        let count_response = Value::Array(vec![Value::Int(5)]);
+
+        let converted_count = convert_to_expected_type(
+            count_response,
+            Some(ExpectedReturnType::FTSearchWithSortKeysReturnType),
+        )
+        .unwrap();
+
+        assert_eq!(converted_count, Value::Array(vec![Value::Int(5)]));
+    }
+
+    // CLIENT TRACKING INFO tests
+    // --------------------------
+
+    /// CLIENT TRACKINGINFO response in RESP2 format (flat array, flags as Array).
+    fn tracking_info_resp2() -> Value {
+        Value::Array(vec![
+            Value::BulkString(b"flags".to_vec().into()),
+            Value::Array(vec![Value::BulkString(b"off".to_vec().into())]),
+            Value::BulkString(b"redirect".to_vec().into()),
+            Value::Int(-1),
+            Value::BulkString(b"prefixes".to_vec().into()),
+            Value::Array(vec![]),
+        ])
+    }
+
+    /// CLIENT TRACKINGINFO response in RESP3 format (native map, flags as Set).
+    fn tracking_info_resp3() -> Value {
+        Value::Map(vec![
+            (
+                Value::BulkString(b"flags".to_vec().into()),
+                Value::Set(vec![Value::BulkString(b"off".to_vec().into())]),
+            ),
+            (
+                Value::BulkString(b"redirect".to_vec().into()),
+                Value::Int(-1),
+            ),
+            (
+                Value::BulkString(b"prefixes".to_vec().into()),
+                Value::Array(vec![]),
+            ),
+        ])
+    }
+
+    #[test]
+    fn test_client_tracking_info_resp2() {
+        let result = convert_to_expected_type(
+            tracking_info_resp2(),
+            Some(ExpectedReturnType::ClientTrackingInfoReturnType),
+        )
+        .unwrap();
+        assert_eq!(result, tracking_info_resp3());
+    }
+
+    #[test]
+    fn test_client_tracking_info_resp3() {
+        let result = convert_to_expected_type(
+            tracking_info_resp3(),
+            Some(ExpectedReturnType::ClientTrackingInfoReturnType),
+        )
+        .unwrap();
+        assert_eq!(result, tracking_info_resp3());
+    }
+
+    #[test]
+    fn test_client_tracking_info_multi_node_resp2() {
+        let cmd = redis::cmd("CLIENT TRACKINGINFO");
+        let conversion_type = expected_type_for_cmd(&cmd);
+
+        let multi_node_input = Value::Map(vec![
+            (
+                Value::BulkString(b"node1:6379".to_vec().into()),
+                tracking_info_resp2(),
+            ),
+            (
+                Value::BulkString(b"node2:6370".to_vec().into()),
+                tracking_info_resp2(),
+            ),
+        ]);
+
+        let expected = Value::Map(vec![
+            (
+                Value::BulkString(b"node1:6379".to_vec().into()),
+                tracking_info_resp3(),
+            ),
+            (
+                Value::BulkString(b"node2:6370".to_vec().into()),
+                tracking_info_resp3(),
+            ),
+        ]);
+
+        let result = convert_to_expected_type(multi_node_input, conversion_type).unwrap();
+        assert_eq!(result, expected);
+    }
+
+    #[test]
+    fn test_client_tracking_info_multi_node_resp3() {
+        let cmd = redis::cmd("CLIENT TRACKINGINFO");
+        let conversion_type = expected_type_for_cmd(&cmd);
+
+        let multi_node_input = Value::Map(vec![
+            (
+                Value::BulkString(b"node1:6379".to_vec().into()),
+                tracking_info_resp3(),
+            ),
+            (
+                Value::BulkString(b"node2:6370".to_vec().into()),
+                tracking_info_resp3(),
+            ),
+        ]);
+
+        let expected = Value::Map(vec![
+            (
+                Value::BulkString(b"node1:6379".to_vec().into()),
+                tracking_info_resp3(),
+            ),
+            (
+                Value::BulkString(b"node2:6370".to_vec().into()),
+                tracking_info_resp3(),
+            ),
+        ]);
+
+        let result = convert_to_expected_type(multi_node_input, conversion_type).unwrap();
+        assert_eq!(result, expected);
     }
 }

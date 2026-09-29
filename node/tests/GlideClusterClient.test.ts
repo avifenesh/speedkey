@@ -10,11 +10,16 @@ import {
     expect,
     it,
 } from "@jest/globals";
+import { setTimeout as sleep } from "node:timers/promises";
 import { gte } from "semver";
 import { ValkeyCluster } from "../../utils/TestUtils";
 import {
     BitwiseOperation,
+    ClientPauseMode,
+    ClientSideCache,
+    ClientTrackingInfo,
     ClusterBatch,
+    ConfigurationError,
     Decoder,
     FlushMode,
     FunctionListResponse,
@@ -27,6 +32,7 @@ import {
     GlideString,
     InfoOptions,
     ListDirection,
+    MemoryStats,
     ProtocolVersion,
     RequestError,
     Routes,
@@ -39,28 +45,37 @@ import {
 } from "../build-ts";
 import { runBaseTests } from "./SharedTests";
 import {
+    assertClientTrackingInfo,
+    assertConnected,
+    assertMemoryStatsDbEntry,
+    assertMemoryStatsFields,
     batchTest,
     checkClusterResponse,
     checkFunctionListResponse,
     checkFunctionStatsResponse,
     createLongRunningLuaScript,
     createLuaLibWithLongRunningFunction,
-    flushAndCloseClient,
+    flushClient,
     generateLuaLibCode,
+    flattenClusterResponseArrays,
     getClientConfigurationOption,
     getClientCount,
     getFirstResult,
     getRandomKey,
+    getUnixSeconds,
     getServerVersion,
     intoArray,
     intoString,
     parseEndpoints,
+    PRIMARY_SLOT_ROUTE_OPTION,
+    triggerLatencySpike,
     validateBatchResponse,
     waitForNotBusy,
+    socketDrainDelay,
 } from "./TestUtilities";
 
 const TIMEOUT = 50000;
-const CLEANUP_TIMEOUT = 10000; // 10 seconds for cleanup operations
+const CLEANUP_TIMEOUT = 60000; // afterAll timeout: cluster teardown on EC2 runners can take >10s
 
 describe("GlideClusterClient", () => {
     let testsFailed = 0;
@@ -68,6 +83,9 @@ describe("GlideClusterClient", () => {
     let azCluster: ValkeyCluster;
     let client: GlideClusterClient;
     let azClient: GlideClusterClient;
+    let lastProtocol: ProtocolVersion | undefined;
+    let pooledClient: GlideClusterClient | undefined;
+    let pooledAzClient: GlideClusterClient | undefined;
     beforeAll(async () => {
         const clusterAddresses = global.CLUSTER_ENDPOINTS;
 
@@ -109,22 +127,32 @@ describe("GlideClusterClient", () => {
     }, 120000);
 
     afterEach(async () => {
-        await flushAndCloseClient(true, cluster?.getAddresses(), client);
-        // Add small delay between cluster cleanups to prevent socket exhaustion
-        await new Promise((resolve) => setTimeout(resolve, 5));
-        await flushAndCloseClient(true, azCluster?.getAddresses(), azClient);
+        await flushClient(client);
+        await flushClient(azClient);
+
+        // Close clients that were created by standalone tests (not pooled).
+        if (client && client !== pooledClient) {
+            client.close();
+            client = undefined!;
+        }
+
+        if (azClient && azClient !== pooledAzClient) {
+            azClient.close();
+            azClient = undefined!;
+        }
     });
 
     afterAll(async () => {
+        client?.close();
+        azClient?.close();
+
         if (testsFailed === 0) {
             if (cluster) await cluster.close();
-            // Add small delay between cluster closures to prevent socket contention
-            await new Promise((resolve) => setTimeout(resolve, 50));
+            await socketDrainDelay();
             if (azCluster) await azCluster.close();
         } else {
             if (cluster) await cluster.close(true);
-            // Add small delay between cluster closures to prevent socket contention
-            await new Promise((resolve) => setTimeout(resolve, 50));
+            await socketDrainDelay();
             if (azCluster) await azCluster.close(true);
         }
     }, CLEANUP_TIMEOUT);
@@ -136,15 +164,41 @@ describe("GlideClusterClient", () => {
                 protocol,
                 configOverrides,
             );
-            client = await GlideClusterClient.createClient(configCurrent);
+
+            // Recreate client if config changed or client is dead
+            if (configOverrides || !client || protocol !== lastProtocol) {
+                client?.close();
+                client = await GlideClusterClient.createClient(configCurrent);
+            } else {
+                try {
+                    await client.ping();
+                } catch {
+                    client =
+                        await GlideClusterClient.createClient(configCurrent);
+                }
+            }
 
             const configNew = getClientConfigurationOption(
                 azCluster.getAddresses(),
                 protocol,
                 configOverrides,
             );
-            azClient = await GlideClusterClient.createClient(configNew);
 
+            // Recreate azClient if config changed or client is dead
+            if (configOverrides || !azClient || protocol !== lastProtocol) {
+                azClient?.close();
+                azClient = await GlideClusterClient.createClient(configNew);
+            } else {
+                try {
+                    await azClient.ping();
+                } catch {
+                    azClient = await GlideClusterClient.createClient(configNew);
+                }
+            }
+
+            lastProtocol = protocol;
+            pooledClient = client;
+            pooledAzClient = azClient;
             testsFailed += 1;
             return {
                 client,
@@ -160,6 +214,227 @@ describe("GlideClusterClient", () => {
         },
         timeout: TIMEOUT,
     });
+
+    it(
+        "register_custom_client_info_names",
+        async () => {
+            if (cluster.checkIfServerVersionLessThan("7.2.0")) return;
+
+            // Test default library name
+            const defaultClient = await GlideClusterClient.createClient(
+                getClientConfigurationOption(
+                    cluster.getAddresses(),
+                    ProtocolVersion.RESP3,
+                ),
+            );
+
+            try {
+                const info = (await defaultClient.customCommand(
+                    ["CLIENT", "INFO"],
+                    { route: "allNodes" },
+                )) as GlideRecord<string>;
+
+                for (const entry of info) {
+                    expect(entry.value).toContain("lib-name=GlideJS");
+                }
+            } finally {
+                defaultClient.close();
+            }
+
+            // Test libName override only
+            const overrideOnlyClient = await GlideClusterClient.createClient(
+                getClientConfigurationOption(
+                    cluster.getAddresses(),
+                    ProtocolVersion.RESP3,
+                    { libName: "custom-client" },
+                ),
+            );
+
+            try {
+                const info = (await overrideOnlyClient.customCommand(
+                    ["CLIENT", "INFO"],
+                    { route: "allNodes" },
+                )) as GlideRecord<string>;
+
+                for (const entry of info) {
+                    expect(entry.value).toContain("lib-name=custom-client");
+                }
+            } finally {
+                overrideOnlyClient.close();
+            }
+
+            // Test clientInfoTag only (appended to default GlideJS)
+            const tagOnlyClient = await GlideClusterClient.createClient(
+                getClientConfigurationOption(
+                    cluster.getAddresses(),
+                    ProtocolVersion.RESP3,
+                    { clientInfoTag: "framework:1.2" },
+                ),
+            );
+
+            try {
+                const info = (await tagOnlyClient.customCommand(
+                    ["CLIENT", "INFO"],
+                    { route: "allNodes" },
+                )) as GlideRecord<string>;
+
+                for (const entry of info) {
+                    expect(entry.value).toContain(
+                        "lib-name=GlideJS(framework:1.2)",
+                    );
+                }
+            } finally {
+                tagOnlyClient.close();
+            }
+
+            // Test combined libName + clientInfoTag
+            const combinedClient = await GlideClusterClient.createClient(
+                getClientConfigurationOption(
+                    cluster.getAddresses(),
+                    ProtocolVersion.RESP3,
+                    {
+                        libName: "custom-client",
+                        clientInfoTag: "framework:1.2",
+                    },
+                ),
+            );
+
+            try {
+                const info = (await combinedClient.customCommand(
+                    ["CLIENT", "INFO"],
+                    { route: "allNodes" },
+                )) as GlideRecord<string>;
+
+                for (const entry of info) {
+                    expect(entry.value).toContain(
+                        "lib-name=custom-client(framework:1.2)",
+                    );
+                }
+            } finally {
+                combinedClient.close();
+            }
+        },
+        TIMEOUT,
+    );
+
+    it("clientInfoTag_rejects_whitespace", async () => {
+        await expect(
+            GlideClusterClient.createClient(
+                getClientConfigurationOption(
+                    cluster.getAddresses(),
+                    ProtocolVersion.RESP3,
+                    { clientInfoTag: "has space" },
+                ),
+            ),
+        ).rejects.toThrow(ConfigurationError);
+
+        await expect(
+            GlideClusterClient.createClient(
+                getClientConfigurationOption(
+                    cluster.getAddresses(),
+                    ProtocolVersion.RESP3,
+                    { clientInfoTag: "has\ttab" },
+                ),
+            ),
+        ).rejects.toThrow(ConfigurationError);
+
+        await expect(
+            GlideClusterClient.createClient(
+                getClientConfigurationOption(
+                    cluster.getAddresses(),
+                    ProtocolVersion.RESP3,
+                    { clientInfoTag: "has\nnewline" },
+                ),
+            ),
+        ).rejects.toThrow(ConfigurationError);
+    });
+
+    it.each([ProtocolVersion.RESP2, ProtocolVersion.RESP3])(
+        "clientPauseAll then clientUnpause_%p",
+        async (protocol) => {
+            client = await GlideClusterClient.createClient(
+                getClientConfigurationOption(cluster.getAddresses(), protocol, {
+                    requestTimeout: 10000,
+                }),
+            );
+            const key = "clientPauseAll_then_clientUnpause_key";
+            expect(await client.set(key, "before")).toEqual("OK");
+
+            expect(
+                await client.clientPause(2000, ClientPauseMode.ALL, {
+                    route: "allPrimaries",
+                }),
+            ).toEqual("OK");
+
+            let setDone = false;
+            const set = client.set(key, "after").then((r) => {
+                setDone = true;
+                return r;
+            });
+            let unpauseDone = false;
+            const unpause = client
+                .clientUnpause({ route: "allPrimaries" })
+                .then((r) => {
+                    unpauseDone = true;
+                    return r;
+                });
+
+            await sleep(300);
+
+            // Verify that none of the commands completes during the pause window.
+            expect(setDone).toBe(false);
+            expect(unpauseDone).toBe(false);
+
+            // Verify that all commands complete once pause expires naturally.
+            expect(await set).toEqual("OK");
+            expect(await unpause).toEqual("OK");
+            expect(await client.get(key)).toEqual("after");
+        },
+        TIMEOUT,
+    );
+
+    it.each([ProtocolVersion.RESP2, ProtocolVersion.RESP3])(
+        "clientPauseWrite then clientUnpause_%p",
+        async (protocol) => {
+            client = await GlideClusterClient.createClient(
+                getClientConfigurationOption(cluster.getAddresses(), protocol, {
+                    requestTimeout: 10000,
+                }),
+            );
+            const key = "clientPauseWrite_then_clientUnpause_key";
+            expect(await client.set(key, "before")).toEqual("OK");
+
+            expect(
+                await client.clientPause(2000, ClientPauseMode.WRITE, {
+                    route: "allPrimaries",
+                }),
+            ).toEqual("OK");
+
+            // Reads are not blocked by PAUSE WRITE.
+            expect(await client.get(key)).toEqual("before");
+
+            let setDone = false;
+            const set = client.set(key, "after").then((r) => {
+                setDone = true;
+                return r;
+            });
+
+            await sleep(300);
+
+            // Verify that SET has not completed because server is paused.
+            expect(setDone).toBe(false);
+
+            expect(
+                await client.clientUnpause({ route: "allPrimaries" }),
+            ).toEqual("OK");
+
+            // Verify that SET completes once pause expires, and the new value
+            // is visible.
+            expect(await set).toEqual("OK");
+            expect(await client.get(key)).toEqual("after");
+        },
+        TIMEOUT,
+    );
 
     it.each([ProtocolVersion.RESP2, ProtocolVersion.RESP3])(
         `info with server and replication_%p`,
@@ -911,6 +1186,27 @@ describe("GlideClusterClient", () => {
 
             client.close();
         },
+    );
+
+    it.each([ProtocolVersion.RESP2, ProtocolVersion.RESP3])(
+        "migrate test_%p",
+        async (protocol) => {
+            client = await GlideClusterClient.createClient(
+                getClientConfigurationOption(cluster.getAddresses(), protocol),
+            );
+            const key = getRandomKey();
+            // Non-existent key returns NOKEY
+            const result = await client.migrate(
+                "localhost",
+                cluster.getAddresses()[0][1],
+                key,
+                0,
+                5000,
+            );
+            expect(result).toEqual("NOKEY");
+            client.close();
+        },
+        TIMEOUT,
     );
 
     it.each([ProtocolVersion.RESP2, ProtocolVersion.RESP3])(
@@ -2375,7 +2671,7 @@ describe("GlideClusterClient", () => {
                 // Run all tasks: fail short timeout, succeed with large timeout, and run the debug command
                 await Promise.all([
                     debugCommandPromise, // Run the long-running command
-                    connectWithLargeTimeout(), // Attempt to create the client with a short timeout
+                    connectWithLargeTimeout(), // Verify a long timeout (10s) allows successful connection
                 ]);
             } finally {
                 // Clean up the test client and ensure everything is flushed and closed
@@ -2511,7 +2807,11 @@ describe("GlideClusterClient", () => {
                 expect(stats).toHaveProperty("total_bytes_compressed");
                 expect(stats).toHaveProperty("total_bytes_decompressed");
                 expect(stats).toHaveProperty("compression_skipped_count");
-                expect(Object.keys(stats)).toHaveLength(8);
+                expect(stats).toHaveProperty("subscription_out_of_sync_count");
+                expect(stats).toHaveProperty(
+                    "subscription_last_sync_timestamp",
+                );
+                expect(Object.keys(stats)).toHaveLength(10);
             } finally {
                 // Ensure the client is properly closed
                 glideClientForTesting?.close();
@@ -2970,6 +3270,312 @@ describe("GlideClusterClient", () => {
                 }
             },
         );
+
+        it.each([ProtocolVersion.RESP2, ProtocolVersion.RESP3])(
+            "should route GET commands to all nodes (primary and replicas) with allNodes strategy using protocol %p",
+            async (protocol) => {
+                if (cluster.checkIfServerVersionLessThan("8.0.0")) return;
+
+                let client;
+
+                try {
+                    client = await GlideClusterClient.createClient(
+                        getClientConfigurationOption(
+                            cluster.getAddresses(),
+                            protocol,
+                            { readFrom: "allNodes" },
+                        ),
+                    );
+
+                    await client.configResetStat({ route: "allNodes" });
+
+                    const get_calls = 200;
+
+                    for (let i = 0; i < get_calls; i++) {
+                        await client.get("foo");
+                    }
+
+                    const info_result = (await client.info({
+                        sections: [InfoOptions.All],
+                        route: "allNodes",
+                    })) as Record<string, string>;
+
+                    const nodes_with_gets = Object.values(info_result).filter(
+                        (info) => info.includes("cmdstat_get:calls="),
+                    ).length;
+
+                    expect(nodes_with_gets).toBeGreaterThan(1);
+
+                    const primary_received_gets = Object.values(
+                        info_result,
+                    ).some(
+                        (info) =>
+                            (info.includes("role:master") ||
+                                info.includes("role:primary")) &&
+                            info.includes("cmdstat_get:calls="),
+                    );
+
+                    expect(primary_received_gets).toBe(true);
+
+                    const replica_received_gets = Object.values(
+                        info_result,
+                    ).some(
+                        (info) =>
+                            info.includes("role:slave") &&
+                            info.includes("cmdstat_get:calls="),
+                    );
+
+                    expect(replica_received_gets).toBe(true);
+
+                    // Verify total GET calls
+                    const total_get_calls = Object.values(info_result)
+                        .filter((info) => info.includes("cmdstat_get:calls="))
+                        .reduce((sum, info) => {
+                            const match = info.match(/cmdstat_get:calls=(\d+)/);
+                            return sum + (match ? parseInt(match[1]) : 0);
+                        }, 0);
+
+                    expect(total_get_calls).toBe(get_calls);
+                } finally {
+                    client?.close();
+                }
+            },
+        );
+    });
+
+    describe("AZAffinityAllNodes Read Strategy Tests", () => {
+        it.each([ProtocolVersion.RESP2, ProtocolVersion.RESP3])(
+            "should split GET commands evenly between primary and replica in the same AZ using protocol %p",
+            async (protocol) => {
+                // Skip test if version is below 8.0.0
+                if (cluster.checkIfServerVersionLessThan("8.0.0")) return;
+
+                const az = "us-east-1a";
+                const other_az = "us-east-1b";
+                const get_calls = 4;
+                const nodes_in_same_az = 2; // one primary + one replica
+                const per_node_get_calls = get_calls / nodes_in_same_az;
+                const per_node_cmdstat = `cmdstat_get:calls=${per_node_get_calls}`;
+
+                let client_for_config_set;
+                let client_for_testing_az;
+
+                try {
+                    // Stage 1: Configure nodes.
+                    client_for_config_set =
+                        await GlideClusterClient.createClient(
+                            getClientConfigurationOption(
+                                azCluster.getAddresses(),
+                                protocol,
+                                { requestTimeout: 3000 },
+                            ),
+                        );
+
+                    // Reset stats and place every node in the other AZ first.
+                    await client_for_config_set.configResetStat({
+                        route: "allNodes",
+                    });
+                    await client_for_config_set.configSet(
+                        { "availability-zone": other_az },
+                        { route: "allNodes" },
+                    );
+
+                    // Move the primary and one replica of slot 12182 ("foo") into the client's AZ.
+                    await client_for_config_set.configSet(
+                        { "availability-zone": az },
+                        { route: { type: "primarySlotId", id: 12182 } },
+                    );
+                    await client_for_config_set.configSet(
+                        { "availability-zone": az },
+                        { route: { type: "replicaSlotId", id: 12182 } },
+                    );
+
+                    // Stage 2: Create the AZ affinity client AFTER configuration so it
+                    // discovers the AZs on connect.
+                    client_for_testing_az =
+                        await GlideClusterClient.createClient(
+                            getClientConfigurationOption(
+                                azCluster.getAddresses(),
+                                protocol,
+                                {
+                                    requestTimeout: 3000,
+                                    readFrom: "AZAffinityAllNodes",
+                                    clientAz: az,
+                                },
+                            ),
+                        );
+
+                    // Stage 3: Perform GET operations against slot 12182.
+                    const key = "foo_{12182}"; // Key targets slot 12182
+
+                    for (let i = 0; i < get_calls; i++) {
+                        await client_for_testing_az.get(key);
+                    }
+
+                    // Stage 4: Verify GET commands were split evenly across the in-AZ
+                    // primary and replica, and never landed on out-of-AZ nodes.
+                    const info_result = (await client_for_testing_az.info({
+                        sections: [InfoOptions.All],
+                        route: "allNodes",
+                    })) as Record<string, string>;
+
+                    let matching_entries_count = 0;
+                    let total_get_calls = 0;
+
+                    Object.entries(info_result).forEach(([nodeId, infoStr]) => {
+                        if (!infoStr.includes("cmdstat_get:calls=")) return;
+
+                        const azMatch = infoStr.match(
+                            /availability_zone:(\S+)/,
+                        );
+                        const nodeAZ = azMatch ? azMatch[1] : "unknown";
+                        const isInClientAZ = nodeAZ === az;
+                        const getCalls = parseInt(
+                            (infoStr.match(/cmdstat_get:calls=(\d+)/) ||
+                                [])[1] || "0",
+                        );
+                        total_get_calls += getCalls;
+
+                        if (
+                            isInClientAZ &&
+                            infoStr.includes(per_node_cmdstat)
+                        ) {
+                            matching_entries_count++;
+                        } else if (!isInClientAZ && getCalls > 0) {
+                            throw new Error(
+                                `WARNING: GET calls to node not in client AZ: ${nodeId}`,
+                            );
+                        }
+                    });
+
+                    // The in-AZ primary and replica should evenly split the GET calls.
+                    expect(matching_entries_count).toBe(nodes_in_same_az);
+                    expect(total_get_calls).toBe(get_calls);
+                } finally {
+                    // Cleanup
+                    await client_for_config_set?.configSet(
+                        { "availability-zone": "" },
+                        { route: "allNodes" },
+                    );
+                    client_for_config_set?.close();
+                    client_for_testing_az?.close();
+                }
+            },
+        );
+
+        it.each([ProtocolVersion.RESP2, ProtocolVersion.RESP3])(
+            "should fall back to all nodes when no node is in the client's AZ using protocol %p",
+            async (protocol) => {
+                // Skip test if version is below 8.0.0
+                if (cluster.checkIfServerVersionLessThan("8.0.0")) return;
+
+                let client_for_config_set;
+                let client_for_testing_az;
+
+                try {
+                    // Stage 1: Reset stats and clear all AZ assignments so that the
+                    // client's AZ ("non-existing-az") matches no node, triggering the
+                    // all-nodes fallback.
+                    client_for_config_set =
+                        await GlideClusterClient.createClient(
+                            getClientConfigurationOption(
+                                azCluster.getAddresses(),
+                                protocol,
+                                { requestTimeout: 3000 },
+                            ),
+                        );
+
+                    await client_for_config_set.configSet(
+                        { "availability-zone": "" },
+                        { route: "allNodes" },
+                    );
+                    await client_for_config_set.configResetStat({
+                        route: "allNodes",
+                    });
+
+                    // Determine how many nodes serve the shard that owns "foo"
+                    // (primary + connected replicas).
+                    const replication_info = (await client_for_config_set.info({
+                        sections: [InfoOptions.Replication],
+                        route: { type: "primarySlotKey", key: "foo" },
+                    })) as string;
+                    const replicas_match = replication_info.match(
+                        /connected_slaves:(\d+)/,
+                    );
+                    const n_replicas = replicas_match
+                        ? parseInt(replicas_match[1])
+                        : 0;
+                    const nodes_in_shard = n_replicas + 1; // primary + replicas
+
+                    expect(nodes_in_shard).toBeGreaterThan(1);
+
+                    // One GET per shard node under round-robin fallback.
+                    const get_calls = nodes_in_shard;
+
+                    // Stage 2: Create a client with an AZ that no node belongs to.
+                    client_for_testing_az =
+                        await GlideClusterClient.createClient(
+                            getClientConfigurationOption(
+                                azCluster.getAddresses(),
+                                protocol,
+                                {
+                                    requestTimeout: 3000,
+                                    readFrom: "AZAffinityAllNodes",
+                                    clientAz: "non-existing-az",
+                                },
+                            ),
+                        );
+
+                    for (let i = 0; i < get_calls; i++) {
+                        await client_for_testing_az.get("foo");
+                    }
+
+                    // Stage 3: Verify every node in the shard (primary + replicas)
+                    // received traffic, with the total matching the number of calls.
+                    const info_result = (await client_for_testing_az.info({
+                        sections: [InfoOptions.All],
+                        route: "allNodes",
+                    })) as Record<string, string>;
+
+                    let nodes_with_gets = 0;
+                    let total_get_calls = 0;
+                    let primary_received_gets = false;
+                    let replica_received_gets = false;
+
+                    Object.values(info_result).forEach((infoStr) => {
+                        if (!infoStr.includes("cmdstat_get:calls=")) return;
+
+                        nodes_with_gets++;
+                        total_get_calls += parseInt(
+                            (infoStr.match(/cmdstat_get:calls=(\d+)/) ||
+                                [])[1] || "0",
+                        );
+
+                        if (
+                            infoStr.includes("role:master") ||
+                            infoStr.includes("role:primary")
+                        ) {
+                            primary_received_gets = true;
+                        }
+
+                        if (
+                            infoStr.includes("role:slave") ||
+                            infoStr.includes("role:replica")
+                        ) {
+                            replica_received_gets = true;
+                        }
+                    });
+
+                    expect(nodes_with_gets).toBe(nodes_in_shard);
+                    expect(primary_received_gets).toBe(true);
+                    expect(replica_received_gets).toBe(true);
+                    expect(total_get_calls).toBe(get_calls);
+                } finally {
+                    client_for_config_set?.close();
+                    client_for_testing_az?.close();
+                }
+            },
+        );
     });
 
     it.each([ProtocolVersion.RESP2, ProtocolVersion.RESP3])(
@@ -3015,8 +3621,8 @@ describe("GlideClusterClient", () => {
                         await getClientCount(monitoringClient);
 
                     // We need to verify the lazy connection is working properly
-                    // Note: The connection count behavior in Node.js differs from Python
-                    // Python strictly adds 2 connections per node, but Node.js may handle connections differently
+                    // Connection count assertions are racy: prior tests may still be
+                    // closing connections asynchronously. Assert only directional change.
 
                     // Verify the ping worked (which means the lazy connection was established)
                     expect(pingResponse).toBeDefined();
@@ -3176,7 +3782,10 @@ describe("GlideClusterClient", () => {
             // Test explicit true
             const clientTrue = await GlideClusterClient.createClient({
                 ...config,
-                advancedConfiguration: { tcpNoDelay: true },
+                advancedConfiguration: {
+                    tcpNoDelay: true,
+                    connectionTimeout: 10000,
+                },
             });
             expect(await clientTrue.ping()).toBe("PONG");
             expect(await clientTrue.set("key2", "value2")).toBe("OK");
@@ -3186,12 +3795,387 @@ describe("GlideClusterClient", () => {
             // Test explicit false
             const clientFalse = await GlideClusterClient.createClient({
                 ...config,
-                advancedConfiguration: { tcpNoDelay: false },
+                advancedConfiguration: {
+                    tcpNoDelay: false,
+                    connectionTimeout: 10000,
+                },
             });
             expect(await clientFalse.ping()).toBe("PONG");
             expect(await clientFalse.set("key3", "value3")).toBe("OK");
             expect(await clientFalse.get("key3")).toBe("value3");
             clientFalse.close();
+        },
+        TIMEOUT,
+    );
+
+    it.each([ProtocolVersion.RESP2, ProtocolVersion.RESP3])(
+        "latencyHistory with route_%p",
+        async (protocol) => {
+            client = await GlideClusterClient.createClient(
+                getClientConfigurationOption(cluster.getAddresses(), protocol),
+            );
+
+            const beforeSpike = await getUnixSeconds(client);
+            await triggerLatencySpike(client);
+
+            // Multi-node (default route)
+            const multiHistory = await client.latencyHistory("command");
+            const allEntries = flattenClusterResponseArrays(multiHistory);
+            expect(allEntries.length).toBeGreaterThan(0);
+
+            for (const entry of allEntries) {
+                expect(entry.time).toBeGreaterThanOrEqual(beforeSpike);
+                expect(entry.latency).toBeGreaterThan(0);
+            }
+
+            // Single-node route (primary node)
+            const singleHistory = await client.latencyHistory(
+                "command",
+                PRIMARY_SLOT_ROUTE_OPTION,
+            );
+            expect(Array.isArray(singleHistory)).toBe(true);
+
+            const singleEntries = flattenClusterResponseArrays(singleHistory);
+            expect(singleEntries.length).toBeGreaterThan(0);
+
+            for (const entry of singleEntries) {
+                expect(entry.time).toBeGreaterThanOrEqual(beforeSpike);
+                expect(entry.latency).toBeGreaterThan(0);
+            }
+
+            // Non-existent event returns empty
+            const unknown = await client.latencyHistory("nonexistent");
+            expect(flattenClusterResponseArrays(unknown).length).toBe(0);
+
+            client.close();
+        },
+        TIMEOUT,
+    );
+
+    it.each([ProtocolVersion.RESP2, ProtocolVersion.RESP3])(
+        "latencyLatest with route_%p",
+        async (protocol) => {
+            client = await GlideClusterClient.createClient(
+                getClientConfigurationOption(cluster.getAddresses(), protocol),
+            );
+
+            const beforeSpike = await getUnixSeconds(client);
+            await triggerLatencySpike(client);
+
+            // Multi-node (default route)
+            const multiLatest = await client.latencyLatest();
+            const allEntries = flattenClusterResponseArrays(multiLatest);
+            expect(allEntries.length).toBeGreaterThanOrEqual(1);
+
+            const commandInfo = allEntries.find(
+                (info) => info.eventName === "command",
+            );
+            expect(commandInfo).toBeDefined();
+            expect(commandInfo!.latestTime).toBeGreaterThanOrEqual(beforeSpike);
+            expect(commandInfo!.latestDuration).toBeGreaterThan(0);
+            expect(commandInfo!.maxDuration).toBeGreaterThanOrEqual(
+                commandInfo!.latestDuration,
+            );
+
+            // Single-node route (primary node)
+            const singleLatest = await client.latencyLatest(
+                PRIMARY_SLOT_ROUTE_OPTION,
+            );
+            expect(Array.isArray(singleLatest)).toBe(true);
+
+            const singleEntries = flattenClusterResponseArrays(singleLatest);
+            expect(singleEntries.length).toBeGreaterThanOrEqual(1);
+
+            const singleCommand = singleEntries.find(
+                (info) => info.eventName === "command",
+            );
+            expect(singleCommand).toBeDefined();
+            expect(singleCommand!.latestDuration).toBeGreaterThan(0);
+            expect(singleCommand!.maxDuration).toBeGreaterThanOrEqual(
+                singleCommand!.latestDuration,
+            );
+
+            client.close();
+        },
+        TIMEOUT,
+    );
+
+    it.each([ProtocolVersion.RESP2, ProtocolVersion.RESP3])(
+        "latencyReset with route_%p",
+        async (protocol) => {
+            client = await GlideClusterClient.createClient(
+                getClientConfigurationOption(cluster.getAddresses(), protocol),
+            );
+
+            // Trigger spike then reset with route
+            await triggerLatencySpike(client);
+            const resetResult = await client.latencyReset(undefined, {
+                route: "allNodes",
+            });
+            expect(resetResult).toBeGreaterThan(0);
+
+            // Trigger spike then reset specific event with route
+            await triggerLatencySpike(client);
+            const specificReset = await client.latencyReset(["command"], {
+                route: "allNodes",
+            });
+            expect(specificReset).toBeGreaterThan(0);
+
+            client.close();
+        },
+        TIMEOUT,
+    );
+
+    it.each([ProtocolVersion.RESP2, ProtocolVersion.RESP3])(
+        "memoryDoctor with allNodes route %p",
+        async (protocol) => {
+            client = await GlideClusterClient.createClient(
+                getClientConfigurationOption(cluster.getAddresses(), protocol),
+            );
+
+            const result = await client.memoryDoctor({ route: "allNodes" });
+            const reports = Object.values(result as Record<string, string>);
+            expect(reports.length).toBeGreaterThan(0);
+
+            for (const report of reports) {
+                expect(typeof report).toBe("string");
+                expect(report.length).toBeGreaterThan(0);
+            }
+
+            client.close();
+        },
+        TIMEOUT,
+    );
+
+    it.each([ProtocolVersion.RESP2, ProtocolVersion.RESP3])(
+        "memoryMallocStats with allNodes route %p",
+        async (protocol) => {
+            client = await GlideClusterClient.createClient(
+                getClientConfigurationOption(cluster.getAddresses(), protocol),
+            );
+
+            const result = await client.memoryMallocStats({
+                route: "allNodes",
+            });
+            const reports = Object.values(result as Record<string, string>);
+            expect(reports.length).toBeGreaterThan(0);
+
+            for (const report of reports) {
+                expect(typeof report).toBe("string");
+                expect(report.length).toBeGreaterThan(0);
+            }
+
+            client.close();
+        },
+        TIMEOUT,
+    );
+
+    it.each([ProtocolVersion.RESP2, ProtocolVersion.RESP3])(
+        "memoryPurge with allNodes route %p",
+        async (protocol) => {
+            client = await GlideClusterClient.createClient(
+                getClientConfigurationOption(cluster.getAddresses(), protocol),
+            );
+
+            expect(await client.memoryPurge({ route: "allNodes" })).toBe("OK");
+
+            client.close();
+        },
+        TIMEOUT,
+    );
+
+    it.each([ProtocolVersion.RESP2, ProtocolVersion.RESP3])(
+        "memoryStats with allNodes route %p",
+        async (protocol) => {
+            client = await GlideClusterClient.createClient(
+                getClientConfigurationOption(cluster.getAddresses(), protocol),
+            );
+
+            const key = getRandomKey();
+            await client.set(key, "allNodesMemTest");
+
+            const result = await client.memoryStats({ route: "allNodes" });
+            const statsList = Object.values(
+                result as Record<string, MemoryStats>,
+            );
+            expect(statsList.length).toBeGreaterThan(0);
+
+            for (const stats of statsList) {
+                assertMemoryStatsFields(stats, cluster.getVersion());
+            }
+
+            client.close();
+        },
+        TIMEOUT,
+    );
+
+    it.each([ProtocolVersion.RESP2, ProtocolVersion.RESP3])(
+        "memoryDoctor with randomNode route %p",
+        async (protocol) => {
+            client = await GlideClusterClient.createClient(
+                getClientConfigurationOption(cluster.getAddresses(), protocol),
+            );
+
+            const result = await client.memoryDoctor({ route: "randomNode" });
+            expect(typeof result).toBe("string");
+            expect((result as string).length).toBeGreaterThan(0);
+
+            client.close();
+        },
+        TIMEOUT,
+    );
+
+    it.each([ProtocolVersion.RESP2, ProtocolVersion.RESP3])(
+        "memoryMallocStats with randomNode route %p",
+        async (protocol) => {
+            client = await GlideClusterClient.createClient(
+                getClientConfigurationOption(cluster.getAddresses(), protocol),
+            );
+
+            const result = await client.memoryMallocStats({
+                route: "randomNode",
+            });
+            expect(typeof result).toBe("string");
+            expect((result as string).length).toBeGreaterThan(0);
+
+            client.close();
+        },
+        TIMEOUT,
+    );
+
+    it.each([ProtocolVersion.RESP2, ProtocolVersion.RESP3])(
+        "memoryPurge with randomNode route %p",
+        async (protocol) => {
+            client = await GlideClusterClient.createClient(
+                getClientConfigurationOption(cluster.getAddresses(), protocol),
+            );
+
+            expect(await client.memoryPurge({ route: "randomNode" })).toBe(
+                "OK",
+            );
+
+            client.close();
+        },
+        TIMEOUT,
+    );
+
+    it.each([ProtocolVersion.RESP2, ProtocolVersion.RESP3])(
+        "memoryStats with single node route %p",
+        async (protocol) => {
+            client = await GlideClusterClient.createClient(
+                getClientConfigurationOption(cluster.getAddresses(), protocol),
+            );
+
+            // Write a key and route to its node to ensure db entry exists
+            const key = `memoryStats_single_node_${protocol}`;
+            await client.set(key, "value");
+
+            const result = await client.memoryStats({
+                route: { type: "primarySlotKey", key },
+            });
+            const stats = result as MemoryStats;
+            assertMemoryStatsFields(stats, cluster.getVersion());
+            expect(stats.db[0]).toBeDefined();
+            assertMemoryStatsDbEntry(stats.db[0]);
+
+            client.close();
+        },
+        TIMEOUT,
+    );
+
+    it(
+        "should connect with IPv4 address",
+        async () => {
+            const address = {
+                host: cluster.getAddresses()[0][0],
+                port: cluster.getAddresses()[0][1],
+            };
+            const client = await GlideClusterClient.createClient({
+                addresses: [address],
+            });
+
+            await assertConnected(client);
+            client.close();
+        },
+        TIMEOUT,
+    );
+
+    it(
+        "should connect with IPv6 address",
+        async () => {
+            // Skip if no IPv6 endpoint is available in this environment
+            if (!cluster.getAddresses().some(([host]) => host.includes(":"))) {
+                return;
+            }
+
+            const address = {
+                host: cluster
+                    .getAddresses()
+                    .find(([host]) => host.includes(":"))![0],
+                port: cluster
+                    .getAddresses()
+                    .find(([host]) => host.includes(":"))![1],
+            };
+            const client = await GlideClusterClient.createClient({
+                addresses: [address],
+            });
+
+            await assertConnected(client);
+            client.close();
+        },
+        TIMEOUT,
+    );
+
+    it.each([ProtocolVersion.RESP2, ProtocolVersion.RESP3])(
+        "clientTrackingInfo with cache off and default route_%p",
+        async (protocol) => {
+            client = await GlideClusterClient.createClient(
+                getClientConfigurationOption(cluster.getAddresses(), protocol),
+            );
+            const info =
+                (await client.clientTrackingInfo()) as ClientTrackingInfo;
+            assertClientTrackingInfo(info, false);
+        },
+        TIMEOUT,
+    );
+
+    it.each([ProtocolVersion.RESP2, ProtocolVersion.RESP3])(
+        "clientTrackingInfo with cache off and multi-node route_%p",
+        async (protocol) => {
+            client = await GlideClusterClient.createClient(
+                getClientConfigurationOption(cluster.getAddresses(), protocol),
+            );
+            const multiInfo = (await client.clientTrackingInfo({
+                route: "allPrimaries",
+            })) as Record<string, ClientTrackingInfo>;
+
+            expect(Object.keys(multiInfo).length).toBeGreaterThan(0);
+
+            for (const nodeInfo of Object.values(multiInfo)) {
+                assertClientTrackingInfo(nodeInfo, false);
+            }
+        },
+        TIMEOUT,
+    );
+
+    it(
+        "clientTrackingInfo with cache on and default route",
+        async () => {
+            const cache = new ClientSideCache({
+                maxCacheKb: 1,
+                entryTtlMs: 60000,
+                serverAssisted: true,
+            });
+            client = await GlideClusterClient.createClient(
+                getClientConfigurationOption(
+                    cluster.getAddresses(),
+                    ProtocolVersion.RESP3,
+                    { clientSideCache: cache },
+                ),
+            );
+            const info =
+                (await client.clientTrackingInfo()) as ClientTrackingInfo;
+            assertClientTrackingInfo(info, true);
         },
         TIMEOUT,
     );

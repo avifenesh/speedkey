@@ -1,26 +1,36 @@
 // Copyright Valkey GLIDE Project Contributors - SPDX Identifier: Apache-2.0
 
+mod constants;
 mod utilities;
 
 #[cfg(test)]
 mod cluster_client_tests {
     use std::collections::HashMap;
+    use std::sync::Arc;
+    use std::time::Duration;
 
-    use super::*;
-    use cluster::{LONG_CLUSTER_TEST_TIMEOUT, setup_cluster_with_replicas};
-    use glide_core::client::Client;
-    use glide_core::connection_request::ProtocolVersion as GlideProtocolVersion;
-    use glide_core::connection_request::{
-        self, PubSubChannelsOrPatterns, PubSubSubscriptions, ReadFrom,
+    use crate::constants::{IP_ADDRESS_V4, IP_ADDRESS_V6};
+    use crate::utilities::{
+        cluster::{
+            LONG_CLUSTER_TEST_TIMEOUT, RedisCluster, SHORT_CLUSTER_TEST_TIMEOUT,
+            setup_cluster_with_replicas, setup_test_basics_internal,
+        },
+        *,
     };
-    use redis::cluster_routing::{
-        MultipleNodeRoutingInfo, Route, RoutingInfo, SingleNodeRoutingInfo, SlotAddr,
+    use glide_core::{
+        client::Client,
+        connection_request::{
+            self, ProtocolVersion as GlideProtocolVersion, PubSubChannelsOrPatterns,
+            PubSubSubscriptions, ReadFrom,
+        },
     };
-    use redis::{InfoDict, Value};
-
+    use redis::{
+        InfoDict, RedisConnectionInfo, Value,
+        cluster_routing::{
+            MultipleNodeRoutingInfo, Route, RoutingInfo, SingleNodeRoutingInfo, SlotAddr,
+        },
+    };
     use rstest::rstest;
-    use utilities::cluster::{SHORT_CLUSTER_TEST_TIMEOUT, setup_test_basics_internal};
-    use utilities::*;
     use versions::Versioning;
 
     fn count_primary_or_replica(value: &str) -> (u16, u16) {
@@ -316,7 +326,7 @@ mod cluster_client_tests {
         let routing_info = RoutingInfo::MultiNode((MultipleNodeRoutingInfo::AllMasters, None));
         let mut total_clients = 0;
 
-        logger_core::log_info(
+        glide_logger::log_info(
             "TestClusterLazyHelper",
             "Querying CLIENT LIST on all shared cluster primaries via AllMasters routing.",
         );
@@ -335,7 +345,7 @@ mod cluster_client_tests {
                             total_clients += text.lines().count();
                         }
                         _ => {
-                            logger_core::log_warn(
+                            glide_logger::log_warn(
                                 "TestClusterLazyHelper",
                                 format!(
                                     "CLIENT LIST from a primary (AllMasters) returned unexpected inner type for a node's result: {node_result_value:?}"
@@ -347,7 +357,7 @@ mod cluster_client_tests {
             }
             Ok(other_type) => {
                 // Logging if returned type is not a map as we expect
-                logger_core::log_warn(
+                glide_logger::log_warn(
                     "TestClusterLazyHelper",
                     format!(
                         "CLIENT LIST with AllMasters routing returned an unexpected type (expected Map): {other_type:?}"
@@ -355,14 +365,14 @@ mod cluster_client_tests {
                 );
             }
             Err(e) => {
-                logger_core::log_warn(
+                glide_logger::log_warn(
                     "TestClusterLazyHelper",
                     format!("CLIENT LIST with AllMasters routing failed: {e:?}"),
                 );
             }
         }
 
-        logger_core::log_info(
+        glide_logger::log_info(
             "TestClusterLazyHelper",
             format!("Total clients found on shared primaries (AllMasters): {total_clients}"),
         );
@@ -394,8 +404,7 @@ mod cluster_client_tests {
             .await;
 
             // Skip test if server version is less than 9.0 (database isolation not supported)
-            if !utilities::version_greater_or_equal(&mut version_check_basics.client, "9.0.0").await
-            {
+            if !version_greater_or_equal(&mut version_check_basics.client, "9.0.0").await {
                 return;
             }
             let mut test_basics = setup_test_basics_internal(TestConfiguration {
@@ -432,10 +441,13 @@ mod cluster_client_tests {
                 Err(err) => {
                     // Connection was dropped as expected
                     assert!(
-                        err.is_connection_dropped() || err.is_timeout(),
-                        "Expected connection dropped or timeout error, got: {err:?}",
+                        err.is_connection_dropped()
+                            || err.is_timeout()
+                            || err.kind() == redis::ErrorKind::AllConnectionsUnavailable
+                            || err.kind() == redis::ErrorKind::ClientError,
+                        "Expected connection dropped, timeout, unavailable, or recovery error, got: {err:?}",
                     );
-                    let client_info = repeat_try_create(|| async {
+                    let client_info = retry(|| async {
                         let mut client = test_basics.client.clone();
                         let mut cmd = client_info_cmd.clone();
                         let response = client.send_command(&mut cmd, None).await.ok()?;
@@ -511,7 +523,7 @@ mod cluster_client_tests {
             // 3. Get initial client count on Cluster A.
             let clients_before_lazy_init =
                 get_total_clients_on_shared_cluster_primaries(&mut monitoring_client).await;
-            logger_core::log_info(
+            glide_logger::log_info(
                 "TestClusterLazy",
                 format!(
                     "Clients before lazy client init (protocol={protocol:?} on dedicated cluster A): {clients_before_lazy_init}"
@@ -526,7 +538,7 @@ mod cluster_client_tests {
             lazy_client_config.client_name = Some("lazy_config".into());
 
             // Create connection request directly with our dedicated cluster addresses
-            let lazy_connection_request = utilities::create_connection_request(
+            let lazy_connection_request = create_connection_request(
                 &dedicated_cluster_addresses,
                 &lazy_client_config, // Uses the same config but with lazy_connect=true
             );
@@ -539,7 +551,7 @@ mod cluster_client_tests {
             // 6. Assert that no new connections were made yet by the lazy client on Cluster A.
             let clients_after_lazy_init =
                 get_total_clients_on_shared_cluster_primaries(&mut monitoring_client).await;
-            logger_core::log_info(
+            glide_logger::log_info(
                 "TestClusterLazy",
                 format!(
                     "Clients after lazy client init (protocol={protocol:?} on dedicated cluster A): {clients_after_lazy_init}"
@@ -551,7 +563,7 @@ mod cluster_client_tests {
             );
 
             // 7. Send the first command using the lazy client to Cluster A.
-            logger_core::log_info(
+            glide_logger::log_info(
                 "TestClusterLazy",
                 format!(
                     "Sending first command to lazy client (PING) (protocol={protocol:?} on dedicated cluster A)"
@@ -574,7 +586,7 @@ mod cluster_client_tests {
             // 8. Assert that new connections were made on Cluster A by the lazy client.
             let clients_after_first_command =
                 get_total_clients_on_shared_cluster_primaries(&mut monitoring_client).await;
-            logger_core::log_info(
+            glide_logger::log_info(
                 "TestClusterLazy",
                 format!(
                     "Clients after first command (protocol={protocol:?} on dedicated cluster A): {clients_after_first_command}"
@@ -592,15 +604,11 @@ mod cluster_client_tests {
     #[timeout(SHORT_CLUSTER_TEST_TIMEOUT)]
     fn test_cluster_tls_connection_with_custom_root_cert() {
         block_on_all(async move {
-            // Create a dedicated TLS cluster with custom certificates
-            let tempdir = tempfile::Builder::new()
-                .prefix("tls_cluster_test")
-                .tempdir()
-                .expect("Failed to create temp dir");
-            let tls_paths = build_keys_and_certs_for_tls(&tempdir);
+            let tempdir = tempfile::tempdir().expect("Failed to create temp dir");
+            let tls_paths = build_tls_file_paths(&tempdir);
             let ca_cert_bytes = tls_paths.read_ca_cert_as_bytes();
 
-            let cluster = utilities::cluster::RedisCluster::new_with_tls(3, 0, Some(tls_paths));
+            let cluster = RedisCluster::new_with_tls(3, 0, Some(tls_paths));
             let cluster_addresses = cluster.get_server_addresses();
 
             // Create connection request with custom root certificate
@@ -621,12 +629,7 @@ mod cluster_client_tests {
                 .await
                 .expect("Failed to create cluster client with custom root cert");
 
-            // Verify connection works by sending a command
-            let ping_result = client.send_command(&mut redis::cmd("PING"), None).await;
-            assert_eq!(
-                ping_result.unwrap(),
-                Value::SimpleString("PONG".to_string())
-            );
+            assert_connected(&mut client).await;
         });
     }
 
@@ -636,22 +639,15 @@ mod cluster_client_tests {
     fn test_cluster_tls_connection_fails_with_wrong_root_cert() {
         block_on_all(async move {
             // Create a TLS cluster with one set of certificates
-            let tempdir1 = tempfile::Builder::new()
-                .prefix("tls_cluster_server")
-                .tempdir()
-                .expect("Failed to create temp dir");
-            let server_tls_paths = build_keys_and_certs_for_tls(&tempdir1);
+            let server_tempdir = tempfile::tempdir().expect("Failed to create temp dir");
+            let server_tls_paths = build_tls_file_paths(&server_tempdir);
 
             // Create different CA certificate for client
-            let tempdir2 = tempfile::Builder::new()
-                .prefix("tls_cluster_client")
-                .tempdir()
-                .expect("Failed to create temp dir");
-            let client_tls_paths = build_keys_and_certs_for_tls(&tempdir2);
+            let client_tempdir = tempfile::tempdir().expect("Failed to create temp dir");
+            let client_tls_paths = build_tls_file_paths(&client_tempdir);
             let wrong_ca_cert_bytes = client_tls_paths.read_ca_cert_as_bytes();
 
-            let cluster =
-                utilities::cluster::RedisCluster::new_with_tls(3, 0, Some(server_tls_paths));
+            let cluster = RedisCluster::new_with_tls(3, 0, Some(server_tls_paths));
             let cluster_addresses = cluster.get_server_addresses();
 
             // Try to connect with wrong root certificate
@@ -672,6 +668,278 @@ mod cluster_client_tests {
             assert!(
                 client_result.is_err(),
                 "Expected cluster connection to fail with wrong root certificate"
+            );
+        });
+    }
+
+    #[rstest]
+    #[serial_test::serial]
+    #[timeout(SHORT_CLUSTER_TEST_TIMEOUT)]
+    fn test_cluster_tls_connection_with_ip_address_succeeds(
+        #[values(IP_ADDRESS_V4, IP_ADDRESS_V6)] host: &str,
+    ) {
+        block_on_all(async move {
+            let tempdir = tempfile::tempdir().expect("Failed to create temp dir");
+            let tls_paths = build_tls_file_paths(&tempdir);
+            let ca_cert_bytes = tls_paths.read_ca_cert_as_bytes();
+            let cluster = RedisCluster::new_with_tls(3, 0, Some(tls_paths));
+
+            // Wait to ensure server is ready before connecting.
+            tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
+
+            let default_address = cluster.get_server_addresses()[0].clone();
+            let ip_addr = match default_address {
+                redis::ConnectionAddr::TcpTls { port, .. } => redis::ConnectionAddr::TcpTls {
+                    host: host.to_string(),
+                    port,
+                    insecure: false,
+                    tls_params: None,
+                },
+                _ => panic!("Expected TLS address"),
+            };
+
+            let mut connection_request = create_connection_request(
+                &[ip_addr],
+                &TestConfiguration {
+                    use_tls: true,
+                    cluster_mode: ClusterMode::Enabled,
+                    shared_server: false,
+                    ..Default::default()
+                },
+            );
+            connection_request.tls_mode = glide_core::connection_request::TlsMode::SecureTls.into();
+            connection_request.root_certs = vec![ca_cert_bytes.into()];
+
+            let mut client = Client::new(connection_request.into(), None)
+                .await
+                .expect("Failed to create cluster client with IP address");
+
+            assert_connected(&mut client).await;
+        });
+    }
+
+    #[rstest]
+    #[serial_test::serial]
+    #[timeout(SHORT_CLUSTER_TEST_TIMEOUT)]
+    fn test_cluster_connection_with_ip_address_succeeds(
+        #[values(IP_ADDRESS_V4, IP_ADDRESS_V6)] host: &str,
+    ) {
+        block_on_all(async move {
+            let cluster = RedisCluster::new(false, &None, None, None);
+
+            // Wait to ensure server is ready before connecting.
+            tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
+
+            let default_address = cluster.get_server_addresses()[0].clone();
+            let ip_addr = match default_address {
+                redis::ConnectionAddr::Tcp(_, port) => {
+                    redis::ConnectionAddr::Tcp(host.to_string(), port)
+                }
+                _ => panic!("Expected TCP address"),
+            };
+
+            let connection_request = create_connection_request(
+                &[ip_addr],
+                &TestConfiguration {
+                    cluster_mode: ClusterMode::Enabled,
+                    shared_server: false,
+                    ..Default::default()
+                },
+            );
+
+            let mut client = Client::new(connection_request.into(), None)
+                .await
+                .expect("Failed to create cluster client with IP address");
+
+            assert_connected(&mut client).await;
+        });
+    }
+
+    #[rstest]
+    #[timeout(SHORT_CLUSTER_TEST_TIMEOUT)]
+    #[serial_test::serial]
+    fn test_cluster_connection_fails_with_permission_denied() {
+        block_on_all(async {
+            // Setup a cluster with default (unrestricted) access
+            let test_basics = setup_test_basics_internal(TestConfiguration {
+                cluster_mode: ClusterMode::Enabled,
+                shared_server: false,
+                ..Default::default()
+            })
+            .await;
+
+            let cluster = test_basics.cluster.as_ref().unwrap();
+            let mut client = test_basics.client;
+
+            let username = "restricted_user";
+            let password = "test_password_456";
+
+            let mut cmd = redis::cmd("ACL");
+            cmd.arg("SETUSER")
+                .arg(username)
+                .arg("on")
+                .arg("allkeys")
+                .arg("+@all")
+                .arg("-cluster")
+                .arg(format!(">{password}"));
+            let routing = RoutingInfo::MultiNode((MultipleNodeRoutingInfo::AllNodes, None));
+            let set_user = client.send_command(&mut cmd, Some(routing)).await;
+
+            assert!(
+                set_user.is_ok(),
+                "Failed to set up ACL users for testing {:?}",
+                set_user.err()
+            );
+
+            // Create a new connection request with the restricted user's credentials
+            let restricted_configuration = TestConfiguration {
+                cluster_mode: ClusterMode::Enabled,
+                connection_info: Some(RedisConnectionInfo {
+                    username: Some(username.to_string()),
+                    password: Some(password.to_string()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+
+            let addresses = cluster.get_server_addresses();
+            let mut connection_request =
+                create_connection_request(&addresses, &restricted_configuration);
+
+            // Increase connection timeout to 10 seconds to allow retries to complete
+            connection_request.connection_timeout = 10_000;
+
+            // Reconnect with the restricted user.
+            let result = Client::new(connection_request.into(), None).await;
+
+            // Assert that connection failed
+            assert!(
+                result.is_err(),
+                "Expected connection to fail with cluster slots permission"
+            );
+
+            if let Err(err) = result {
+                let error_msg = format!("{:?}", err);
+                // Assert the error contains permission error
+                assert!(
+                    error_msg.contains("PermissionDenied"),
+                    "Error should be a perrmission error, got: {}",
+                    error_msg
+                );
+            }
+        });
+    }
+
+    #[cfg(unix)]
+    #[rstest]
+    #[timeout(LONG_CLUSTER_TEST_TIMEOUT)]
+    fn test_reconnect_to_initial_nodes_doesnt_block_throughput() {
+        // Test for #4990: Failover causes near-zero throughput
+        // See: https://github.com/valkey-io/valkey-glide/issues/4990
+        //
+        // Kills all cluster nodes with a TCP blackhole as seed node, then measures how many
+        // commands complete in a time window during reconnection. Without the fix, poll_flush
+        // blocks behind the reconnect task (2000ms per attempt) and commands are not processed.
+        // With the fix, ReconnectToInitialNodes path calls fail_pending_requests immediately,
+        // so commands get ClientError quickly and the loop can advance.
+        block_on_all(async {
+            const CONNECTION_TIMEOUT_MS: u64 = 2000;
+            const WINDOW_MS: u64 = 3000;
+            const MIN_COMMANDS_WITH_FIX: u32 = 10;
+
+            // TCP blackhole: accepts connections but never responds.
+            // Simulates a seed node whose DNS hasn't updated after failover.
+            let blackhole_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind blackhole listener");
+            let blackhole_port = blackhole_listener.local_addr().unwrap().port();
+            let held_streams = Arc::new(std::sync::Mutex::new(Vec::<tokio::net::TcpStream>::new()));
+            let held_clone = held_streams.clone();
+            tokio::spawn(async move {
+                while let Ok((stream, _)) = blackhole_listener.accept().await {
+                    held_clone.lock().unwrap().push(stream);
+                }
+            });
+
+            let cluster = RedisCluster::new(false, &None, Some(3), Some(0));
+            let cluster_addresses = cluster.get_server_addresses();
+            let pids = cluster.all_server_pids();
+
+            // Add blackhole as a seed node to trigger blocking reconnect behavior
+            let mut initial_nodes: Vec<redis::ConnectionInfo> = cluster_addresses
+                .iter()
+                .map(|addr| redis::ConnectionInfo {
+                    addr: addr.clone(),
+                    redis: redis::RedisConnectionInfo::default(),
+                })
+                .collect();
+            initial_nodes.push(redis::ConnectionInfo {
+                addr: redis::ConnectionAddr::Tcp("127.0.0.1".to_string(), blackhole_port),
+                redis: redis::RedisConnectionInfo::default(),
+            });
+
+            let cluster_client = redis::cluster::ClusterClientBuilder::new(initial_nodes)
+                .periodic_connections_checks(Some(Duration::from_millis(100)))
+                .connection_timeout(Duration::from_millis(CONNECTION_TIMEOUT_MS))
+                .slots_refresh_rate_limit(Duration::from_millis(0), 0)
+                .build()
+                .expect("build cluster client");
+
+            let mut conn: redis::cluster_async::ClusterConnection = cluster_client
+                .get_async_connection(None, None, None, None)
+                .await
+                .expect("connect to cluster");
+
+            let ping: redis::RedisResult<redis::Value> = conn
+                .route_command(
+                    &redis::cmd("PING"),
+                    redis::cluster_routing::RoutingInfo::SingleNode(SingleNodeRoutingInfo::Random),
+                )
+                .await;
+            assert!(ping.is_ok(), "PING before kill failed: {:?}", ping);
+
+            // Kill all cluster nodes to trigger reconnect
+            for pid in &pids {
+                std::process::Command::new("kill")
+                    .args(["-9", &pid.to_string()])
+                    .output()
+                    .ok();
+            }
+
+            // Wait for connection health checks to detect failures
+            tokio::time::sleep(Duration::from_millis(500)).await;
+
+            // Measure how many commands complete (success or error) in the window.
+            // With fail-fast, each command gets ClientError immediately so the loop
+            // advances quickly. Without the fix, each command would block for
+            // CONNECTION_TIMEOUT_MS waiting for the reconnect task to finish.
+            let mut completed: u32 = 0;
+            let mut cmd = redis::cmd("GET");
+            cmd.arg("{test}key");
+            let window_start = std::time::Instant::now();
+
+            while window_start.elapsed() < Duration::from_millis(WINDOW_MS) {
+                let _ = tokio::time::timeout(
+                    Duration::from_millis(CONNECTION_TIMEOUT_MS + 500),
+                    conn.route_command(
+                        &cmd,
+                        redis::cluster_routing::RoutingInfo::SingleNode(
+                            SingleNodeRoutingInfo::SpecificNode(Route::new(0, SlotAddr::Master)),
+                        ),
+                    ),
+                )
+                .await;
+                completed += 1;
+            }
+
+            assert!(
+                completed >= MIN_COMMANDS_WITH_FIX,
+                "Send loop blocked: only {}/{} commands completed in {}ms. \
+                 Each command serialized behind reconnect_to_initial_nodes blocking for {}ms.",
+                completed,
+                MIN_COMMANDS_WITH_FIX,
+                WINDOW_MS,
+                CONNECTION_TIMEOUT_MS,
             );
         });
     }

@@ -1,13 +1,16 @@
 // Copyright Valkey GLIDE Project Contributors - SPDX Identifier: Apache-2.0
 
 #![cfg(feature = "socket-layer")]
+
+mod constants;
+mod utilities;
+
 use glide_core::*;
+use integer_encoding::VarInt;
 use rsevents::{Awaitable, EventState, ManualResetEvent};
 use std::io::prelude::*;
 use std::sync::{Arc, Mutex};
 use std::{os::unix::net::UnixStream, thread};
-mod utilities;
-use integer_encoding::VarInt;
 use utilities::cluster::*;
 use utilities::*;
 
@@ -426,7 +429,7 @@ mod socket_listener {
         let mut responses = std::collections::HashMap::new();
         responses.insert(
             "*2\r\n$4\r\nINFO\r\n$11\r\nREPLICATION\r\n".to_string(),
-            Value::BulkString(b"role:master\r\nconnected_slaves:0\r\n".to_vec()),
+            Value::BulkString(b"role:master\r\nconnected_slaves:0\r\n".to_vec().into()),
         );
         let server_mock = ServerMock::new(responses);
         let addresses = server_mock.get_addresses();
@@ -641,7 +644,7 @@ mod socket_listener {
             &mut buffer,
             Some(&mut test_basics.socket),
             CALLBACK2_INDEX,
-            Value::BulkString(value.into_bytes()),
+            Value::BulkString(value.into_bytes().into()),
         );
     }
 
@@ -691,7 +694,7 @@ mod socket_listener {
             &mut buffer,
             Some(&mut test_basics.socket),
             CALLBACK2_INDEX,
-            Value::BulkString(value.into_bytes()),
+            Value::BulkString(value.into_bytes().into()),
         );
     }
 
@@ -726,7 +729,10 @@ mod socket_listener {
         };
         assert_eq!(values.len(), 3);
         for i in 0..3 {
-            assert_eq!(values.get(i).unwrap().1, Value::BulkString(b"foo".to_vec()));
+            assert_eq!(
+                values.get(i).unwrap().1,
+                Value::BulkString(b"foo".to_vec().into())
+            );
         }
     }
 
@@ -915,7 +921,7 @@ mod socket_listener {
             &mut buffer,
             None,
             CALLBACK2_INDEX,
-            Value::BulkString(value.into_bytes()),
+            Value::BulkString(value.into_bytes().into()),
         );
     }
 
@@ -980,7 +986,9 @@ mod socket_listener {
                                     let values = values_for_read.lock().unwrap();
                                     assert_value(
                                         pointer,
-                                        Some(Value::BulkString(values[callback_index].clone())),
+                                        Some(Value::BulkString(
+                                            values[callback_index].clone().into(),
+                                        )),
                                     );
                                     results[callback_index] = State::ReceivedValue;
                                 }
@@ -1214,7 +1222,7 @@ mod socket_listener {
             CALLBACK_INDEX,
             Value::Array(vec![
                 Value::Okay,
-                Value::BulkString(vec![b'b', b'a', b'r']),
+                Value::BulkString(vec![b'b', b'a', b'r'].into()),
                 Value::Okay,
                 Value::Nil,
             ]),
@@ -1282,8 +1290,11 @@ mod socket_listener {
             Value::Array(vec![
                 Value::Okay,
                 Value::Okay,
-                Value::BulkString(vec![b'b', b'a', b'r']),
-                Value::Array(vec![Value::BulkString(vec![b'b', b'a', b'r']), Value::Nil]),
+                Value::BulkString(vec![b'b', b'a', b'r'].into()),
+                Value::Array(vec![
+                    Value::BulkString(vec![b'b', b'a', b'r'].into()),
+                    Value::Nil,
+                ]),
                 Value::Int(1),
             ]),
         );
@@ -1387,7 +1398,7 @@ mod socket_listener {
             &mut buffer,
             Some(&mut test_basics.socket),
             CALLBACK_INDEX,
-            Value::BulkString(value.into_bytes()),
+            Value::BulkString(value.into_bytes().into()),
         );
     }
 

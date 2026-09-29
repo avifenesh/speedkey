@@ -147,7 +147,7 @@ where
 async fn setup_connection<C>(
     connection_info: &RedisConnectionInfo,
     con: &mut C,
-    // This parameter is set to 'true' if ReadFromReplica strategy is set to AZAffinity or AZAffinityReplicasAndPrimary.
+    // This parameter is set to 'true' if ReadFromReplica strategy is set to AZAffinity, AZAffinityReplicasAndPrimary, or AZAffinityAllNodes.
     // An INFO command will be triggered in the connection's setup to update the 'availability_zone' property.
     discover_az: bool,
 ) -> RedisResult<()>
@@ -225,16 +225,49 @@ where
         }
     }
 
+    if connection_info.server_assisted_cache {
+        if connection_info.protocol == ProtocolVersion::RESP2 {
+            return Err(RedisError::from((
+                ErrorKind::InvalidClientConfig,
+                "server_assisted_cache requires RESP3 protocol",
+            )));
+        }
+        match cmd("CLIENT")
+            .arg("TRACKING")
+            .arg("ON")
+            .arg("BCAST")
+            .query_async(con)
+            .await
+        {
+            Ok(Value::Okay) => {}
+            Err(e) => {
+                return Err(RedisError::from((
+                    ErrorKind::ClientError,
+                    "Failed to enable server-assisted client tracking",
+                    e.to_string(),
+                )));
+            }
+            _ => {
+                return Err(RedisError::from((
+                    ErrorKind::ClientError,
+                    "Unexpected response from CLIENT TRACKING ON BCAST",
+                )));
+            }
+        }
+    }
+
     if discover_az {
         update_az_from_info(con).await?;
     }
 
     // result is ignored, as per the command's instructions.
     // https://redis.io/commands/client-setinfo/
-    let _: RedisResult<()> =
-        crate::connection::client_set_info_pipeline(connection_info.lib_name.as_deref())
-            .query_async(con)
-            .await;
+    let _: RedisResult<()> = crate::connection::client_set_info_pipeline(
+        connection_info.lib_name.as_deref(),
+        connection_info.lib_ver.as_deref(),
+    )
+    .query_async(con)
+    .await;
     Ok(())
 }
 

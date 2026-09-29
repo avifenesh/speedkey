@@ -1,8 +1,8 @@
 // Copyright Valkey GLIDE Project Contributors - SPDX Identifier: Apache-2.0
 #[allow(unused_imports)]
 use bytes::{Bytes, BytesMut};
+use glide_logger::log_error;
 use integer_encoding::VarInt;
-use logger_core::log_error;
 use protobuf::Message;
 use std::io;
 
@@ -68,7 +68,7 @@ mod tests {
     use crate::command_request::{Command, CommandRequest, RequestType};
     use crate::command_request::{command, command_request};
     use bytes::BufMut;
-    use rand::{RngExt, distr::Alphanumeric};
+    use rand::{Rng, distributions::Alphanumeric};
     use rstest::rstest;
 
     fn write_length(buffer: &mut BytesMut, length: u32) {
@@ -161,7 +161,7 @@ mod tests {
     }
 
     fn generate_random_string(length: usize) -> String {
-        rand::rng()
+        rand::thread_rng()
             .sample_iter(&Alphanumeric)
             .take(length)
             .map(char::from)

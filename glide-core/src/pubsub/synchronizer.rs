@@ -2,7 +2,8 @@
 
 use crate::client::{ClientWrapper, PubSubCommandApplier};
 use async_trait::async_trait;
-use logger_core::{log_debug, log_error, log_warn};
+use glide_logger::{log_debug, log_error, log_warn};
+use glide_telemetry::GlideOpenTelemetry;
 use once_cell::sync::OnceCell;
 use redis::{
     Cmd, ErrorKind, PubSubChannelOrPattern, PubSubSubscriptionInfo, PubSubSubscriptionKind,
@@ -12,7 +13,6 @@ use redis::{
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, RwLock, Weak};
 use std::time::{Duration, Instant};
-use telemetrylib::GlideOpenTelemetry;
 use tokio::sync::{Notify, RwLock as TokioRwLock};
 
 const LOCK_ERR: &str = "Lock poisoned";
@@ -579,9 +579,9 @@ impl GlidePubSubSynchronizer {
         let (desired, actual) = self.get_subscription_state();
 
         Value::Array(vec![
-            Value::BulkString(b"desired".to_vec()),
+            Value::BulkString(b"desired".to_vec().into()),
             Self::convert_sub_map_to_value(desired),
-            Value::BulkString(b"actual".to_vec()),
+            Value::BulkString(b"actual".to_vec().into()),
             Self::convert_sub_map_to_value(actual),
         ])
     }
@@ -595,9 +595,12 @@ impl GlidePubSubSynchronizer {
                     PubSubSubscriptionKind::Pattern => "Pattern",
                     PubSubSubscriptionKind::Sharded => "Sharded",
                 };
-                let values_array: Vec<Value> = values.into_iter().map(Value::BulkString).collect();
+                let values_array: Vec<Value> = values
+                    .into_iter()
+                    .map(|v| Value::BulkString(v.into()))
+                    .collect();
                 (
-                    Value::BulkString(key.as_bytes().to_vec()),
+                    Value::BulkString(key.as_bytes().to_vec().into()),
                     Value::Array(values_array),
                 )
             })
@@ -724,7 +727,7 @@ impl PubSubSynchronizer for GlidePubSubSynchronizer {
         } else {
             // For regular subscriptions (Exact/Pattern), remove from ALL addresses.
             // These are not slot-bound, and the server's unsubscribe is authoritative.
-            for (_, addr_subs) in current_by_addr.iter_mut() {
+            for addr_subs in current_by_addr.values_mut() {
                 if let Some(existing) = addr_subs.get_mut(&subscription_type) {
                     for channel in &channels {
                         existing.remove(channel);

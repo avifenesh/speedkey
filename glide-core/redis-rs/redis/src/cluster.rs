@@ -48,7 +48,9 @@ use crate::connection::{
     connect, Connection, ConnectionAddr, ConnectionInfo, ConnectionLike, RedisConnectionInfo,
 };
 use crate::parser::parse_redis_value;
-use crate::types::{ErrorKind, HashMap, RedisError, RedisResult, RetryMethod, Value};
+use crate::types::{
+    AddressResolver, ErrorKind, HashMap, RedisError, RedisResult, RetryMethod, Value,
+};
 pub use crate::TlsMode; // Pub for backwards compatibility
 use crate::{
     cluster_client::ClusterParams,
@@ -383,7 +385,16 @@ where
                 ErrorKind::ClientError,
                 "can't parse node address",
             )))?;
-            match parse_and_count_slots(&value, self.cluster_params.tls, addr).map(
+            match parse_and_count_slots(
+                &value,
+                self.cluster_params.tls,
+                addr,
+                self.cluster_params
+                    .address_resolver
+                    .as_ref()
+                    .map(Arc::as_ref),
+            )
+            .map(
                 |ParsedSlotsResult {
                      slots,
                      address_to_ip_map,
@@ -685,7 +696,9 @@ where
                 let results = results
                     .into_iter()
                     .map(|result| {
-                        result.map(|(addr, val)| (Value::BulkString(addr.as_bytes().to_vec()), val))
+                        result.map(|(addr, val)| {
+                            (Value::BulkString(addr.as_bytes().to_vec().into()), val)
+                        })
                     })
                     .collect::<RedisResult<Vec<_>>>()?;
                 Ok(Value::Map(results))
@@ -1006,15 +1019,19 @@ pub(crate) fn get_connection_info(
             host.to_string(),
             port,
             cluster_params.tls,
-            cluster_params.tls_params,
+            cluster_params.tls_params.clone(),
+            cluster_params.address_resolver.as_ref().map(Arc::as_ref),
         ),
         redis: RedisConnectionInfo {
             password: cluster_params.password,
             username: cluster_params.username,
             client_name: cluster_params.client_name,
             lib_name: cluster_params.lib_name,
+            lib_ver: cluster_params.lib_ver,
             protocol: cluster_params.protocol,
             db: cluster_params.database_id,
+            cache: cluster_params.cache,
+            server_assisted_cache: cluster_params.server_assisted_cache,
         },
     })
 }
@@ -1024,21 +1041,29 @@ pub(crate) fn get_connection_addr(
     port: u16,
     tls: Option<TlsMode>,
     tls_params: Option<TlsConnParams>,
+    address_resolver: Option<&dyn AddressResolver>,
 ) -> ConnectionAddr {
+    // Resolve the address if a resolver is provided
+    let (resolved_host, resolved_port) = if let Some(resolver) = address_resolver {
+        resolver.resolve(&host, port)
+    } else {
+        (host, port)
+    };
+
     match tls {
         Some(TlsMode::Secure) => ConnectionAddr::TcpTls {
-            host,
-            port,
+            host: resolved_host,
+            port: resolved_port,
             insecure: false,
             tls_params,
         },
         Some(TlsMode::Insecure) => ConnectionAddr::TcpTls {
-            host,
-            port,
+            host: resolved_host,
+            port: resolved_port,
             insecure: true,
             tls_params,
         },
-        _ => ConnectionAddr::Tcp(host, port),
+        _ => ConnectionAddr::Tcp(resolved_host, resolved_port),
     }
 }
 

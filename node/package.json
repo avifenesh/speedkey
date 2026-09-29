@@ -1,10 +1,10 @@
 {
-    "name": "@glidemq/speedkey",
-    "description": "Valkey/Redis client with direct NAPI bindings based on valkey-glide core",
+    "name": "@valkey/valkey-glide",
+    "description": "General Language Independent Driver for the Enterprise (GLIDE) for Valkey",
     "main": "build-ts/index.js",
     "module": "build-ts/index.js",
     "types": "build-ts/index.d.ts",
-    "version": "0.3.0",
+    "version": "0.0.0",
     "exports": {
         ".": {
             "import": {
@@ -25,14 +25,14 @@
     "type": "commonjs",
     "repository": {
         "type": "git",
-        "url": "git+https://github.com/avifenesh/speedkey.git"
+        "url": "git+https://github.com/valkey-io/valkey-glide.git"
     },
-    "homepage": "https://github.com/avifenesh/speedkey",
+    "homepage": "https://valkey.io/valkey-glide/node/",
     "author": "Valkey GLIDE Maintainers",
     "license": "Apache-2.0",
     "dependencies": {
         "long": "5",
-        "protobufjs": "8"
+        "protobufjs": "^7.6.3"
     },
     "keywords": [
         "valkey",
@@ -56,9 +56,9 @@
         "valkey-glide"
     ],
     "scripts": {
-        "clean:build": "shx rm -rf build-ts dist/*/target rust-client/target rust-client/speedkey.*.node src/speedkey.*.node build/*.tsbuildinfo",
-        "clean": "shx rm -rf build-ts dist/*/target node_modules rust-client/node_modules */node_modules rust-client/target glide-logs rust-client/speedkey.*.node src/speedkey.*.node rust-client/index.* src/ProtobufMessage.* *.tsbuildinfo test-report*.html yarn.lock package-lock.json rust-client/package-lock.json rust-client/Cargo.lock",
-        "prebuild": "npm install && npm run clean:build",
+        "clean:build": "shx rm -rf build-ts dist/*/target rust-client/target rust-client/valkey-glide.*.node src/valkey-glide.*.node build/*.tsbuildinfo",
+        "clean": "shx rm -rf build-ts dist/*/target node_modules rust-client/node_modules */node_modules rust-client/target glide-logs rust-client/valkey-glide.*.node src/valkey-glide.*.node rust-client/index.* src/ProtobufMessage.* *.tsbuildinfo test-report*.html yarn.lock package-lock.json rust-client/package-lock.json rust-client/Cargo.lock",
+        "prebuild": "npm ci && npm run clean:build",
         "build": "npm run build-protobuf && npm run build:rust-client && npm run build:ts",
         "build:release": "npm run prereq && npm run build-protobuf && npm run build:rust-client:release && npm run build:ts",
         "build:benchmark": "npm run prereq && npm run build-protobuf && npm run build:rust-client:benchmark && npm run build:ts",
@@ -76,26 +76,28 @@
         "repl": "ts-node --project tsconfig.json",
         "lint": "npm run install-linting && eslint -c ../eslint.config.mjs && npm run prettier:check",
         "lint:fix": "npm run install-linting && eslint -c ../eslint.config.mjs --fix && npm run prettier:format",
-        "install-linting": "cd .. && npm install",
+        "install-linting": "cd .. && npm ci",
         "prettier:check": "prettier --check . --ignore-unknown \"!**/*.{js,d.ts}\"",
         "prettier:format": "prettier --write . --ignore-unknown \"!**/*.{js,d.ts}\"",
         "staged": "lint-staged",
-        "prereq": "npm install",
+        "prereq": "npm ci",
         "artifacts": "napi artifacts",
+        "prepublishOnly": "cd ../.. && napi prepublish --config npm/glide/package.json -t npm --skip-gh-release",
         "docs": "npm run build && ./docs/build-docs"
     },
     "devDependencies": {
         "@jest/globals": "29",
+        "@napi-rs/cli": "^3.8.3",
         "@types/jest": "29",
         "@types/minimist": "1",
-        "@types/node": "26",
+        "@types/node": "24",
         "@types/semver": "7",
         "@types/uuid": "11",
         "find-free-port": "2",
         "lint-staged": "17",
         "jest": "29",
         "jest-html-reporter": "4",
-        "protobufjs-cli": "2",
+        "protobufjs-cli": "1",
         "replace": "1",
         "semver": "7",
         "shx": "0.4",
@@ -114,6 +116,14 @@
             "prettier --write"
         ]
     },
+    "overrides": {
+        "replace": {
+            "minimatch": "3.1.5"
+        },
+        "markdown-it@<14.2.0": "^14.2.0",
+        "@babel/core@<7.29.6": "^7.29.6",
+        "js-yaml@<4.2.0": "^4.2.0"
+    },
     "publishConfig": {
         "registry": "https://registry.npmjs.org/",
         "access": "public"
@@ -122,15 +132,18 @@
         "node": ">=20"
     },
     "napi": {
-        "binaryName": "speedkey",
-        "targets": [
-            "x86_64-apple-darwin",
-            "aarch64-apple-darwin",
-            "x86_64-unknown-linux-gnu",
-            "aarch64-unknown-linux-gnu",
-            "x86_64-unknown-linux-musl",
-            "aarch64-unknown-linux-musl",
-            "x86_64-pc-windows-msvc"
-        ]
+        "binaryName": "valkey-glide",
+        "triples": {
+            "defaults": false,
+            "additional": [
+                "x86_64-apple-darwin",
+                "aarch64-apple-darwin",
+                "x86_64-unknown-linux-gnu",
+                "aarch64-unknown-linux-gnu",
+                "x86_64-unknown-linux-musl",
+                "aarch64-unknown-linux-musl",
+                "x86_64-pc-windows-msvc"
+            ]
+        }
     }
 }

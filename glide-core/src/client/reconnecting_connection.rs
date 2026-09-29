@@ -3,10 +3,12 @@
 use super::{NodeAddress, TlsMode};
 use async_trait::async_trait;
 use futures_intrusive::sync::ManualResetEvent;
-use logger_core::{log_debug, log_error, log_trace, log_warn};
+use glide_logger::{log_debug, log_error, log_trace, log_warn};
+use glide_telemetry::Telemetry;
 use redis::aio::{DisconnectNotifier, MultiplexedConnection};
 use redis::{
-    GlideConnectionOptions, PushInfo, RedisConnectionInfo, RedisError, RedisResult, RetryStrategy,
+    AddressResolver, GlideConnectionOptions, PushInfo, RedisConnectionInfo, RedisError,
+    RedisResult, RetryStrategy,
 };
 use std::fmt;
 use std::sync::Arc;
@@ -14,7 +16,6 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{RwLock, RwLockReadGuard};
 use std::time::Duration;
-use telemetrylib::Telemetry;
 use tokio::sync::{Notify, mpsc};
 use tokio::task;
 use tokio::time::timeout;
@@ -34,6 +35,84 @@ pub enum ReconnectReason {
     CreateError,
 }
 
+/// Token handle to the IAM token cache for use during reconnection.
+///
+/// Holds shared references to the cached token, its creation timestamp, and the
+/// IAM configuration needed to generate a fresh token on demand. On every
+/// reconnection attempt the handle returns the best available token — refreshing
+/// it via SigV4 signing when the current one has expired — so the AUTH command
+/// always uses valid credentials without requiring a reference back to the full
+/// `IAMTokenManager`.
+#[derive(Clone)]
+pub struct IAMTokenHandle {
+    /// Shared cached IAM token (same `Arc` owned by `IAMTokenManager`).
+    pub(crate) cached_token: Arc<tokio::sync::RwLock<String>>,
+    /// When the cached token was last generated or refreshed.
+    pub(crate) token_created_at: Arc<tokio::sync::RwLock<tokio::time::Instant>>,
+    /// IAM configuration (cluster name, region, etc.) for on-demand token generation.
+    pub(crate) iam_token_state: crate::iam::IamTokenState,
+}
+
+impl IAMTokenHandle {
+    /// Returns the best available token, refreshing it first if expired.
+    ///
+    /// If the token has expired, attempts to generate a fresh one via SigV4.
+    /// On refresh failure, falls back to the existing cached token so that
+    /// the password is always updated on every reconnection attempt.
+    /// Returns `None` only if the cache is completely empty.
+    pub(crate) async fn get_valid_token_inner(&self) -> Option<String> {
+        use crate::iam::TOKEN_TTL_SECONDS;
+
+        let is_expired = {
+            let ts = self.token_created_at.read().await;
+            ts.elapsed() >= std::time::Duration::from_secs(TOKEN_TTL_SECONDS)
+        };
+
+        if is_expired {
+            glide_logger::log_info(
+                "IAM reconnect",
+                "Token expired, generating a fresh token before reconnection",
+            );
+            match crate::iam::IAMTokenManager::generate_token_with_backoff(&self.iam_token_state)
+                .await
+            {
+                Ok(new_token) => {
+                    {
+                        let mut guard = self.cached_token.write().await;
+                        *guard = new_token.clone();
+                    }
+                    {
+                        let mut ts = self.token_created_at.write().await;
+                        *ts = tokio::time::Instant::now();
+                    }
+                    return Some(new_token);
+                }
+                Err(_err) => {
+                    // Do not include err in the log message — it may contain credential
+                    // material from the user's GlideCredentialProvider implementation.
+                    glide_logger::log_error(
+                        "IAM reconnect",
+                        "Failed to generate fresh IAM token. \
+                         Using cached token. Check your GlideCredentialProvider implementation.",
+                    );
+                    // Fall through to return the cached (possibly expired) token
+                }
+            }
+        }
+
+        let guard = self.cached_token.read().await;
+        let token = guard.clone();
+        if token.is_empty() { None } else { Some(token) }
+    }
+}
+
+#[async_trait::async_trait]
+impl redis::IAMTokenProvider for IAMTokenHandle {
+    async fn get_valid_token(&self) -> Option<String> {
+        self.get_valid_token_inner().await
+    }
+}
+
 /// The object that is used in order to recreate a connection after a disconnect.
 struct ConnectionBackend {
     /// This signal is reset when a connection disconnects, and set when a new `ConnectionState` has been set with a `Connected` state.
@@ -42,6 +121,11 @@ struct ConnectionBackend {
     connection_info: RwLock<redis::Client>,
     /// Once this flag is set, the internal connection needs no longer try to reconnect to the server, because all the outer clients were dropped.
     client_dropped_flagged: AtomicBool,
+    /// Optional handle to the IAM token cache for refreshing the password before reconnection.
+    iam_token_handle: Option<IAMTokenHandle>,
+    /// Optional handle to the reloaded mTLS certificate cache for refreshing the
+    /// client TLS params before reconnection.
+    cert_material_handle: Option<crate::tls_reload::CertReloadHandle>,
 }
 
 /// State of the current connection. Allows the user to use a connection only when a reconnect isn't in progress or has failed.
@@ -117,6 +201,10 @@ impl TokioDisconnectNotifier {
     }
 }
 
+// The Err variant is large because it hands the connection back for the caller to retry
+// on. Boxing it would change the error type at every call site.
+// TODO: Box the Err payload and drop this allow - https://github.com/valkey-io/valkey-glide/issues/6819
+#[allow(clippy::result_large_err)]
 async fn create_connection(
     connection_backend: ConnectionBackend,
     retry_strategy: RetryStrategy,
@@ -125,7 +213,7 @@ async fn create_connection(
     connection_timeout: Duration,
     tcp_nodelay: bool,
     pubsub_synchronizer: Option<Arc<dyn crate::pubsub::PubSubSynchronizer>>,
-) -> Result<ReconnectingConnection, (ReconnectingConnection, RedisError)> {
+) -> Result<ReconnectingConnection, Box<(ReconnectingConnection, RedisError)>> {
     let client = {
         let guard = connection_backend
             .connection_info
@@ -144,6 +232,8 @@ async fn create_connection(
         connection_retry_strategy: Some(retry_strategy),
         tcp_nodelay,
         pubsub_synchronizer,
+        iam_token_provider: None,
+        cert_params_provider: None,
     };
 
     // Wrap retry loop in timeout so total time respects connection_timeout
@@ -214,7 +304,7 @@ async fn create_connection(
                 connection_options,
             };
             connection.reconnect(ReconnectReason::CreateError);
-            Err((connection, err))
+            Err(Box::new((connection, err)))
         }
     }
 }
@@ -226,9 +316,15 @@ fn get_client(
     tls_mode: TlsMode,
     redis_connection_info: redis::RedisConnectionInfo,
     tls_params: Option<redis::TlsConnParams>,
+    address_resolver: Option<&std::sync::Arc<dyn super::AddressResolver>>,
 ) -> redis::Client {
-    let connection_info =
-        super::get_connection_info(address, tls_mode, redis_connection_info, tls_params);
+    let connection_info = super::get_connection_info(
+        address,
+        tls_mode,
+        redis_connection_info,
+        tls_params,
+        address_resolver,
+    );
     redis::Client::open(connection_info).unwrap() // can unwrap, because [open] fails only on trying to convert input to ConnectionInfo, and we pass ConnectionInfo.
 }
 
@@ -240,6 +336,10 @@ impl ConnectionBackend {
 }
 
 impl ReconnectingConnection {
+    // Large Err for the same reason as create_connection, and boxing it would change the
+    // error type at every call site.
+    // TODO: Box the Err payload and drop this allow - https://github.com/valkey-io/valkey-glide/issues/6819
+    #[allow(clippy::result_large_err)]
     #[allow(clippy::too_many_arguments)]
     pub(super) async fn new(
         address: &NodeAddress,
@@ -252,17 +352,28 @@ impl ReconnectingConnection {
         tls_params: Option<redis::TlsConnParams>,
         tcp_nodelay: bool,
         pubsub_synchronizer: Option<Arc<dyn crate::pubsub::PubSubSynchronizer>>,
-    ) -> Result<ReconnectingConnection, (ReconnectingConnection, RedisError)> {
+        address_resolver: Option<&std::sync::Arc<dyn AddressResolver>>,
+        iam_token_handle: Option<IAMTokenHandle>,
+        cert_material_handle: Option<crate::tls_reload::CertReloadHandle>,
+    ) -> Result<ReconnectingConnection, Box<(ReconnectingConnection, RedisError)>> {
         log_debug(
             "connection creation",
             format!("Attempting connection to {address}"),
         );
 
-        let connection_info = get_client(address, tls_mode, redis_connection_info, tls_params);
+        let connection_info = get_client(
+            address,
+            tls_mode,
+            redis_connection_info,
+            tls_params,
+            address_resolver,
+        );
         let backend = ConnectionBackend {
             connection_info: RwLock::new(connection_info),
             connection_available_signal: ManualResetEvent::new(true),
             client_dropped_flagged: AtomicBool::new(false),
+            iam_token_handle,
+            cert_material_handle,
         };
         create_connection(
             backend,
@@ -293,31 +404,13 @@ impl ReconnectingConnection {
     }
 
     pub(super) fn mark_as_dropped(&self) {
-        let was_dropped = self
-            .inner
+        // Update the telemetry for each connection that is dropped. A dropped connection
+        // will not be re-connected, so update the telemetry here
+        Telemetry::decr_total_connections(1);
+        self.inner
             .backend
             .client_dropped_flagged
-            .swap(true, Ordering::Relaxed);
-
-        if !was_dropped {
-            // Update the telemetry for each connection that is dropped. A dropped connection
-            // will not be re-connected, so update the telemetry here
-            Telemetry::decr_total_connections(1);
-        }
-    }
-
-    /// Marks the connection as dropped and closes the socket right away.
-    ///
-    /// `mark_as_dropped` alone only stops future reconnects; the socket stays open until the
-    /// last `MultiplexedConnection` clone is gone and every in-flight request has been answered.
-    /// A blocking command in flight therefore keeps a closed client attached to the server.
-    /// Killing the connection makes the server drop the client immediately.
-    pub(super) fn kill(&self) {
-        self.mark_as_dropped();
-        let guard = self.inner.state.lock().unwrap();
-        if let ConnectionState::Connected(connection) = &*guard {
-            connection.kill();
-        }
+            .store(true, Ordering::Relaxed)
     }
 
     pub(super) async fn try_get_connection(&self) -> Option<MultiplexedConnection> {
@@ -342,10 +435,6 @@ impl ReconnectingConnection {
     ///
     /// This function spawns a task to perform the reconnection in the background
     pub(super) fn reconnect(&self, reason: ReconnectReason) {
-        if self.is_dropped() {
-            log_debug("reconnect", "skipped, client was dropped");
-            return;
-        }
         {
             let mut guard = self.inner.state.lock().unwrap();
             if matches!(*guard, ConnectionState::Reconnecting) {
@@ -369,12 +458,26 @@ impl ReconnectingConnection {
         // The reconnect task is spawned instead of awaited here, so that the reconnect attempt will continue in the
         // background, regardless of whether the calling task is dropped or not.
         task::spawn(async move {
-            // Get a clone of the client with the current connection info
-            // updates made via update_connection_database(). This ensures reconnection uses the
-            // correct database as selected by previous SELECT commands.
-            let client = {
-                let guard = connection_clone.inner.backend.get_backend_client();
-                guard.clone()
+            let has_iam = connection_clone.inner.backend.iam_token_handle.is_some();
+            let has_cert_reload = connection_clone
+                .inner
+                .backend
+                .cert_material_handle
+                .is_some();
+
+            // For connections without dynamic credentials, clone the client once
+            // before the loop to preserve the original reconnection behavior
+            // (password/TLS material is fixed at reconnect start). For IAM or
+            // cert-reload connections, the client is cloned inside the loop so each
+            // retry picks up the freshest token / certificate written into the
+            // stored client below.
+            let static_client = if !has_iam && !has_cert_reload {
+                Some({
+                    let guard = connection_clone.inner.backend.get_backend_client();
+                    guard.clone()
+                })
+            } else {
+                None
             };
 
             let infinite_backoff_dur_iterator = connection_clone
@@ -391,6 +494,53 @@ impl ReconnectingConnection {
                     // Client was dropped, reconnection attempts can stop
                     return;
                 }
+
+                // If IAM authentication is configured, ensure the connection uses a
+                // valid token before attempting to reconnect.  If the cached token has
+                // expired, a fresh one is generated on demand via SigV4 signing.
+                if let Some(handle) = &connection_clone.inner.backend.iam_token_handle
+                    && let Some(valid_token) = handle.get_valid_token_inner().await
+                {
+                    let mut client = connection_clone
+                        .inner
+                        .backend
+                        .connection_info
+                        .write()
+                        .expect(WRITE_LOCK_ERR);
+                    client.update_password(Some(valid_token));
+                    log_debug(
+                        "reconnect",
+                        "Updated connection password with valid IAM token before reconnection attempt",
+                    );
+                }
+
+                // If mTLS certificate reload is configured, apply the freshest
+                // (last-known-good) client certificate/key before reconnecting so
+                // a rotated certificate is adopted on the next connection attempt.
+                if let Some(handle) = &connection_clone.inner.backend.cert_material_handle {
+                    let params = handle.current_params().await;
+                    let mut client = connection_clone
+                        .inner
+                        .backend
+                        .connection_info
+                        .write()
+                        .expect(WRITE_LOCK_ERR);
+                    client.update_tls_params(Some(params));
+                    log_debug(
+                        "reconnect",
+                        "Updated connection TLS params with reloaded client certificate before reconnection attempt",
+                    );
+                }
+
+                let client = if let Some(ref c) = static_client {
+                    c.clone()
+                } else {
+                    // IAM / cert-reload path: re-read from backend to pick up the
+                    // token and/or TLS params update applied above.
+                    let guard = connection_clone.inner.backend.get_backend_client();
+                    guard.clone()
+                };
+
                 match get_multiplexed_connection(&client, &connection_clone.connection_options)
                     .await
                 {
@@ -405,17 +555,6 @@ impl ReconnectingConnection {
                         }
                         {
                             let mut guard = connection_clone.inner.state.lock().unwrap();
-                            // kill() may have run while this task was connecting. It found the
-                            // state Reconnecting and had nothing to close, so close the new
-                            // connection here instead of installing it.
-                            if connection_clone.is_dropped() {
-                                log_debug(
-                                    "reconnect",
-                                    "client was dropped during reconnect, closing the new connection",
-                                );
-                                connection.kill();
-                                return;
-                            }
                             log_debug("reconnect", "completed successfully");
                             connection_clone
                                 .inner
@@ -491,6 +630,42 @@ impl ReconnectingConnection {
             .write()
             .expect(WRITE_LOCK_ERR);
         client.update_client_name(new_client_name);
+    }
+
+    /// Updates the username that's saved inside connection_info, that will be used in case of disconnection from the server.
+    ///
+    /// This method is called when an AUTH command is successfully executed with a username to track the current user.
+    /// During reconnection, the stored username will be automatically used for authentication.
+    ///
+    /// # Arguments
+    /// * `new_username` - The username to store for future reconnections (None to clear)
+    ///
+    pub(crate) fn update_connection_username(&self, new_username: Option<String>) {
+        let mut client = self
+            .inner
+            .backend
+            .connection_info
+            .write()
+            .expect(WRITE_LOCK_ERR);
+        client.update_username(new_username);
+    }
+
+    /// Updates the protocol version that's saved inside connection_info, that will be used in case of disconnection from the server.
+    ///
+    /// This method is called when a HELLO command is successfully executed to track the current protocol version.
+    /// During reconnection, the stored protocol version will be automatically used for connection establishment.
+    ///
+    /// # Arguments
+    /// * `new_protocol` - The protocol version to store for future reconnections
+    ///
+    pub(crate) fn update_connection_protocol(&self, new_protocol: redis::ProtocolVersion) {
+        let mut client = self
+            .inner
+            .backend
+            .connection_info
+            .write()
+            .expect(WRITE_LOCK_ERR);
+        client.update_protocol(new_protocol);
     }
 
     /// Returns the username if one was configured during client creation. Otherwise, returns None.

@@ -41,7 +41,7 @@ Other NAPI entry points: `sendBatch`, `invokeScript`, `clusterScan`, `updateConn
 ### Worker Pool Architecture
 
 - A global `LocalPoolHandle` (from `tokio_util`) manages `num_cpus` worker threads
-- Each client is pinned to a single worker thread via `spawn_pinned` for lock-free concurrent execution
+- Each client is pinned to a single worker thread via `spawn_pinned` for thread-local command execution
 - Commands within a client run concurrently via `task::spawn_local` on that thread
 - The pool is reference-counted: created on first client, dropped when last client closes (enables clean Node.js exit)
 
@@ -135,6 +135,22 @@ npm run test:debug -- --testNamePattern="batch"
 # Run server modules tests
 npm run test:modules -- --cluster-endpoints=localhost:7000
 ```
+
+### Testing Connection Establishment (Avoid Count-Based CLIENT LIST Assertions)
+
+Do not assert on `CLIENT LIST` connection _counts_ to detect whether a specific
+client connected (e.g. baseline + 1). Since the socket-IPC-to-NAPI change,
+`close()` only drops the JS handle and the Rust worker exits later, so
+connections from a preceding test can linger in `CLIENT LIST` when the baseline
+is taken and disappear one poll later, producing a net-zero delta and a flaky
+test. Polling until the count "stabilizes" does not fix this: two matching
+readings only prove stability for one poll window.
+
+Instead, identify the client deterministically by a unique `clientName`
+(passed in the client configuration) and assert `CLIENT LIST` excludes that name
+before the first command and includes it afterwards. See the
+`lazy connection establishes only on first command` test in
+`tests/GlideClient.test.ts` and the pattern in `tests/NodeDiscoveryMode.test.ts`.
 
 ## Contribution Requirements
 
@@ -274,7 +290,7 @@ node/
 - **Development Setup:** [DEVELOPER.md](./DEVELOPER.md)
 - **Examples:** [../examples/node/](../examples/node/)
 - **API Documentation:** [Valkey GLIDE Node.js docs](https://valkey.io/valkey-glide/node/)
-- **Wiki:** [NodeJS wrapper wiki](https://github.com/valkey-io/valkey-glide/wiki/NodeJS-wrapper)
+- **Documentation:** [GLIDE Docs](https://glide.valkey.io/)
 - **Test Suites:** [tests/](./tests/) directory
 - **Package Manager Tests:** [pm-and-types-tests/](./pm-and-types-tests/)
 - **Rust Client:** [rust-client/](./rust-client/) directory

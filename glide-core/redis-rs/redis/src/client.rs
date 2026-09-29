@@ -7,7 +7,7 @@ use crate::{
     connection::{connect, Connection, ConnectionInfo, ConnectionLike, IntoConnectionInfo},
     push_manager::PushInfo,
     retry_strategies::RetryStrategy,
-    types::{RedisResult, Value},
+    types::{ProtocolVersion, RedisResult, Value},
 };
 #[cfg(feature = "aio")]
 use std::net::IpAddr;
@@ -88,7 +88,7 @@ pub struct GlideConnectionOptions {
     #[cfg(feature = "aio")]
     /// Passive disconnect notifier
     pub disconnect_notifier: Option<Box<dyn DisconnectNotifier>>,
-    /// If ReadFromReplica strategy is set to AZAffinity or AZAffinityReplicasAndPrimary, this parameter will be set to 'true'.
+    /// If ReadFromReplica strategy is set to AZAffinity, AZAffinityReplicasAndPrimary, or AZAffinityAllNodes, this parameter will be set to 'true'.
     /// In this case, an INFO command will be triggered in the connection's setup to update the connection's 'availability_zone' property.
     pub discover_az: bool,
     /// Connection timeout duration.
@@ -103,6 +103,35 @@ pub struct GlideConnectionOptions {
     pub tcp_nodelay: bool,
     /// Optional PubSub synchronizer for managing subscription state
     pub pubsub_synchronizer: Option<Arc<dyn PubSubSynchronizer>>,
+    /// Optional async callback that returns a valid IAM token for authentication.
+    /// When set, the cluster reconnection loop will invoke this callback before each
+    /// connection attempt to ensure the password uses fresh credentials.
+    /// The callback should return `Some(token)` if a valid token is available,
+    /// or `None` if token retrieval failed.
+    pub iam_token_provider: Option<Arc<dyn IAMTokenProvider>>,
+    /// Optional async callback that returns the freshest reloaded mTLS client
+    /// certificate/key parameters. When set, the cluster reconnection loop invokes
+    /// it before each connection attempt so that rotated certificates are picked up
+    /// on reconnect. Returns `None` if no reloaded material is available.
+    pub cert_params_provider: Option<Arc<dyn CertParamsProvider>>,
+}
+
+/// Trait for providing IAM tokens to the reconnection path.
+/// Implemented by the IAM token handle in glide-core.
+#[async_trait::async_trait]
+pub trait IAMTokenProvider: Send + Sync {
+    /// Returns a valid token, refreshing it if expired.
+    async fn get_valid_token(&self) -> Option<String>;
+}
+
+/// Trait for providing the freshest reloaded mTLS client certificate/key
+/// parameters to the reconnection path. Implemented by the certificate-material
+/// handle in glide-core.
+#[async_trait::async_trait]
+pub trait CertParamsProvider: Send + Sync {
+    /// Returns the current (last-known-good) TLS connection parameters, or `None`
+    /// if no reloaded material is available.
+    async fn current_tls_params(&self) -> Option<crate::tls::TlsConnParams>;
 }
 
 /// To enable async support you need to enable the feature: `tokio-comp`
@@ -486,7 +515,7 @@ impl Client {
     ///
     /// # Examples
     ///
-    /// ```no_run
+    /// ```rust,no_run
     /// use std::{fs::File, io::{BufReader, Read}};
     ///
     /// use redis::{Client, AsyncCommands as _, TlsCertificates, ClientTlsConfig};
@@ -584,6 +613,30 @@ impl Client {
         self.connection_info.redis.password = password;
     }
 
+    /// Updates the TLS connection parameters in connection_info.
+    ///
+    /// The parameters live inside the [`ConnectionAddr::TcpTls`] variant, so this
+    /// rewrites that variant's `tls_params` field, preserving host, port, and the
+    /// `insecure` flag. It is a no-op for non-TLS addresses. The updated params are
+    /// picked up on the next connection attempt (reconnect), since the custom-cert
+    /// path rebuilds the rustls config from `tls_params` on every connect.
+    pub fn update_tls_params(&mut self, tls_params: Option<crate::tls::TlsConnParams>) {
+        if let crate::ConnectionAddr::TcpTls {
+            host,
+            port,
+            insecure,
+            ..
+        } = &self.connection_info.addr
+        {
+            self.connection_info.addr = crate::ConnectionAddr::TcpTls {
+                host: host.clone(),
+                port: *port,
+                insecure: *insecure,
+                tls_params,
+            };
+        }
+    }
+
     /// Updates the database ID in connection_info.
     ///
     /// This method updates the database field in the connection information,
@@ -601,6 +654,34 @@ impl Client {
     /// Updates the client_name in connection_info.
     pub fn update_client_name(&mut self, client_name: Option<String>) {
         self.connection_info.redis.client_name = client_name;
+    }
+
+    /// Updates the username in connection_info.
+    ///
+    /// This method updates the username field in the connection information,
+    /// which will be used for subsequent connections and reconnections.
+    /// Typically updated when AUTH command is used with a username.
+    ///
+    /// # Arguments
+    ///
+    /// * `username` - The username to use for authentication (None to clear)
+    ///
+    pub fn update_username(&mut self, username: Option<String>) {
+        self.connection_info.redis.username = username;
+    }
+
+    /// Updates the protocol version in connection_info.
+    ///
+    /// This method updates the protocol field in the connection information,
+    /// which will be used for subsequent connections and reconnections.
+    /// Typically updated when HELLO command is used to change protocol version.
+    ///
+    /// # Arguments
+    ///
+    /// * `protocol` - The protocol version to use (RESP2 or RESP3)
+    ///
+    pub fn update_protocol(&mut self, protocol: ProtocolVersion) {
+        self.connection_info.redis.protocol = protocol;
     }
 }
 
@@ -665,5 +746,55 @@ mod test {
 
         // Verify database was updated
         assert_eq!(client.connection_info.redis.db, 1);
+    }
+
+    #[test]
+    fn test_update_tls_params_preserves_host_port_insecure() {
+        // A rediss:// URL yields a TcpTls address with no tls_params initially.
+        let mut client = Client::open("rediss://127.0.0.1:6380/0#insecure").unwrap();
+
+        match &client.connection_info.addr {
+            crate::ConnectionAddr::TcpTls {
+                host,
+                port,
+                insecure,
+                tls_params,
+            } => {
+                assert_eq!(host, "127.0.0.1");
+                assert_eq!(*port, 6380);
+                assert!(*insecure);
+                assert!(tls_params.is_none());
+            }
+            other => panic!("expected TcpTls, got {other:?}"),
+        }
+
+        // Swapping params rewrites only the tls_params field. We can't easily build
+        // a real TlsConnParams here without cert material, so verify the None->None
+        // path is a structural no-op that preserves host/port/insecure.
+        client.update_tls_params(None);
+        match &client.connection_info.addr {
+            crate::ConnectionAddr::TcpTls {
+                host,
+                port,
+                insecure,
+                tls_params,
+            } => {
+                assert_eq!(host, "127.0.0.1");
+                assert_eq!(*port, 6380);
+                assert!(*insecure);
+                assert!(tls_params.is_none());
+            }
+            other => panic!("expected TcpTls, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_update_tls_params_noop_on_non_tls_addr() {
+        // For a non-TLS address, update_tls_params must be a no-op (address unchanged).
+        let mut client = Client::open("redis://127.0.0.1:6379/0").unwrap();
+        let before = format!("{:?}", client.connection_info.addr);
+        client.update_tls_params(None);
+        let after = format!("{:?}", client.connection_info.addr);
+        assert_eq!(before, after);
     }
 }
