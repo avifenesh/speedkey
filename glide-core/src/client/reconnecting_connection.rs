@@ -293,13 +293,31 @@ impl ReconnectingConnection {
     }
 
     pub(super) fn mark_as_dropped(&self) {
-        // Update the telemetry for each connection that is dropped. A dropped connection
-        // will not be re-connected, so update the telemetry here
-        Telemetry::decr_total_connections(1);
-        self.inner
+        let was_dropped = self
+            .inner
             .backend
             .client_dropped_flagged
-            .store(true, Ordering::Relaxed)
+            .swap(true, Ordering::Relaxed);
+
+        if !was_dropped {
+            // Update the telemetry for each connection that is dropped. A dropped connection
+            // will not be re-connected, so update the telemetry here
+            Telemetry::decr_total_connections(1);
+        }
+    }
+
+    /// Marks the connection as dropped and closes the socket right away.
+    ///
+    /// `mark_as_dropped` alone only stops future reconnects; the socket stays open until the
+    /// last `MultiplexedConnection` clone is gone and every in-flight request has been answered.
+    /// A blocking command in flight therefore keeps a closed client attached to the server.
+    /// Killing the connection makes the server drop the client immediately.
+    pub(super) fn kill(&self) {
+        self.mark_as_dropped();
+        let guard = self.inner.state.lock().unwrap();
+        if let ConnectionState::Connected(connection) = &*guard {
+            connection.kill();
+        }
     }
 
     pub(super) async fn try_get_connection(&self) -> Option<MultiplexedConnection> {
@@ -324,6 +342,10 @@ impl ReconnectingConnection {
     ///
     /// This function spawns a task to perform the reconnection in the background
     pub(super) fn reconnect(&self, reason: ReconnectReason) {
+        if self.is_dropped() {
+            log_debug("reconnect", "skipped, client was dropped");
+            return;
+        }
         {
             let mut guard = self.inner.state.lock().unwrap();
             if matches!(*guard, ConnectionState::Reconnecting) {

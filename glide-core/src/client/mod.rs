@@ -593,6 +593,21 @@ impl Client {
         Ok(guard.clone()) // ✅ Return clone of the now-initialized wrapper
     }
 
+    /// Closes the underlying connections immediately.
+    ///
+    /// Unlike dropping the client, this does not wait for in-flight requests: a blocking
+    /// command (`XREADGROUP ... BLOCK`, `BLPOP`, ...) is cut off and the server discards it.
+    /// Pending requests fail with a connection error. The client must not be used afterwards.
+    ///
+    /// Cluster connections are not torn down here; they close once every clone is dropped
+    /// and the in-flight requests have been answered.
+    pub async fn kill(&self) {
+        let guard = self.internal_client.read().await;
+        if let ClientWrapper::Standalone(client) = &*guard {
+            client.kill();
+        }
+    }
+
     /// Send a command to the server.
     /// This function will route the command to the correct node, and retry if needed.
     pub fn send_command<'a>(
