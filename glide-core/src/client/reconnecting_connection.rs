@@ -405,6 +405,17 @@ impl ReconnectingConnection {
                         }
                         {
                             let mut guard = connection_clone.inner.state.lock().unwrap();
+                            // kill() may have run while this task was connecting. It found the
+                            // state Reconnecting and had nothing to close, so close the new
+                            // connection here instead of installing it.
+                            if connection_clone.is_dropped() {
+                                log_debug(
+                                    "reconnect",
+                                    "client was dropped during reconnect, closing the new connection",
+                                );
+                                connection.kill();
+                                return;
+                            }
                             log_debug("reconnect", "completed successfully");
                             connection_clone
                                 .inner
