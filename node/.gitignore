@@ -82,6 +82,7 @@ dist/
 .yarn/install-state.gz
 .pnp.*
 *glide*.node
+speedkey.*.node
 build-ts/**
 yarn.lock
 
