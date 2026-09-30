@@ -1090,15 +1090,17 @@ impl Client {
     /// command (`XREADGROUP ... BLOCK`, `BLPOP`, ...) is cut off and the server discards it.
     /// Pending requests fail with a connection error. The client must not be used afterwards.
     ///
-    /// Cluster connections are not torn down here; they close once every clone is dropped
-    /// and the in-flight requests have been answered.
+    /// For a cluster client this closes every node connection (user and management) and
+    /// stops the request loop and reconnect tasks; see `ClusterConnection::kill`.
     pub async fn kill(&self) {
         // Set first: a lazy client that has not connected yet checks this flag under the
         // write lock in get_or_initialize_client and refuses to connect.
         self.killed.store(true, Ordering::Release);
         let guard = self.internal_client.read().await;
-        if let ClientWrapper::Standalone(client) = &*guard {
-            client.kill();
+        match &*guard {
+            ClientWrapper::Standalone(client) => client.kill(),
+            ClientWrapper::Cluster { client, .. } => client.kill(),
+            ClientWrapper::Lazy(_) => {}
         }
     }
 
