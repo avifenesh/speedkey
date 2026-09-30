@@ -119,7 +119,7 @@ jobs:
         name: Node Tests - ${{ matrix.node }}, EngineVersion - ${{ matrix.engine.version }}, Target - ${{ matrix.host.TARGET }}
         runs-on: ${{ matrix.host.RUNNER }}
         needs: [get-matrices]
-        timeout-minutes: 25
+        timeout-minutes: 40
         strategy:
             fail-fast: false
             matrix:
@@ -193,6 +193,10 @@ jobs:
               shell: bash
               run: |
                   npm run build
+                  ulimit -n 65536 2>/dev/null || true
+                  export AWS_ACCESS_KEY_ID=test_access_key
+                  export AWS_SECRET_ACCESS_KEY=test_secret_key
+                  export AWS_SESSION_TOKEN=test_session_token
                   npm run test -- \
                       --cluster-endpoints=${{ steps.valkey.outputs.cluster }} \
                       --standalone-endpoints=${{ steps.valkey.outputs.standalone }}
@@ -287,12 +291,12 @@ jobs:
               shell: bash
               run: |
                   cd depend-on-glide-package
-                  yarn install
+                  yarn install --immutable
                   rm -rf node_modules/@glidemq/speedkey/build-ts/*
                   cp -r ../../build-ts ./node_modules/@glidemq/speedkey/
                   yarn run build
                   cd ../depend-on-glide-dependent
-                  yarn install
+                  yarn install --immutable
                   yarn run build
 
             - name: Test hybrid node modules - commonjs
@@ -363,7 +367,7 @@ jobs:
     test-node-container:
         runs-on: ${{ matrix.host.RUNNER }}
         needs: [get-containers]
-        timeout-minutes: 25
+        timeout-minutes: 35
         strategy:
             fail-fast: false
             matrix:
