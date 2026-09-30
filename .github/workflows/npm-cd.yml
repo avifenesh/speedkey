@@ -540,6 +540,7 @@ jobs:
               shell: bash
               working-directory: ./node
               env:
+                  NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
                   VERSION: ${{ needs.get-build-parameters.outputs.release_version }}
                   NPM_TAG: ${{ needs.get-build-parameters.outputs.npm_tag }}
               run: |
