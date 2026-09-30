@@ -1069,7 +1069,7 @@ dependencies = [
  "itoa",
  "lazy_static",
  "lru",
- "num-bigint",
+ "num-bigint 0.4.8",
  "parking_lot",
  "percent-encoding",
  "pin-project-lite",
@@ -1716,9 +1716,9 @@ dependencies = [
 
 [[package]]
 name = "napi"
-version = "3.12.4"
+version = "3.13.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3d2c1d080c842ec1347ebf3cfb9347c15f8c2262f143cc30eea41ddf1c7da720"
+checksum = "3b12638855cec016784a7e17cc4ecbdee7ca8b0a3456aa50640d0ee5ed1a42f8"
 dependencies = [
  "bitflags",
  "ctor",
@@ -1732,15 +1732,15 @@ dependencies = [
 
 [[package]]
 name = "napi-build"
-version = "2.4.4"
+version = "2.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9befcb51d87271051c0c11aaf625d09340266b7f1ac3fef5975e62274dc2813f"
+checksum = "0941983559cd62bfa7f04646a16428967a847365adeef27711e4e3927046bbed"
 
 [[package]]
 name = "napi-derive"
-version = "3.6.5"
+version = "3.6.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "350057056a30368aa76c11a0d406b0aa61321710be2c36656ab4f6efe0b785a2"
+checksum = "6b1d232c24dc6754979b27efdf2047a5849efc7c92c1245de87e6bedbb9f5c3c"
 dependencies = [
  "convert_case",
  "ctor",
@@ -1798,9 +1798,19 @@ dependencies = [
 
 [[package]]
 name = "num-bigint"
-version = "0.4.6"
+version = "0.4.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a5e44f723f1133c9deac646763579fdb3ac745e418f2a7af9cd0c431da1f20b9"
+checksum = "c89e69e7e0f03bea5ef08013795c25018e101932225a656383bd384495ecc367"
+dependencies = [
+ "num-integer",
+ "num-traits",
+]
+
+[[package]]
+name = "num-bigint"
+version = "0.5.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "93e7820bc0a80a0238e650327316f929ba18d5be054b647490a3a6a339f3e7c0"
 dependencies = [
  "num-integer",
  "num-traits",
@@ -2660,6 +2670,32 @@ dependencies = [
 ]
 
 [[package]]
+name = "speedkey"
+version = "0.1.0"
+dependencies = [
+ "byteorder",
+ "bytes",
+ "dashmap",
+ "glide-core",
+ "glide-core-engine",
+ "glide-logger",
+ "glide-telemetry",
+ "napi",
+ "napi-build",
+ "napi-derive",
+ "num-bigint 0.5.1",
+ "num-traits",
+ "num_cpus",
+ "parking_lot",
+ "protobuf",
+ "tikv-jemallocator",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "stable_deref_trait"
 version = "1.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3177,32 +3213,6 @@ dependencies = [
  "js-sys",
  "rand 0.10.1",
  "wasm-bindgen",
-]
-
-[[package]]
-name = "speedkey"
-version = "0.1.0"
-dependencies = [
- "byteorder",
- "bytes",
- "dashmap",
- "glide-core",
- "glide-core-engine",
- "glide-logger",
- "glide-telemetry",
- "napi",
- "napi-build",
- "napi-derive",
- "num-bigint",
- "num-traits",
- "num_cpus",
- "parking_lot",
- "protobuf",
- "tikv-jemallocator",
- "tokio",
- "tokio-util",
- "tracing",
- "uuid",
 ]
 
 [[package]]
