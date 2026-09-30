@@ -75,7 +75,7 @@ glide-core = { path = ".", features = ["socket-layer", "test-util"] }
 
 # External dependencies
 criterion = { version = "^0.8", features = ["html_reports", "async_tokio"] }
-ctor = "0.10"
+ctor = "1.0"
 gungraun = "0.19"
 rsevents = "0.3.1"
 rstest = "^0.27"
