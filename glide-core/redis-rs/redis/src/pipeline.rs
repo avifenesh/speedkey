@@ -1,6 +1,6 @@
 #![macro_use]
 
-use telemetrylib::GlideSpan;
+use glide_telemetry::GlideSpan;
 
 use crate::cmd::{cmd, cmd_len, Cmd};
 use crate::connection::ConnectionLike;
@@ -87,6 +87,11 @@ impl Pipeline {
         self
     }
 
+    /// Returns a slice of the pipeline's commands.
+    pub fn commands(&self) -> &[Arc<Cmd>] {
+        &self.commands
+    }
+
     /// Returns the encoded pipeline commands.
     pub fn get_packed_pipeline(&self) -> Vec<u8> {
         encode_pipeline(&self.commands, self.transaction_mode)
@@ -95,6 +100,27 @@ impl Pipeline {
     #[cfg(feature = "aio")]
     pub(crate) fn write_packed_pipeline(&self, out: &mut Vec<u8>) {
         write_pipeline(out, &self.commands, self.transaction_mode)
+    }
+
+    /// Returns the encoded pipeline as segments for vectored writes.
+    /// Byte-identical on the wire to [`Pipeline::get_packed_pipeline`], with
+    /// large shared payloads as their own zero-copy segments.
+    pub fn get_packed_pipeline_segments(&self) -> crate::cmd::SegmentedBytes {
+        let mut out = crate::cmd::SegmentedBytes::default();
+        let mut scratch = Vec::new();
+        if self.transaction_mode {
+            cmd("MULTI").write_packed_segments(&mut out, &mut scratch);
+            for command in &self.commands {
+                command.write_packed_segments(&mut out, &mut scratch);
+            }
+            cmd("EXEC").write_packed_segments(&mut out, &mut scratch);
+        } else {
+            for command in &self.commands {
+                command.write_packed_segments(&mut out, &mut scratch);
+            }
+        }
+        out.push(bytes::Bytes::from_owner(scratch));
+        out
     }
 
     fn execute_pipelined(&self, con: &mut dyn ConnectionLike) -> RedisResult<Value> {
@@ -303,6 +329,14 @@ macro_rules! implement_pipeline_commands {
             /// Returns an iterator over all the commands currently in the pipeline.
             pub fn cmd_iter(&self) -> impl Iterator<Item = &Arc<Cmd>> {
                 self.commands.iter()
+            }
+
+            // TODO #7024: Revisit this. Is it needed?
+            /// The indices of commands whose replies are ignored (`.ignore()`).
+            /// Exposed so a downstream runner can reproduce the reply filtering
+            /// that `make_pipeline_results` performs.
+            pub fn ignored_commands(&self) -> &std::collections::HashSet<usize> {
+                &self.ignored_commands
             }
 
             /// Instructs the pipeline to ignore the return value of this command.

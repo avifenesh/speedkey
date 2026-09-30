@@ -1,19 +1,20 @@
 // Copyright Valkey GLIDE Project Contributors - SPDX Identifier: Apache-2.0
 
+mod constants;
 mod utilities;
 
 #[cfg(test)]
 mod standalone_client_tests {
-    use crate::utilities::mocks::{Mock, ServerMock};
-    use std::collections::HashMap;
-
     use super::*;
+    use crate::constants::{IP_ADDRESS_V4, IP_ADDRESS_V6};
+    use crate::utilities::mocks::{Mock, ServerMock, SetInfoResponse};
     use glide_core::{
         client::{Client as GlideClient, ConnectionError, StandaloneClient},
         connection_request::{ProtocolVersion, ReadFrom},
     };
     use redis::{FromRedisValue, Value};
     use rstest::rstest;
+    use std::collections::HashMap;
     use utilities::*;
 
     async fn get_connected_clients(client: &mut StandaloneClient) -> usize {
@@ -43,7 +44,7 @@ mod standalone_client_tests {
     fn test_detect_disconnect_and_reconnect_using_heartbeat(#[values(false, true)] use_tls: bool) {
         let (sender, receiver) = tokio::sync::oneshot::channel();
         block_on_all(async move {
-            let mut test_basics = setup_test_basics(use_tls).await;
+            let mut test_basics = setup_test_basics_tls(use_tls).await;
             let server = test_basics.server.expect("Server shouldn't be None");
             let address = server.get_client_addr();
             drop(server);
@@ -120,13 +121,7 @@ mod standalone_client_tests {
 
             assert!(info_clients.contains("connected_clients:2"));
 
-            // validate connection works
-            let ping_result = validation_client
-                .client
-                .send_command(&redis::cmd("PING"))
-                .await
-                .ok();
-            assert_eq!(ping_result, Some(Value::SimpleString("PONG".to_string())));
+            assert_connected(&mut validation_client.client).await;
         });
     }
 
@@ -138,19 +133,19 @@ mod standalone_client_tests {
         let mut primary_responses = std::collections::HashMap::new();
         primary_responses.insert(
             "*1\r\n$4\r\nPING\r\n".to_string(),
-            Value::BulkString(b"PONG".to_vec()),
+            Value::BulkString(b"PONG".to_vec().into()),
         );
         primary_responses.insert(
             "*2\r\n$4\r\nINFO\r\n$11\r\nREPLICATION\r\n".to_string(),
-            Value::BulkString(b"role:master\r\nconnected_slaves:3\r\n".to_vec()),
+            Value::BulkString(b"role:master\r\nconnected_slaves:3\r\n".to_vec().into()),
         );
         primary_responses.insert(
             "*2\r\n$5\r\nHELLO\r\n$1\r\n3\r\n".to_string(),
             Value::Map(vec![
-                (Value::BulkString(b"proto".to_vec()), Value::Int(3)),
+                (Value::BulkString(b"proto".to_vec().into()), Value::Int(3)),
                 (
-                    Value::BulkString(b"role".to_vec()),
-                    Value::BulkString(b"master".to_vec()),
+                    Value::BulkString(b"role".to_vec().into()),
+                    Value::BulkString(b"master".to_vec().into()),
                 ),
             ]),
         );
@@ -161,19 +156,19 @@ mod standalone_client_tests {
         let mut replica_responses = std::collections::HashMap::new();
         replica_responses.insert(
             "*1\r\n$4\r\nPING\r\n".to_string(),
-            Value::BulkString(b"PONG".to_vec()),
+            Value::BulkString(b"PONG".to_vec().into()),
         );
         replica_responses.insert(
             "*2\r\n$4\r\nINFO\r\n$11\r\nREPLICATION\r\n".to_string(),
-            Value::BulkString(b"role:slave\r\n".to_vec()),
+            Value::BulkString(b"role:slave\r\n".to_vec().into()),
         );
         replica_responses.insert(
             "*2\r\n$5\r\nHELLO\r\n$1\r\n3\r\n".to_string(),
             Value::Map(vec![
-                (Value::BulkString(b"proto".to_vec()), Value::Int(3)),
+                (Value::BulkString(b"proto".to_vec().into()), Value::Int(3)),
                 (
-                    Value::BulkString(b"role".to_vec()),
-                    Value::BulkString(b"replica".to_vec()),
+                    Value::BulkString(b"role".to_vec().into()),
+                    Value::BulkString(b"replica".to_vec().into()),
                 ),
             ]),
         );
@@ -191,19 +186,46 @@ mod standalone_client_tests {
         vec![primary_1, primary_2, replica]
     }
 
+    fn create_response_with_az(base: HashMap<String, Value>, az: &str) -> HashMap<String, Value> {
+        let mut responses = base;
+        responses.insert(
+            "*1\r\n$4\r\nINFO\r\n".to_string(),
+            Value::BulkString(format!("availability_zone:{az}\r\n").into_bytes().into()),
+        );
+        responses
+    }
+
     fn create_primary_mock_with_replicas(replica_count: usize) -> Vec<ServerMock> {
+        create_primary_mock_with_replicas_az(replica_count, None, &[])
+    }
+
+    /// Creates a primary and `replica_count` replica mock servers.
+    /// Returns `[primary, replica_0, replica_1, ...]`.
+    /// When `primary_az` is set, the primary's INFO response includes that AZ.
+    /// `replica_azs` maps each replica index to an AZ; replicas without an entry get no AZ.
+    fn create_primary_mock_with_replicas_az(
+        replica_count: usize,
+        primary_az: Option<&str>,
+        replica_azs: &[&str],
+    ) -> Vec<ServerMock> {
         let mut listeners: Vec<std::net::TcpListener> = (0..replica_count + 1)
             .map(|_| get_listener_on_available_port())
             .collect();
-        let primary =
-            ServerMock::new_with_listener(create_primary_responses(), listeners.pop().unwrap());
+
+        let primary_responses = match primary_az {
+            Some(az) => create_response_with_az(create_primary_responses(), az),
+            None => create_primary_responses(),
+        };
+        let primary = ServerMock::new_with_listener(primary_responses, listeners.pop().unwrap());
         let mut mocks = vec![primary];
 
-        mocks.extend(
-            listeners
-                .into_iter()
-                .map(|listener| ServerMock::new_with_listener(create_replica_response(), listener)),
-        );
+        for (i, listener) in listeners.into_iter().enumerate() {
+            let responses = match replica_azs.get(i) {
+                Some(az) => create_response_with_az(create_replica_response(), az),
+                None => create_replica_response(),
+            };
+            mocks.push(ServerMock::new_with_listener(responses, listener));
+        }
         mocks
     }
 
@@ -215,6 +237,9 @@ mod standalone_client_tests {
         number_of_missing_replicas: usize,
         number_of_replicas_dropped_after_connection: usize,
         number_of_requests_sent: usize,
+        client_az: Option<String>,
+        primary_az: Option<String>,
+        replica_azs: Vec<String>,
     }
 
     impl Default for ReadFromReplicaTestConfig {
@@ -227,19 +252,25 @@ mod standalone_client_tests {
                 number_of_missing_replicas: 0,
                 number_of_replicas_dropped_after_connection: 0,
                 number_of_requests_sent: 3,
+                client_az: None,
+                primary_az: None,
+                replica_azs: vec![],
             }
         }
     }
 
     fn test_read_from_replica(config: ReadFromReplicaTestConfig) {
-        let mut servers = create_primary_mock_with_replicas(
+        let replica_az_refs: Vec<&str> = config.replica_azs.iter().map(|s| s.as_str()).collect();
+        let mut servers = create_primary_mock_with_replicas_az(
             config.number_of_initial_replicas - config.number_of_missing_replicas,
+            config.primary_az.as_deref(),
+            &replica_az_refs,
         );
         let mut cmd = redis::cmd("GET");
         cmd.arg("foo");
 
         for server in servers.iter() {
-            for _ in 0..3 {
+            for _ in 0..config.number_of_requests_sent {
                 server.add_response(&cmd, "$-1\r\n".to_string());
             }
         }
@@ -254,13 +285,16 @@ mod standalone_client_tests {
         let mut connection_request =
             create_connection_request(addresses.as_slice(), &Default::default());
         connection_request.read_from = config.read_from.into();
+        if let Some(ref az) = config.client_az {
+            connection_request.client_az = az.clone().into();
+        }
 
         block_on_all(async {
             let mut client =
                 StandaloneClient::create_client(connection_request.into(), None, None, None)
                     .await
                     .unwrap();
-            logger_core::log_info(
+            glide_logger::log_info(
                 "Test",
                 format!(
                     "Closing {} servers after connection established",
@@ -270,7 +304,7 @@ mod standalone_client_tests {
             for server in servers.drain(1..config.number_of_replicas_dropped_after_connection + 1) {
                 server.close().await;
             }
-            logger_core::log_info(
+            glide_logger::log_info(
                 "Test",
                 format!("sending {} messages", config.number_of_requests_sent),
             );
@@ -281,17 +315,27 @@ mod standalone_client_tests {
             }
         });
 
+        let primary_reads = servers[0].get_number_of_received_commands();
         assert_eq!(
-            servers[0].get_number_of_received_commands(),
-            config.expected_primary_reads
+            primary_reads, config.expected_primary_reads,
+            "Primary reads: expected {}, got {}",
+            config.expected_primary_reads, primary_reads
         );
+
         let mut replica_reads: Vec<_> = servers
             .iter()
             .skip(1)
             .map(|mock| mock.get_number_of_received_commands())
             .collect();
+
         replica_reads.sort();
-        assert!(config.expected_replica_reads <= replica_reads);
+
+        assert!(
+            config.expected_replica_reads <= replica_reads,
+            "Replica reads: expected {:?}, got {:?}",
+            config.expected_replica_reads,
+            replica_reads
+        );
     }
 
     #[rstest]
@@ -313,7 +357,7 @@ mod standalone_client_tests {
         });
     }
 
-    // TODO - Current test falls back to PreferReplica when run, need to integrate the az here also
+    // At least one replica matches client AZ.
     #[rstest]
     #[serial_test::serial]
     #[timeout(SHORT_STANDALONE_TEST_TIMEOUT)]
@@ -321,19 +365,261 @@ mod standalone_client_tests {
         test_read_from_replica(ReadFromReplicaTestConfig {
             read_from: ReadFrom::AZAffinity,
             expected_primary_reads: 0,
-            expected_replica_reads: vec![1, 1, 1],
+            expected_replica_reads: vec![0, 0, 3],
+            client_az: Some("us-east-1a".to_string()),
+            primary_az: Some("us-east-1b".to_string()),
+            replica_azs: vec![
+                "us-east-1a".to_string(),
+                "us-east-1b".to_string(),
+                "us-east-1b".to_string(),
+            ],
             ..Default::default()
         });
     }
-    // TODO - Needs changes in the struct and the create_primary_mock
+
+    // AZAffinity: no replica matches client AZ, falls back to round-robin across replicas
     #[rstest]
     #[serial_test::serial]
     #[timeout(SHORT_STANDALONE_TEST_TIMEOUT)]
-    fn test_read_from_replica_az_affinity_replicas_and_primary() {
+    fn test_read_from_replica_az_affinity_primary_az_match() {
+        test_read_from_replica(ReadFromReplicaTestConfig {
+            read_from: ReadFrom::AZAffinity,
+            expected_primary_reads: 0,
+            expected_replica_reads: vec![1, 1, 1],
+            client_az: Some("us-east-1a".to_string()),
+            primary_az: Some("us-east-1a".to_string()),
+            replica_azs: vec![
+                "us-east-1c".to_string(),
+                "us-east-1c".to_string(),
+                "us-east-1c".to_string(),
+            ],
+            ..Default::default()
+        });
+    }
+
+    #[rstest]
+    #[serial_test::serial]
+    #[timeout(SHORT_STANDALONE_TEST_TIMEOUT)]
+    fn test_read_from_replica_az_affinity_no_az_match() {
+        test_read_from_replica(ReadFromReplicaTestConfig {
+            read_from: ReadFrom::AZAffinity,
+            expected_primary_reads: 0,
+            expected_replica_reads: vec![1, 1, 1],
+            client_az: Some("us-east-1a".to_string()),
+            primary_az: Some("us-east-1c".to_string()),
+            replica_azs: vec![
+                "us-east-1c".to_string(),
+                "us-east-1c".to_string(),
+                "us-east-1c".to_string(),
+            ],
+            ..Default::default()
+        });
+    }
+
+    // AZAffinity: client reads from local replicas first. Fallback to other replicas or primary.
+    #[rstest]
+    #[serial_test::serial]
+    #[timeout(SHORT_STANDALONE_TEST_TIMEOUT)]
+    fn test_read_from_replica_az_affinity_all_az_match() {
+        test_read_from_replica(ReadFromReplicaTestConfig {
+            read_from: ReadFrom::AZAffinity,
+            number_of_requests_sent: 4,
+            expected_primary_reads: 0,
+            expected_replica_reads: vec![1, 1, 2],
+            client_az: Some("us-east-1a".to_string()),
+            primary_az: Some("us-east-1a".to_string()),
+            replica_azs: vec![
+                "us-east-1a".to_string(),
+                "us-east-1a".to_string(),
+                "us-east-1a".to_string(),
+            ],
+            ..Default::default()
+        });
+    }
+
+    // AZAffinityReplicasAndPrimary: same-AZ replica preferred over primary
+    #[rstest]
+    #[serial_test::serial]
+    #[timeout(SHORT_STANDALONE_TEST_TIMEOUT)]
+    fn test_read_from_replica_az_affinity_replicas_and_primary_az_match_replica() {
+        test_read_from_replica(ReadFromReplicaTestConfig {
+            read_from: ReadFrom::AZAffinityReplicasAndPrimary,
+            number_of_requests_sent: 4,
+            expected_primary_reads: 0,
+            expected_replica_reads: vec![1, 1, 2],
+            client_az: Some("us-east-1a".to_string()),
+            primary_az: Some("us-east-1b".to_string()),
+            replica_azs: vec![
+                "us-east-1a".to_string(),
+                "us-east-1a".to_string(),
+                "us-east-1a".to_string(),
+            ],
+            ..Default::default()
+        });
+    }
+
+    // AZAffinityReplicasAndPrimary: same-AZ replica preferred over primary
+    #[rstest]
+    #[serial_test::serial]
+    #[timeout(SHORT_STANDALONE_TEST_TIMEOUT)]
+    fn test_read_from_replica_az_affinity_replicas_and_primary_az_match_primary() {
+        test_read_from_replica(ReadFromReplicaTestConfig {
+            read_from: ReadFrom::AZAffinityReplicasAndPrimary,
+            expected_primary_reads: 3,
+            expected_replica_reads: vec![0, 0, 0],
+            client_az: Some("us-east-1a".to_string()),
+            primary_az: Some("us-east-1a".to_string()),
+            replica_azs: vec![
+                "us-east-1c".to_string(),
+                "us-east-1c".to_string(),
+                "us-east-1c".to_string(),
+            ],
+            ..Default::default()
+        });
+    }
+
+    // AZAffinityReplicasAndPrimary: When there are no local nodes, distribute read evenly starting with replicas.
+    #[rstest]
+    #[serial_test::serial]
+    #[timeout(SHORT_STANDALONE_TEST_TIMEOUT)]
+    fn test_read_from_replica_az_affinity_replicas_and_primary_no_az_match() {
+        test_read_from_replica(ReadFromReplicaTestConfig {
+            read_from: ReadFrom::AZAffinityReplicasAndPrimary,
+            number_of_requests_sent: 4,
+            expected_primary_reads: 1,
+            expected_replica_reads: vec![1, 1, 1],
+            client_az: Some("us-east-1a".to_string()),
+            primary_az: Some("us-east-1c".to_string()),
+            replica_azs: vec![
+                "us-east-1c".to_string(),
+                "us-east-1c".to_string(),
+                "us-east-1c".to_string(),
+            ],
+            ..Default::default()
+        });
+    }
+
+    // AZAffinityReplicasAndPrimary: When all nodes local, distribute read to all replicas first then primary.
+    #[rstest]
+    #[serial_test::serial]
+    #[timeout(SHORT_STANDALONE_TEST_TIMEOUT)]
+    fn test_read_from_replica_az_affinity_replicas_and_primary_all_az_match_prioritize_replicas() {
         test_read_from_replica(ReadFromReplicaTestConfig {
             read_from: ReadFrom::AZAffinityReplicasAndPrimary,
             expected_primary_reads: 0,
             expected_replica_reads: vec![1, 1, 1],
+            client_az: Some("us-east-1a".to_string()),
+            primary_az: Some("us-east-1a".to_string()),
+            replica_azs: vec![
+                "us-east-1a".to_string(),
+                "us-east-1a".to_string(),
+                "us-east-1a".to_string(),
+            ],
+            ..Default::default()
+        });
+    }
+
+    // AZAffinityAllNodes: same-AZ primary and replica share reads equally.
+    #[rstest]
+    #[serial_test::serial]
+    #[timeout(SHORT_STANDALONE_TEST_TIMEOUT)]
+    fn test_read_from_replica_az_affinity_all_nodes_az_match_mixed() {
+        test_read_from_replica(ReadFromReplicaTestConfig {
+            read_from: ReadFrom::AZAffinityAllNodes,
+            number_of_requests_sent: 4,
+            expected_primary_reads: 2,
+            expected_replica_reads: vec![0, 0, 2],
+            client_az: Some("us-east-1a".to_string()),
+            primary_az: Some("us-east-1a".to_string()),
+            replica_azs: vec![
+                "us-east-1a".to_string(),
+                "us-east-1b".to_string(),
+                "us-east-1b".to_string(),
+            ],
+            ..Default::default()
+        });
+    }
+
+    // AZAffinityAllNodes: only the primary matches the client AZ, so it gets all reads.
+    #[rstest]
+    #[serial_test::serial]
+    #[timeout(SHORT_STANDALONE_TEST_TIMEOUT)]
+    fn test_read_from_replica_az_affinity_all_nodes_az_match_primary() {
+        test_read_from_replica(ReadFromReplicaTestConfig {
+            read_from: ReadFrom::AZAffinityAllNodes,
+            expected_primary_reads: 3,
+            expected_replica_reads: vec![0, 0, 0],
+            client_az: Some("us-east-1a".to_string()),
+            primary_az: Some("us-east-1a".to_string()),
+            replica_azs: vec![
+                "us-east-1c".to_string(),
+                "us-east-1c".to_string(),
+                "us-east-1c".to_string(),
+            ],
+            ..Default::default()
+        });
+    }
+
+    // AZAffinityAllNodes: when there are no local nodes, distribute reads evenly across all nodes.
+    #[rstest]
+    #[serial_test::serial]
+    #[timeout(SHORT_STANDALONE_TEST_TIMEOUT)]
+    fn test_read_from_replica_az_affinity_all_nodes_no_az_match() {
+        test_read_from_replica(ReadFromReplicaTestConfig {
+            read_from: ReadFrom::AZAffinityAllNodes,
+            number_of_requests_sent: 4,
+            expected_primary_reads: 1,
+            expected_replica_reads: vec![1, 1, 1],
+            client_az: Some("us-east-1a".to_string()),
+            primary_az: Some("us-east-1c".to_string()),
+            replica_azs: vec![
+                "us-east-1c".to_string(),
+                "us-east-1c".to_string(),
+                "us-east-1c".to_string(),
+            ],
+            ..Default::default()
+        });
+    }
+
+    // AZAffinityAllNodes: the primary is an equal member of the in-AZ rotation; out-of-AZ replicas get no reads.
+    #[rstest]
+    #[serial_test::serial]
+    #[timeout(SHORT_STANDALONE_TEST_TIMEOUT)]
+    fn test_read_from_replica_az_affinity_all_nodes_most_az_match() {
+        test_read_from_replica(ReadFromReplicaTestConfig {
+            read_from: ReadFrom::AZAffinityAllNodes,
+            number_of_requests_sent: 6,
+            expected_primary_reads: 2,
+            expected_replica_reads: vec![0, 2, 2],
+            client_az: Some("us-east-1a".to_string()),
+            primary_az: Some("us-east-1a".to_string()),
+            replica_azs: vec![
+                "us-east-1a".to_string(),
+                "us-east-1a".to_string(),
+                "us-east-1c".to_string(),
+            ],
+            ..Default::default()
+        });
+    }
+
+    // AZAffinityAllNodes: a disconnected in-AZ node is skipped; the remaining in-AZ nodes serve all reads.
+    #[rstest]
+    #[serial_test::serial]
+    #[timeout(SHORT_STANDALONE_TEST_TIMEOUT)]
+    fn test_read_from_replica_az_affinity_all_nodes_skips_disconnected_nodes() {
+        test_read_from_replica(ReadFromReplicaTestConfig {
+            read_from: ReadFrom::AZAffinityAllNodes,
+            number_of_requests_sent: 6,
+            expected_primary_reads: 3,
+            expected_replica_reads: vec![0, 3],
+            number_of_replicas_dropped_after_connection: 1,
+            client_az: Some("us-east-1a".to_string()),
+            primary_az: Some("us-east-1a".to_string()),
+            replica_azs: vec![
+                "us-east-1a".to_string(),
+                "us-east-1a".to_string(),
+                "us-east-1c".to_string(),
+            ],
             ..Default::default()
         });
     }
@@ -498,10 +784,12 @@ mod standalone_client_tests {
                 Err(err) => {
                     // Connection was dropped as expected
                     assert!(
-                        err.is_connection_dropped() || err.is_timeout(),
-                        "Expected connection dropped or timeout error, got: {err:?}",
+                        err.is_connection_dropped()
+                            || err.is_timeout()
+                            || err.kind() == redis::ErrorKind::AllConnectionsUnavailable,
+                        "Expected connection dropped, timeout, or unavailable error, got: {err:?}",
                     );
-                    let client_info = repeat_try_create(|| async {
+                    let client_info = retry(|| async {
                         let mut client = client.clone();
                         String::from_owned_redis_value(
                             client.send_command(&client_info_cmd).await.unwrap(),
@@ -566,7 +854,7 @@ mod standalone_client_tests {
 
             // 3. Get initial client count on the DEDICATED server.
             let clients_before_lazy_init = get_connected_clients(monitoring_client).await;
-            logger_core::log_info(
+            glide_logger::log_info(
                 "TestStandaloneLazy",
                 format!(
                     "Clients before lazy client init (protocol={protocol:?} on dedicated server): {clients_before_lazy_init}"
@@ -597,7 +885,7 @@ mod standalone_client_tests {
             // 6. Assert that no new connection was made yet by the lazy client
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
             let clients_after_lazy_init = get_connected_clients(monitoring_client).await; // Pass &mut StandaloneClient
-            logger_core::log_info(
+            glide_logger::log_info(
                 "TestStandaloneLazy",
                 format!(
                     "Clients after lazy client init (protocol={protocol:?} on dedicated server): {clients_after_lazy_init}"
@@ -609,29 +897,17 @@ mod standalone_client_tests {
             );
 
             // 7. Send the first command using the lazy client (which is a GlideClient)
-            logger_core::log_info(
+            glide_logger::log_info(
                 "TestStandaloneLazy",
                 format!(
                     "Sending first command to lazy client (PING) (protocol={protocol:?} on dedicated server)"
                 ),
             );
-            let ping_response = lazy_glide_client_enum
-                .send_command(&mut redis::cmd("PING"), None)
-                .await;
-            assert!(
-                ping_response.is_ok(),
-                "PING command failed (on dedicated server): {:?}. protocol={:?}",
-                ping_response.as_ref().err(),
-                protocol
-            );
-            assert_eq!(
-                ping_response.unwrap(),
-                redis::Value::SimpleString("PONG".to_string())
-            );
+            assert_connected(&mut lazy_glide_client_enum).await;
 
             // 8. Assert that a new connection was made by the lazy client on the dedicated server
             let clients_after_first_command = get_connected_clients(monitoring_client).await; // Pass &mut StandaloneClient
-            logger_core::log_info(
+            glide_logger::log_info(
                 "TestStandaloneLazy",
                 format!(
                     "Clients after first command (protocol={protocol:?} on dedicated server): {clients_after_first_command}"
@@ -651,25 +927,10 @@ mod standalone_client_tests {
     fn test_tls_connection_with_custom_root_cert() {
         block_on_all(async move {
             // Create a dedicated TLS server with custom certificates
-            let tempdir = tempfile::Builder::new()
-                .prefix("tls_test")
-                .tempdir()
-                .expect("Failed to create temp dir");
-            let tls_paths = build_keys_and_certs_for_tls(&tempdir);
+            let tempdir = tempfile::tempdir().expect("Failed to create temp dir");
+            let tls_paths = build_tls_file_paths(&tempdir);
             let ca_cert_bytes = tls_paths.read_ca_cert_as_bytes();
-
-            let server = RedisServer::new_with_addr_tls_modules_and_spawner(
-                redis::ConnectionAddr::TcpTls {
-                    host: "127.0.0.1".to_string(),
-                    port: get_available_port(),
-                    insecure: false,
-                    tls_params: None,
-                },
-                Some(tls_paths),
-                &[],
-                false,
-                |cmd| cmd.spawn().expect("Failed to spawn server"),
-            );
+            let server = RedisServer::new_with_tls(true, Some(tls_paths));
 
             let server_addr = server.get_client_addr();
             // Skip wait_for_server_to_become_ready since it uses default OS verifier
@@ -693,12 +954,7 @@ mod standalone_client_tests {
                     .await
                     .expect("Failed to create client with custom root cert");
 
-            // Verify connection works by sending a command
-            let ping_result = client.send_command(&redis::cmd("PING")).await;
-            assert_eq!(
-                ping_result.unwrap(),
-                Value::SimpleString("PONG".to_string())
-            );
+            assert_connected(&mut client).await;
         });
     }
 
@@ -708,32 +964,15 @@ mod standalone_client_tests {
     fn test_tls_connection_fails_with_wrong_root_cert() {
         block_on_all(async move {
             // Create a TLS server with one set of certificates
-            let tempdir1 = tempfile::Builder::new()
-                .prefix("tls_test_server")
-                .tempdir()
-                .expect("Failed to create temp dir");
-            let server_tls_paths = build_keys_and_certs_for_tls(&tempdir1);
+            let server_tempdir = tempfile::tempdir().expect("Failed to create temp dir");
+            let server_tls_paths = build_tls_file_paths(&server_tempdir);
 
             // Create different CA certificate for client
-            let tempdir2 = tempfile::Builder::new()
-                .prefix("tls_test_client")
-                .tempdir()
-                .expect("Failed to create temp dir");
-            let client_tls_paths = build_keys_and_certs_for_tls(&tempdir2);
+            let client_tempdir = tempfile::tempdir().expect("Failed to create temp dir");
+            let client_tls_paths = build_tls_file_paths(&client_tempdir);
             let wrong_ca_cert_bytes = client_tls_paths.read_ca_cert_as_bytes();
 
-            let server = RedisServer::new_with_addr_tls_modules_and_spawner(
-                redis::ConnectionAddr::TcpTls {
-                    host: "127.0.0.1".to_string(),
-                    port: get_available_port(),
-                    insecure: false,
-                    tls_params: None,
-                },
-                Some(server_tls_paths),
-                &[],
-                false,
-                |cmd| cmd.spawn().expect("Failed to spawn server"),
-            );
+            let server = RedisServer::new_with_tls(true, Some(server_tls_paths));
 
             let server_addr = server.get_client_addr();
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
@@ -775,7 +1014,7 @@ mod standalone_client_tests {
     fn test_tls_connection_fails_with_invalid_cert_bytes() {
         block_on_all(async move {
             let server_addr = redis::ConnectionAddr::TcpTls {
-                host: "127.0.0.1".to_string(),
+                host: IP_ADDRESS_V4.to_string(),
                 port: get_available_port(),
                 insecure: false,
                 tls_params: None,
@@ -814,7 +1053,7 @@ mod standalone_client_tests {
     fn test_tls_connection_fails_with_custom_certs_and_no_tls() {
         block_on_all(async move {
             let server_addr =
-                redis::ConnectionAddr::Tcp("127.0.0.1".to_string(), get_available_port());
+                redis::ConnectionAddr::Tcp(IP_ADDRESS_V4.to_string(), get_available_port());
 
             let mut connection_request = create_connection_request(
                 &[server_addr],
@@ -851,33 +1090,16 @@ mod standalone_client_tests {
     fn test_tls_connection_with_multiple_root_certs_first_invalid() {
         block_on_all(async move {
             // Create server with valid certificates
-            let tempdir_server = tempfile::Builder::new()
-                .prefix("tls_test_server")
-                .tempdir()
-                .expect("Failed to create temp dir");
-            let server_tls_paths = build_keys_and_certs_for_tls(&tempdir_server);
+            let server_tempdir = tempfile::tempdir().expect("Failed to create temp dir");
+            let server_tls_paths = build_tls_file_paths(&server_tempdir);
             let valid_ca_cert_bytes = server_tls_paths.read_ca_cert_as_bytes();
 
             // Create invalid CA certificate
-            let tempdir_invalid = tempfile::Builder::new()
-                .prefix("tls_test_invalid")
-                .tempdir()
-                .expect("Failed to create temp dir");
-            let invalid_tls_paths = build_keys_and_certs_for_tls(&tempdir_invalid);
+            let invalid_tempdir = tempfile::tempdir().expect("Failed to create temp dir");
+            let invalid_tls_paths = build_tls_file_paths(&invalid_tempdir);
             let invalid_ca_cert_bytes = invalid_tls_paths.read_ca_cert_as_bytes();
 
-            let server = RedisServer::new_with_addr_tls_modules_and_spawner(
-                redis::ConnectionAddr::TcpTls {
-                    host: "127.0.0.1".to_string(),
-                    port: get_available_port(),
-                    insecure: false,
-                    tls_params: None,
-                },
-                Some(server_tls_paths),
-                &[],
-                false,
-                |cmd| cmd.spawn().expect("Failed to spawn server"),
-            );
+            let server = RedisServer::new_with_tls(true, Some(server_tls_paths));
 
             let server_addr = server.get_client_addr();
             tokio::time::sleep(std::time::Duration::from_millis(200)).await;
@@ -901,26 +1123,22 @@ mod standalone_client_tests {
                     .await
                     .expect("Failed to create client with multiple root certs");
 
-            let ping_result = client.send_command(&redis::cmd("PING")).await;
-            assert_eq!(
-                ping_result.unwrap(),
-                Value::SimpleString("PONG".to_string())
-            );
+            assert_connected(&mut client).await;
         });
     }
 
     #[rstest]
     #[serial_test::serial]
     #[timeout(SHORT_STANDALONE_TEST_TIMEOUT)]
-    fn test_tls_connection_with_with_client_tls_auth() {
+    fn test_tls_connection_with_client_tls_auth() {
         block_on_all(async move {
             // Create a dedicated TLS server with custom certificates
-            let tempdir = tempfile::Builder::new()
-                .prefix("tls_test")
-                .tempdir()
-                .expect("Failed to create temp dir");
-            let tls_paths = build_keys_and_certs_for_tls(&tempdir);
+            let tempdir = tempfile::tempdir().expect("Failed to create temp dir");
+            let tls_paths = build_tls_file_paths(&tempdir);
+
             let ca_cert_bytes = tls_paths.read_ca_cert_as_bytes();
+            let client_cert_bytes = tls_paths.read_redis_cert_as_bytes();
+            let client_key_bytes = tls_paths.read_redis_key_as_bytes();
 
             let server = RedisServer::new_with_addr_tls_modules_and_spawner(
                 redis::ConnectionAddr::TcpTls {
@@ -950,8 +1168,8 @@ mod standalone_client_tests {
             );
             connection_request.tls_mode = glide_core::connection_request::TlsMode::SecureTls.into();
             connection_request.root_certs = vec![ca_cert_bytes.into()];
-            connection_request.client_cert = tls_paths.read_redis_cert_as_bytes().clone().into();
-            connection_request.client_key = tls_paths.read_redis_key_as_bytes().clone().into();
+            connection_request.client_cert = client_cert_bytes.into();
+            connection_request.client_key = client_key_bytes.into();
 
             // Test that connection works with custom root cert and client TLS auth
             let mut client =
@@ -959,11 +1177,533 @@ mod standalone_client_tests {
                     .await
                     .expect("Failed to create client with custom root cert");
 
-            // Verify connection works by sending a command
-            let ping_result = client.send_command(&redis::cmd("PING")).await;
+            assert_connected(&mut client).await;
+        });
+    }
+
+    #[rstest]
+    #[serial_test::serial]
+    #[timeout(SHORT_STANDALONE_TEST_TIMEOUT)]
+    fn test_tls_connection_with_ip_address_succeeds(
+        #[values(IP_ADDRESS_V4, IP_ADDRESS_V6)] host: &str,
+    ) {
+        block_on_all(async move {
+            let tempdir = tempfile::tempdir().expect("Failed to create temp dir");
+            let tls_paths = build_tls_file_paths(&tempdir);
+            let ca_cert_bytes = tls_paths.read_ca_cert_as_bytes();
+
+            let ip_addr = redis::ConnectionAddr::TcpTls {
+                host: host.to_string(),
+                port: get_available_port(),
+                insecure: false,
+                tls_params: None,
+            };
+
+            let _server = RedisServer::new_with_addr_tls_modules_and_spawner(
+                ip_addr.clone(),
+                Some(tls_paths.clone()),
+                &[],
+                false,
+                |cmd| cmd.spawn().expect("Failed to spawn server"),
+            );
+
+            // Wait to ensure server is ready before connecting.
+            tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
+
+            let mut connection_request = create_connection_request(
+                &[ip_addr],
+                &TestConfiguration {
+                    use_tls: true,
+                    shared_server: false,
+                    ..Default::default()
+                },
+            );
+            connection_request.tls_mode = glide_core::connection_request::TlsMode::SecureTls.into();
+            connection_request.root_certs = vec![ca_cert_bytes.into()];
+
+            let mut client =
+                StandaloneClient::create_client(connection_request.into(), None, None, None)
+                    .await
+                    .expect("Failed to create client with IP address");
+
+            assert_connected(&mut client).await;
+        });
+    }
+
+    #[rstest]
+    #[serial_test::serial]
+    #[timeout(SHORT_STANDALONE_TEST_TIMEOUT)]
+    fn test_connection_with_ip_address_succeeds(
+        #[values(IP_ADDRESS_V4, IP_ADDRESS_V6)] host: &str,
+    ) {
+        block_on_all(async move {
+            let ip_addr = redis::ConnectionAddr::Tcp(host.to_string(), get_available_port());
+
+            let _server = RedisServer::new_with_addr_and_modules(ip_addr.clone(), &[]);
+
+            // Wait to ensure server is ready before connecting.
+            tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
+
+            let connection_request = create_connection_request(
+                &[ip_addr],
+                &TestConfiguration {
+                    shared_server: false,
+                    ..Default::default()
+                },
+            );
+
+            let mut client =
+                StandaloneClient::create_client(connection_request.into(), None, None, None)
+                    .await
+                    .expect("Failed to create client with IP address");
+
+            assert_connected(&mut client).await;
+        });
+    }
+
+    #[rstest]
+    #[timeout(SHORT_STANDALONE_TEST_TIMEOUT)]
+    fn test_unsupported_client_setinfo_does_not_prevent_connection() {
+        let mut responses = create_primary_responses();
+        responses.insert(
+            "*1\r\n$4\r\nPING\r\n".to_string(),
+            Value::SimpleString("PONG".to_string()),
+        );
+        let server = ServerMock::new_with_setinfo_response(responses, SetInfoResponse::Unsupported);
+        let addresses = server.get_addresses();
+        let mut connection_request =
+            create_connection_request(addresses.as_slice(), &Default::default());
+        connection_request.lib_name = "GlideRust(framework:1.2)".into();
+
+        block_on_all(async {
+            let mut client =
+                StandaloneClient::create_client(connection_request.into(), None, None, None)
+                    .await
+                    .expect("unsupported CLIENT SETINFO should not prevent client creation");
+
+            assert_connected(&mut client).await;
+        });
+
+        assert_eq!(
+            server.get_number_of_received_setinfo_commands(),
+            2,
+            "connection setup should send CLIENT SETINFO for LIB-NAME and LIB-VER"
+        );
+    }
+
+    #[rstest]
+    #[timeout(SHORT_STANDALONE_TEST_TIMEOUT)]
+    fn test_setinfo_in_library_name_keeps_setup_responses_synchronized() {
+        let mut responses = create_primary_responses();
+        responses.insert(
+            "*1\r\n$4\r\nPING\r\n".to_string(),
+            Value::SimpleString("PONG".to_string()),
+        );
+        let server = ServerMock::new(responses);
+        let addresses = server.get_addresses();
+        let mut connection_request =
+            create_connection_request(addresses.as_slice(), &Default::default());
+        connection_request.lib_name = "GlideSETINFOClient".into();
+
+        block_on_all(async {
+            let mut client =
+                StandaloneClient::create_client(connection_request.into(), None, None, None)
+                    .await
+                    .expect("SETINFO in the library name should not desynchronize setup responses");
+
+            assert_connected(&mut client).await;
+        });
+
+        assert_eq!(
+            server.get_number_of_received_setinfo_commands(),
+            2,
+            "only CLIENT SETINFO command frames should be counted"
+        );
+    }
+
+    // ==================== Read-Only Mode Tests ====================
+
+    /// Creates mock responses for a replica-only server (no primary detection needed)
+    fn create_replica_only_responses() -> HashMap<String, Value> {
+        let mut responses = std::collections::HashMap::new();
+        responses.insert(
+            "*1\r\n$4\r\nPING\r\n".to_string(),
+            Value::BulkString(b"PONG".to_vec().into()),
+        );
+        // GET command response
+        responses.insert(
+            "*2\r\n$3\r\nGET\r\n$3\r\nfoo\r\n".to_string(),
+            Value::BulkString(b"bar".to_vec().into()),
+        );
+        // SET command response (for testing write blocking)
+        responses.insert(
+            "*3\r\n$3\r\nSET\r\n$3\r\nfoo\r\n$3\r\nbar\r\n".to_string(),
+            Value::Okay,
+        );
+        responses
+    }
+
+    fn create_replica_only_mock() -> ServerMock {
+        let listener = get_listener_on_available_port();
+        ServerMock::new_with_listener(create_replica_only_responses(), listener)
+    }
+
+    #[rstest]
+    #[serial_test::serial]
+    #[timeout(SHORT_STANDALONE_TEST_TIMEOUT)]
+    fn test_read_only_mode_connects_without_primary() {
+        // Create a mock server that doesn't respond to INFO REPLICATION as a primary
+        let mock = create_replica_only_mock();
+        let addresses = get_mock_addresses(&[mock]);
+
+        let mut connection_request =
+            create_connection_request(addresses.as_slice(), &Default::default());
+        connection_request.read_only = Some(true);
+
+        block_on_all(async {
+            // This should succeed because read_only mode doesn't require a primary
+            let client_result =
+                StandaloneClient::create_client(connection_request.into(), None, None, None).await;
+            assert!(
+                client_result.is_ok(),
+                "read_only mode should connect without requiring a primary node"
+            );
+        });
+    }
+
+    #[rstest]
+    #[serial_test::serial]
+    #[timeout(SHORT_STANDALONE_TEST_TIMEOUT)]
+    fn test_read_only_mode_blocks_write_commands() {
+        // Use a primary mock so the connection succeeds, then test write blocking
+        let servers = create_primary_mock_with_replicas(0);
+        let mock = &servers[0];
+
+        let mut get_cmd = redis::cmd("GET");
+        get_cmd.arg("foo");
+        mock.add_response(&get_cmd, "$3\r\nbar\r\n".to_string());
+
+        let addresses = get_mock_addresses(&servers);
+        let mut connection_request =
+            create_connection_request(addresses.as_slice(), &Default::default());
+        connection_request.read_only = Some(true);
+
+        block_on_all(async {
+            let mut client =
+                StandaloneClient::create_client(connection_request.into(), None, None, None)
+                    .await
+                    .unwrap();
+
+            // Write command should be blocked before reaching the server
+            let mut set_cmd = redis::cmd("SET");
+            set_cmd.arg("foo").arg("bar");
+            let result = client.send_command(&set_cmd).await;
+            assert!(result.is_err(), "Write command should be blocked");
+            let err = result.unwrap_err();
+            assert!(
+                err.to_string()
+                    .contains("write commands are not allowed in read-only mode"),
+                "Error message should indicate write commands are not allowed, got: {}",
+                err
+            );
+        });
+    }
+
+    #[rstest]
+    #[serial_test::serial]
+    #[timeout(SHORT_STANDALONE_TEST_TIMEOUT)]
+    fn test_read_only_mode_allows_read_commands() {
+        // Use a primary mock so the connection succeeds
+        let servers = create_primary_mock_with_replicas(0);
+        let mock = &servers[0];
+
+        let mut get_cmd = redis::cmd("GET");
+        get_cmd.arg("foo");
+        mock.add_response(&get_cmd, "$3\r\nbar\r\n".to_string());
+
+        let addresses = get_mock_addresses(&servers);
+        let mut connection_request =
+            create_connection_request(addresses.as_slice(), &Default::default());
+        connection_request.read_only = Some(true);
+
+        block_on_all(async {
+            let mut client =
+                StandaloneClient::create_client(connection_request.into(), None, None, None)
+                    .await
+                    .unwrap();
+
+            // Read command should be allowed
+            let result = client.send_command(&get_cmd).await;
+            assert!(
+                result.is_ok(),
+                "Read command should be allowed in read-only mode, got error: {:?}",
+                result.err()
+            );
+        });
+    }
+
+    #[rstest]
+    #[serial_test::serial]
+    #[timeout(SHORT_STANDALONE_TEST_TIMEOUT)]
+    fn test_read_only_mode_rejects_az_affinity() {
+        let mock = create_replica_only_mock();
+        let addresses = get_mock_addresses(&[mock]);
+
+        let mut connection_request =
+            create_connection_request(addresses.as_slice(), &Default::default());
+        connection_request.read_only = Some(true);
+        connection_request.read_from = ReadFrom::AZAffinity.into();
+        connection_request.client_az = "us-east-1a".into();
+
+        block_on_all(async {
+            let result =
+                StandaloneClient::create_client(connection_request.into(), None, None, None).await;
+            assert!(
+                result.is_err(),
+                "AZAffinity should be rejected with read_only mode"
+            );
+            let err = format!("{:?}", result.unwrap_err());
+            assert!(
+                err.contains("read-only mode is not compatible with AZAffinity"),
+                "Error message should indicate AZAffinity incompatibility, got: {}",
+                err
+            );
+        });
+    }
+
+    #[rstest]
+    #[serial_test::serial]
+    #[timeout(SHORT_STANDALONE_TEST_TIMEOUT)]
+    fn test_read_only_mode_rejects_az_affinity_replicas_and_primary() {
+        let mock = create_replica_only_mock();
+        let addresses = get_mock_addresses(&[mock]);
+
+        let mut connection_request =
+            create_connection_request(addresses.as_slice(), &Default::default());
+        connection_request.read_only = Some(true);
+        connection_request.read_from = ReadFrom::AZAffinityReplicasAndPrimary.into();
+        connection_request.client_az = "us-east-1a".into();
+
+        block_on_all(async {
+            let result =
+                StandaloneClient::create_client(connection_request.into(), None, None, None).await;
+            assert!(
+                result.is_err(),
+                "AZAffinityReplicasAndPrimary should be rejected with read_only mode"
+            );
+            let err = format!("{:?}", result.unwrap_err());
+            assert!(
+                err.contains("read-only mode is not compatible with AZAffinity"),
+                "Error message should indicate AZAffinity incompatibility, got: {}",
+                err
+            );
+        });
+    }
+
+    #[rstest]
+    #[serial_test::serial]
+    #[timeout(SHORT_STANDALONE_TEST_TIMEOUT)]
+    fn test_read_only_mode_rejects_az_affinity_all_nodes() {
+        let mock = create_replica_only_mock();
+        let addresses = get_mock_addresses(&[mock]);
+
+        let mut connection_request =
+            create_connection_request(addresses.as_slice(), &Default::default());
+        connection_request.read_only = Some(true);
+        connection_request.read_from = ReadFrom::AZAffinityAllNodes.into();
+        connection_request.client_az = "us-east-1a".into();
+
+        block_on_all(async {
+            let result =
+                StandaloneClient::create_client(connection_request.into(), None, None, None).await;
+            assert!(
+                result.is_err(),
+                "AZAffinityAllNodes should be rejected with read_only mode"
+            );
+            let err = format!("{:?}", result.unwrap_err());
+            assert!(
+                err.contains("read-only mode is not compatible with AZAffinity"),
+                "Error message should indicate AZAffinity incompatibility, got: {}",
+                err
+            );
+        });
+    }
+
+    #[rstest]
+    #[serial_test::serial]
+    #[timeout(SHORT_STANDALONE_TEST_TIMEOUT)]
+    fn test_read_only_mode_accepts_prefer_replica() {
+        let mock = create_replica_only_mock();
+        let addresses = get_mock_addresses(&[mock]);
+
+        let mut connection_request =
+            create_connection_request(addresses.as_slice(), &Default::default());
+        connection_request.read_only = Some(true);
+        connection_request.read_from = ReadFrom::PreferReplica.into();
+
+        block_on_all(async {
+            let result =
+                StandaloneClient::create_client(connection_request.into(), None, None, None).await;
+            assert!(
+                result.is_ok(),
+                "PreferReplica should be accepted with read_only mode"
+            );
+        });
+    }
+
+    #[rstest]
+    #[serial_test::serial]
+    #[timeout(SHORT_STANDALONE_TEST_TIMEOUT)]
+    fn test_read_only_mode_accepts_primary_read_from() {
+        let mock = create_replica_only_mock();
+        let addresses = get_mock_addresses(&[mock]);
+
+        let mut connection_request =
+            create_connection_request(addresses.as_slice(), &Default::default());
+        connection_request.read_only = Some(true);
+        connection_request.read_from = ReadFrom::Primary.into();
+
+        block_on_all(async {
+            let result =
+                StandaloneClient::create_client(connection_request.into(), None, None, None).await;
+            assert!(
+                result.is_ok(),
+                "Primary ReadFrom should be accepted with read_only mode (reads go to connected nodes)"
+            );
+        });
+    }
+
+    #[rstest]
+    #[serial_test::serial]
+    #[timeout(SHORT_STANDALONE_TEST_TIMEOUT)]
+    fn test_read_only_mode_skips_info_replication() {
+        // Create a mock that tracks received commands
+        let mock = create_replica_only_mock();
+        let addresses = get_mock_addresses(&[mock]);
+
+        let mut connection_request =
+            create_connection_request(addresses.as_slice(), &Default::default());
+        connection_request.read_only = Some(true);
+
+        block_on_all(async {
+            let _client =
+                StandaloneClient::create_client(connection_request.into(), None, None, None)
+                    .await
+                    .unwrap();
+
+            // In read_only mode, INFO REPLICATION should not be sent
+            // The mock should only receive connection-related commands, not INFO REPLICATION
+            // Note: This test verifies the behavior indirectly - if INFO REPLICATION was sent,
+            // the mock would fail because it doesn't have a response for it
+        });
+    }
+
+    #[rstest]
+    #[serial_test::serial]
+    #[timeout(SHORT_STANDALONE_TEST_TIMEOUT)]
+    fn test_normal_mode_requires_primary() {
+        // Create a mock that responds as a replica (not primary)
+        let mock = create_replica_only_mock();
+        let addresses = get_mock_addresses(&[mock]);
+
+        let connection_request =
+            create_connection_request(addresses.as_slice(), &Default::default());
+        // read_only is false by default
+
+        block_on_all(async {
+            let result =
+                StandaloneClient::create_client(connection_request.into(), None, None, None).await;
+            // Normal mode should fail because no primary is found
+            assert!(
+                result.is_err(),
+                "Normal mode should fail without a primary node"
+            );
+        });
+    }
+
+    #[rstest]
+    #[serial_test::serial]
+    #[timeout(SHORT_STANDALONE_TEST_TIMEOUT)]
+    fn test_read_only_mode_primary_writes_replica_reads() {
+        // Create a primary mock and a replica mock
+        let servers = create_primary_mock_with_replicas(1);
+        let primary_mock = &servers[0];
+        let replica_mock = &servers[1];
+
+        // Add SET command response to primary
+        let mut set_cmd = redis::cmd("SET");
+        set_cmd.arg("test_key").arg("test_value");
+        primary_mock.add_response(&set_cmd, "+OK\r\n".to_string());
+
+        // Add GET command response to replica (simulating replicated data)
+        let mut get_cmd = redis::cmd("GET");
+        get_cmd.arg("test_key");
+        replica_mock.add_response(&get_cmd, "$10\r\ntest_value\r\n".to_string());
+
+        let addresses = get_mock_addresses(&servers);
+        let primary_address = vec![addresses[0].clone()];
+        let replica_address = vec![addresses[1].clone()];
+
+        block_on_all(async {
+            // Create a normal client connected to the primary for writes
+            let primary_connection_request =
+                create_connection_request(primary_address.as_slice(), &Default::default());
+            let mut primary_client = StandaloneClient::create_client(
+                primary_connection_request.into(),
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect("Primary client should connect successfully");
+
+            // Create a read-only client connected to the replica for reads
+            let mut replica_connection_request =
+                create_connection_request(replica_address.as_slice(), &Default::default());
+            replica_connection_request.read_only = Some(true);
+            let mut replica_client = StandaloneClient::create_client(
+                replica_connection_request.into(),
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect("Read-only replica client should connect successfully");
+
+            // Write to primary using normal client
+            let write_result = primary_client.send_command(&set_cmd).await;
+            assert!(
+                write_result.is_ok(),
+                "Write to primary should succeed, got error: {:?}",
+                write_result.err()
+            );
+
+            // Read from replica using read-only client
+            let read_result = replica_client.send_command(&get_cmd).await;
+            assert!(
+                read_result.is_ok(),
+                "Read from replica should succeed in read-only mode, got error: {:?}",
+                read_result.err()
+            );
+            let value = read_result.unwrap();
             assert_eq!(
-                ping_result.unwrap(),
-                Value::SimpleString("PONG".to_string())
+                value,
+                Value::BulkString(b"test_value".to_vec().into()),
+                "Read value should match written value"
+            );
+
+            // Verify that write commands are blocked on the read-only replica client
+            let blocked_write_result = replica_client.send_command(&set_cmd).await;
+            assert!(
+                blocked_write_result.is_err(),
+                "Write command should be blocked on read-only client"
+            );
+            let err = blocked_write_result.unwrap_err();
+            assert!(
+                err.to_string()
+                    .contains("write commands are not allowed in read-only mode"),
+                "Error message should indicate write commands are not allowed, got: {}",
+                err
             );
         });
     }

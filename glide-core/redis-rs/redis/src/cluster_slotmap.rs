@@ -23,8 +23,9 @@ pub struct SlotMapValue {
     /// The shard addresses responsible for this slot range.
     pub addrs: Arc<ShardAddrs>,
 
-    /// Index of the last used replica for round-robin load balancing when reading from replicas.
-    pub last_used_replica: Arc<AtomicUsize>,
+    /// Index of the last used node for round-robin load balancing when reading from
+    /// replicas or, in node-inclusive strategies, from all nodes (index 0 = primary).
+    pub last_used_node_index: Arc<AtomicUsize>,
 }
 
 #[derive(Debug, Default, Clone, PartialEq)]
@@ -42,6 +43,12 @@ pub enum ReadFromReplicaStrategy {
     /// Spread the read requests among nodes within the client's Availability Zone (AZ) in a round robin manner,
     /// prioritizing local replicas, then the local primary, and falling back to any replica or the primary if needed.
     AZAffinityReplicasAndPrimary(String),
+    /// Spread the read requests between all nodes (primary and replicas) in a round robin manner.
+    AllNodes,
+    /// Spread the read requests equally among all nodes (primary and replicas) within the client's
+    /// Availability Zone (AZ) in a round robin manner, falling back to a round robin across all
+    /// nodes if no node in the client's AZ is available.
+    AZAffinityAllNodes(String),
 }
 
 #[derive(Debug, Default)]
@@ -61,17 +68,42 @@ fn get_address_from_slot(
     if slot_addr == SlotAddr::Master || addrs.replicas().is_empty() {
         return addrs.primary();
     }
+    let round_robin_replica = || {
+        let index = slot
+            .last_used_node_index
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            % addrs.replicas().len();
+        addrs.replicas()[index].clone()
+    };
+    let round_robin_all_nodes = || {
+        // Round-robin across all nodes: primary + all replicas
+        let total_nodes = addrs.replicas().len() + 1;
+        let index = slot
+            .last_used_node_index // index 0 refers to the primary
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            % total_nodes;
+        if index == 0 {
+            addrs.primary()
+        } else {
+            addrs.replicas()[index - 1].clone()
+        }
+    };
     match read_from_replica {
         ReadFromReplicaStrategy::AlwaysFromPrimary => addrs.primary(),
-        ReadFromReplicaStrategy::RoundRobin => {
-            let index = slot
-                .last_used_replica
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-                % addrs.replicas().len();
-            addrs.replicas()[index].clone()
+        ReadFromReplicaStrategy::RoundRobin => round_robin_replica(),
+        ReadFromReplicaStrategy::AllNodes => round_robin_all_nodes(),
+        // The slot map carries no AZ metadata, so fall back to the documented
+        // behavior of these strategies when no local node is known.
+        ReadFromReplicaStrategy::AZAffinity(_az) => round_robin_replica(),
+        ReadFromReplicaStrategy::AZAffinityReplicasAndPrimary(_az) => round_robin_all_nodes(),
+        // Explicit replica routes stay in the replica rotation, matching this
+        // strategy's `lookup_route` behavior.
+        ReadFromReplicaStrategy::AZAffinityAllNodes(_az)
+            if slot_addr == SlotAddr::ReplicaRequired =>
+        {
+            round_robin_replica()
         }
-        ReadFromReplicaStrategy::AZAffinity(_az) => todo!(), // Drop sync client
-        ReadFromReplicaStrategy::AZAffinityReplicasAndPrimary(_az) => todo!(), // Drop sync client
+        ReadFromReplicaStrategy::AZAffinityAllNodes(_az) => round_robin_all_nodes(),
     }
 }
 
@@ -127,7 +159,7 @@ impl SlotMap {
                 SlotMapValue {
                     addrs: shard_addrs_arc,
                     start: slot.start,
-                    last_used_replica: Arc::new(AtomicUsize::new(0)),
+                    last_used_node_index: Arc::new(AtomicUsize::new(0)),
                 },
             );
         }
@@ -189,6 +221,32 @@ impl SlotMap {
             let (node_ip, _shard_addrs) = entry.value();
             (*node_ip == Some(ip)).then(|| entry.key().clone())
         })
+    }
+
+    /// Populates the IP→address reverse lookup table with freshly resolved IPs
+    /// captured from DNS resolution during slot refresh.
+    pub(crate) fn populate_ips(&self, resolved_ips: Vec<(String, IpAddr)>) {
+        for (addr, ip) in resolved_ips {
+            if let Some(mut entry) = self.nodes_map.get_mut(&addr) {
+                entry.0 = Some(ip);
+            }
+        }
+    }
+
+    /// Carries over IP mappings from the old slot map to the new one.
+    /// This ensures IPs survive topology rebuilds when nodes aren't reconnected.
+    /// Fresh IPs (from populate_ips) take priority over carried-over ones.
+    pub(crate) fn carry_over_ips_from(&self, old: &SlotMap) {
+        for entry in old.nodes_map.iter() {
+            let (addr, (ip, _)) = (entry.key(), entry.value());
+            if let Some(ip) = ip {
+                if let Some(mut new_entry) = self.nodes_map.get_mut(addr) {
+                    if new_entry.0.is_none() {
+                        new_entry.0 = Some(*ip);
+                    }
+                }
+            }
+        }
     }
 
     /// Returns a set of all primary node addresses in the cluster.
@@ -273,7 +331,7 @@ impl SlotMap {
             SlotMapValue {
                 start: slot,
                 addrs: shard_addrs,
-                last_used_replica: Arc::new(AtomicUsize::new(0)),
+                last_used_node_index: Arc::new(AtomicUsize::new(0)),
             },
         )
     }
@@ -464,7 +522,7 @@ impl SlotMap {
 
                 let start: u16 = curr_slot_val.start;
                 let addrs = curr_slot_val.addrs.clone();
-                let last_used_replica = curr_slot_val.last_used_replica.clone();
+                let last_used_node_index = curr_slot_val.last_used_node_index.clone();
 
                 // Modify the current slot range to become part C: [slot + 1, end], still owned by the current shard.
                 curr_slot_val.start = slot + 1;
@@ -476,7 +534,7 @@ impl SlotMap {
                     SlotMapValue {
                         start,
                         addrs,
-                        last_used_replica,
+                        last_used_node_index,
                     },
                 );
 
@@ -795,6 +853,126 @@ mod tests_cluster_slotmap {
     fn test_slot_map_rotate_read_replicas() {
         let slot_map = get_slot_map(ReadFromReplicaStrategy::RoundRobin);
         let route = Route::new(2001, SlotAddr::ReplicaOptional);
+        let mut addresses = vec![
+            slot_map.slot_addr_for_route(&route).unwrap(),
+            slot_map.slot_addr_for_route(&route).unwrap(),
+            slot_map.slot_addr_for_route(&route).unwrap(),
+        ];
+        addresses.sort();
+        assert_eq!(
+            addresses,
+            vec!["replica4:6379", "replica5:6379", "replica6:6379"]
+                .into_iter()
+                .map(|s| Arc::new(s.to_string()))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_slot_map_all_nodes_includes_primary_and_replicas() {
+        let slot_map = get_slot_map(ReadFromReplicaStrategy::AllNodes);
+        let route = Route::new(2001, SlotAddr::ReplicaOptional);
+        // With 3 replicas + 1 primary = 4 nodes total, we should cycle through all
+        let mut addresses = vec![
+            slot_map.slot_addr_for_route(&route).unwrap(),
+            slot_map.slot_addr_for_route(&route).unwrap(),
+            slot_map.slot_addr_for_route(&route).unwrap(),
+            slot_map.slot_addr_for_route(&route).unwrap(),
+        ];
+        addresses.sort();
+        assert_eq!(
+            addresses,
+            vec![
+                "node3:6379",
+                "replica4:6379",
+                "replica5:6379",
+                "replica6:6379"
+            ]
+            .into_iter()
+            .map(|s| Arc::new(s.to_string()))
+            .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_slot_map_az_affinity_falls_back_to_round_robin_replicas() {
+        let slot_map = get_slot_map(ReadFromReplicaStrategy::AZAffinity("zone-a".to_string()));
+        let route = Route::new(2001, SlotAddr::ReplicaOptional);
+        let mut addresses = vec![
+            slot_map.slot_addr_for_route(&route).unwrap(),
+            slot_map.slot_addr_for_route(&route).unwrap(),
+            slot_map.slot_addr_for_route(&route).unwrap(),
+        ];
+        addresses.sort();
+        assert_eq!(
+            addresses,
+            vec!["replica4:6379", "replica5:6379", "replica6:6379"]
+                .into_iter()
+                .map(|s| Arc::new(s.to_string()))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_slot_map_az_affinity_replicas_and_primary_falls_back_to_all_nodes() {
+        let slot_map = get_slot_map(ReadFromReplicaStrategy::AZAffinityReplicasAndPrimary(
+            "zone-a".to_string(),
+        ));
+        let route = Route::new(2001, SlotAddr::ReplicaOptional);
+        let mut addresses = vec![
+            slot_map.slot_addr_for_route(&route).unwrap(),
+            slot_map.slot_addr_for_route(&route).unwrap(),
+            slot_map.slot_addr_for_route(&route).unwrap(),
+            slot_map.slot_addr_for_route(&route).unwrap(),
+        ];
+        addresses.sort();
+        assert_eq!(
+            addresses,
+            vec![
+                "node3:6379",
+                "replica4:6379",
+                "replica5:6379",
+                "replica6:6379"
+            ]
+            .into_iter()
+            .map(|s| Arc::new(s.to_string()))
+            .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_slot_map_az_affinity_all_nodes_falls_back_to_all_nodes() {
+        let slot_map = get_slot_map(ReadFromReplicaStrategy::AZAffinityAllNodes(
+            "zone-a".to_string(),
+        ));
+        let route = Route::new(2001, SlotAddr::ReplicaOptional);
+        let mut addresses = vec![
+            slot_map.slot_addr_for_route(&route).unwrap(),
+            slot_map.slot_addr_for_route(&route).unwrap(),
+            slot_map.slot_addr_for_route(&route).unwrap(),
+            slot_map.slot_addr_for_route(&route).unwrap(),
+        ];
+        addresses.sort();
+        assert_eq!(
+            addresses,
+            vec![
+                "node3:6379",
+                "replica4:6379",
+                "replica5:6379",
+                "replica6:6379"
+            ]
+            .into_iter()
+            .map(|s| Arc::new(s.to_string()))
+            .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_slot_map_az_affinity_all_nodes_replica_required_stays_on_replicas() {
+        let slot_map = get_slot_map(ReadFromReplicaStrategy::AZAffinityAllNodes(
+            "zone-a".to_string(),
+        ));
+        let route = Route::new(2001, SlotAddr::ReplicaRequired);
         let mut addresses = vec![
             slot_map.slot_addr_for_route(&route).unwrap(),
             slot_map.slot_addr_for_route(&route).unwrap(),
@@ -1498,5 +1676,106 @@ mod tests_cluster_slotmap {
         // Should be findable by IP
         let found_addr = slot_map.node_address_for_ip(ip);
         assert_eq!(found_addr, Some(Arc::new("new-node:6379".to_string())));
+    }
+
+    #[test]
+    fn test_populate_ips_empty_vec_is_noop() {
+        let slot_map = SlotMap::new(
+            vec![Slot::new(0, 16383, "node1:6379".to_owned(), vec![])],
+            HashMap::new(),
+            ReadFromReplicaStrategy::AlwaysFromPrimary,
+        );
+        // Populate with empty vec — should not panic or change anything
+        slot_map.populate_ips(vec![]);
+        let result = slot_map.node_address_for_ip("10.0.0.1".parse().unwrap());
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_populate_ips_unknown_address_is_ignored() {
+        let slot_map = SlotMap::new(
+            vec![Slot::new(0, 16383, "node1:6379".to_owned(), vec![])],
+            HashMap::new(),
+            ReadFromReplicaStrategy::AlwaysFromPrimary,
+        );
+        // Address not in nodes_map — should be silently ignored
+        slot_map.populate_ips(vec![(
+            "unknown-node:9999".to_string(),
+            "10.0.0.99".parse().unwrap(),
+        )]);
+        let result = slot_map.node_address_for_ip("10.0.0.99".parse().unwrap());
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_carry_over_ips_fresh_takes_priority_over_carryover() {
+        // node1 gets a fresh IP via populate_ips
+        let new_map = SlotMap::new(
+            vec![Slot::new(0, 16383, "node1:6379".to_owned(), vec![])],
+            HashMap::from([("node1:6379".to_string(), "10.0.0.2".parse().unwrap())]),
+            ReadFromReplicaStrategy::AlwaysFromPrimary,
+        );
+
+        // Old map had a different IP for node1
+        let old_map = SlotMap::new(
+            vec![Slot::new(0, 16383, "node1:6379".to_owned(), vec![])],
+            HashMap::from([("node1:6379".to_string(), "10.0.0.1".parse().unwrap())]),
+            ReadFromReplicaStrategy::AlwaysFromPrimary,
+        );
+
+        // carry_over should NOT overwrite the fresh IP with the old one
+        new_map.carry_over_ips_from(&old_map);
+
+        // Fresh IP (10.0.0.2) should win, not the old one (10.0.0.1)
+        let result = new_map.node_address_for_ip("10.0.0.2".parse().unwrap());
+        assert_eq!(result, Some(Arc::new("node1:6379".to_string())));
+
+        let old_result = new_map.node_address_for_ip("10.0.0.1".parse().unwrap());
+        assert!(
+            old_result.is_none(),
+            "Old IP should not be carried over when fresh IP exists"
+        );
+    }
+
+    #[test]
+    fn test_carry_over_ips_fills_gaps_from_old_map() {
+        // new_map has node1 with no IP, node2 with fresh IP
+        let new_map = SlotMap::new(
+            vec![
+                Slot::new(0, 8191, "node1:6379".to_owned(), vec![]),
+                Slot::new(8192, 16383, "node2:6380".to_owned(), vec![]),
+            ],
+            HashMap::from([("node2:6380".to_string(), "10.0.0.2".parse().unwrap())]),
+            ReadFromReplicaStrategy::AlwaysFromPrimary,
+        );
+
+        // old_map had IPs for both nodes
+        let old_map = SlotMap::new(
+            vec![
+                Slot::new(0, 8191, "node1:6379".to_owned(), vec![]),
+                Slot::new(8192, 16383, "node2:6380".to_owned(), vec![]),
+            ],
+            HashMap::from([
+                ("node1:6379".to_string(), "10.0.0.1".parse().unwrap()),
+                ("node2:6380".to_string(), "10.0.0.99".parse().unwrap()), // stale, should NOT override fresh
+            ]),
+            ReadFromReplicaStrategy::AlwaysFromPrimary,
+        );
+
+        new_map.carry_over_ips_from(&old_map);
+
+        // node1's IP should be carried over from old map (gap filled)
+        let node1_result = new_map.node_address_for_ip("10.0.0.1".parse().unwrap());
+        assert_eq!(node1_result, Some(Arc::new("node1:6379".to_string())));
+
+        // node2's fresh IP should be preserved, not overwritten by stale old IP
+        let node2_fresh = new_map.node_address_for_ip("10.0.0.2".parse().unwrap());
+        assert_eq!(node2_fresh, Some(Arc::new("node2:6380".to_string())));
+
+        let node2_stale = new_map.node_address_for_ip("10.0.0.99".parse().unwrap());
+        assert!(
+            node2_stale.is_none(),
+            "Stale IP should not override fresh IP"
+        );
     }
 }

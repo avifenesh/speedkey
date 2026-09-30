@@ -30,5 +30,6 @@ export interface BfInfoResult {
     size: number;
     numberOfFilters: number;
     numberOfItems: number;
-    expansionRate: number;
+    /** Expansion rate, or `null` for a non-scaling filter (the server reports no rate). */
+    expansionRate: number | null;
 }

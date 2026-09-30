@@ -1,9 +1,12 @@
 // Copyright Valkey GLIDE Project Contributors - SPDX Identifier: Apache-2.0
 
 #[allow(unused_imports)]
-use logger_core::log_warn;
+use glide_logger::log_warn;
+use redis::AddressResolver;
+use redis::cache::EvictionPolicy;
 #[allow(unused_imports)]
 use std::collections::HashSet;
+use std::sync::Arc;
 use std::time::Duration;
 
 #[cfg(feature = "proto")]
@@ -11,6 +14,7 @@ use crate::compression::CompressionBackendType;
 use crate::compression::CompressionConfig;
 #[cfg(feature = "proto")]
 use crate::connection_request as protobuf;
+use crate::iam::CredentialsProvider;
 use crate::iam::ServiceType;
 #[cfg(feature = "proto")]
 #[allow(unused_imports)]
@@ -21,6 +25,7 @@ pub struct ConnectionRequest {
     pub read_from: Option<ReadFrom>,
     pub client_name: Option<String>,
     pub lib_name: Option<String>,
+    pub lib_ver: Option<String>,
     pub authentication_info: Option<AuthenticationInfo>,
     pub database_id: i64,
     pub protocol: Option<redis::ProtocolVersion>,
@@ -33,14 +38,29 @@ pub struct ConnectionRequest {
     pub periodic_checks: Option<PeriodicCheck>,
     pub pubsub_subscriptions: Option<redis::PubSubSubscriptionInfo>,
     pub inflight_requests_limit: Option<u32>,
+    pub recovery_requests_queue_size: Option<u32>,
     pub lazy_connect: bool,
     pub refresh_topology_from_initial_nodes: bool,
     pub root_certs: Vec<Vec<u8>>,
     pub client_cert: Vec<u8>,
     pub client_key: Vec<u8>,
+    /// Path to the mTLS client certificate file (PEM). When set together with
+    /// `client_key_path`, the core reads the material from disk and, when
+    /// `cert_reload` is enabled, periodically re-reads it. Mutually exclusive with
+    /// the `client_cert`/`client_key` byte fields.
+    pub client_cert_path: Option<String>,
+    /// Path to the mTLS client private key file (PEM). See `client_cert_path`.
+    pub client_key_path: Option<String>,
+    /// Optional automatic reload configuration for the path-based client cert/key.
+    pub cert_reload: Option<CertReloadConfig>,
     pub compression_config: Option<CompressionConfig>,
     pub tcp_nodelay: bool,
     pub pubsub_reconciliation_interval_ms: Option<u32>,
+    pub read_only: bool,
+    pub client_side_cache: Option<ClientSideCache>,
+    pub node_discovery_mode: NodeDiscoveryMode,
+    pub address_resolver: Option<Arc<dyn AddressResolver>>,
+    pub client_circuit_breaker: Option<ClientCircuitBreakerConfig>,
 }
 
 /// Default connection timeout used when not specified in the request.
@@ -55,6 +75,37 @@ impl ConnectionRequest {
             .map(|val| Duration::from_millis(val as u64))
             .unwrap_or(DEFAULT_CONNECTION_TIMEOUT)
     }
+}
+
+/// Configuration for the client-wide circuit breaker.
+#[derive(Debug, Clone)]
+pub struct ClientCircuitBreakerConfig {
+    pub window_size_ms: u32,
+    pub failure_rate_threshold: f32,
+    pub min_errors: u32,
+    pub open_timeout_ms: u32,
+    pub count_timeouts: bool,
+    pub consecutive_successes: u32,
+}
+
+/// Automatic reload configuration for the path-based mTLS client certificate/key.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CertReloadConfig {
+    /// Whether periodic reload is enabled.
+    pub enabled: bool,
+    /// Re-read interval in seconds. `None` means the core default (5 minutes).
+    pub interval_seconds: Option<u32>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ClientSideCache {
+    pub cache_id: String,
+    pub max_cache_kb: u64,
+    /// Time-to-live for cached entries in milliseconds (0 = no expiration).
+    pub entry_ttl_ms: u64,
+    pub eviction_policy: Option<EvictionPolicy>,
+    pub enable_metrics: bool,
+    pub server_assisted: bool,
 }
 
 /// Authentication information for connecting to Redis/Valkey servers
@@ -77,7 +128,7 @@ pub struct AuthenticationInfo {
 ///
 /// Handles AWS credential resolution, SigV4 token signing, and automatic token refresh.
 /// Tokens are valid for 15 minutes and refreshed every 14 minutes by default.
-#[derive(PartialEq, Eq, Clone, Debug)]
+#[derive(Clone)]
 pub struct IamAuthenticationConfig {
     /// AWS ElastiCache or MemoryDB cluster name
     pub cluster_name: String,
@@ -90,6 +141,49 @@ pub struct IamAuthenticationConfig {
 
     /// Token refresh interval in seconds (1 second to 12 hours, default 14 minutes)
     pub refresh_interval_seconds: Option<u32>,
+
+    /// Optional custom credentials callback.
+    ///
+    /// When `Some`, this closure is invoked to retrieve AWS credentials
+    /// `(access_key_id, secret_access_key, session_token)` for SigV4 token signing
+    /// instead of the default AWS credential chain.
+    pub credentials_provider: Option<CredentialsProvider>,
+}
+
+impl PartialEq for IamAuthenticationConfig {
+    fn eq(&self, other: &Self) -> bool {
+        // credentials_provider is not comparable; two configs are equal if all
+        // other fields match and both have (or neither has) a callback.
+        self.cluster_name == other.cluster_name
+            && self.region == other.region
+            && self.service_type == other.service_type
+            && self.refresh_interval_seconds == other.refresh_interval_seconds
+            && match (&self.credentials_provider, &other.credentials_provider) {
+                (Some(a), Some(b)) => Arc::ptr_eq(a, b),
+                (None, None) => true,
+                _ => false,
+            }
+    }
+}
+
+impl Eq for IamAuthenticationConfig {}
+
+impl std::fmt::Debug for IamAuthenticationConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("IamAuthenticationConfig")
+            .field("cluster_name", &self.cluster_name)
+            .field("region", &self.region)
+            .field("service_type", &self.service_type)
+            .field("refresh_interval_seconds", &self.refresh_interval_seconds)
+            .field(
+                "credentials_provider",
+                &self
+                    .credentials_provider
+                    .as_ref()
+                    .map(|_| "<custom callback>"),
+            )
+            .finish()
+    }
 }
 
 #[derive(Default, Clone, Copy, Debug)]
@@ -112,6 +206,13 @@ impl ::std::fmt::Display for NodeAddress {
     }
 }
 
+/// Initial connection metadata used as default OTel span attributes.
+#[derive(Clone, Debug)]
+pub struct OTelMetadata {
+    pub address: NodeAddress,
+    pub db_namespace: String,
+}
+
 #[derive(PartialEq, Eq, Clone, Default, Debug)]
 pub enum ReadFrom {
     #[default]
@@ -119,6 +220,11 @@ pub enum ReadFrom {
     PreferReplica,
     AZAffinity(String),
     AZAffinityReplicasAndPrimary(String),
+    AllNodes,
+    /// Spread the read requests equally among all nodes (primary and replicas) within the
+    /// client's Availability Zone (AZ) in a round robin manner, falling back to a round robin
+    /// across all nodes if no node in the client's AZ is available.
+    AZAffinityAllNodes(String),
 }
 
 #[derive(PartialEq, Eq, Clone, Copy, Default, Debug)]
@@ -128,6 +234,20 @@ pub enum TlsMode {
     NoTls,
     InsecureTls,
     SecureTls,
+}
+
+#[derive(PartialEq, Eq, Clone, Copy, Default, Debug)]
+/// Controls how the client discovers node roles and topology in standalone mode.
+pub enum NodeDiscoveryMode {
+    /// Default: verify node roles via INFO REPLICATION, use only provided addresses.
+    #[default]
+    Standard,
+    /// Skip role detection entirely. Trust provided addresses as-is; first address is primary.
+    /// Suitable for proxies (e.g., Envoy) or known-static topologies.
+    /// Note: Do not set `client_name` when using this mode with a proxy.
+    Static,
+    /// Discover full topology (primary + all replicas) from any starting node.
+    DiscoverAll,
 }
 
 #[derive(PartialEq, Eq, Clone, Copy, Debug)]
@@ -160,6 +280,7 @@ impl From<protobuf::ConnectionRequest> for ConnectionRequest {
             protobuf::ReadFrom::Primary => ReadFrom::Primary,
             protobuf::ReadFrom::PreferReplica => ReadFrom::PreferReplica,
             protobuf::ReadFrom::LowestLatency => todo!(),
+            protobuf::ReadFrom::AllNodes => ReadFrom::AllNodes,
             protobuf::ReadFrom::AZAffinity => {
                 if let Some(client_az) = chars_to_string_option(&value.client_az) {
                     ReadFrom::AZAffinity(client_az)
@@ -177,6 +298,20 @@ impl From<protobuf::ConnectionRequest> for ConnectionRequest {
             protobuf::ReadFrom::AZAffinityReplicasAndPrimary => {
                 if let Some(client_az) = chars_to_string_option(&value.client_az) {
                     ReadFrom::AZAffinityReplicasAndPrimary(client_az)
+                } else {
+                    log_warn(
+                        "types",
+                        format!(
+                            "Failed to convert availability zone string: '{:?}'. Falling back to `ReadFrom::PreferReplica`",
+                            value.client_az
+                        ),
+                    );
+                    ReadFrom::PreferReplica
+                }
+            },
+            protobuf::ReadFrom::AZAffinityAllNodes => {
+                if let Some(client_az) = chars_to_string_option(&value.client_az) {
+                    ReadFrom::AZAffinityAllNodes(client_az)
                 } else {
                     log_warn(
                         "types",
@@ -210,6 +345,7 @@ impl From<protobuf::ConnectionRequest> for ConnectionRequest {
                     region,
                     service_type,
                     refresh_interval_seconds,
+                    credentials_provider: None,
                 }
             });
 
@@ -300,6 +436,7 @@ impl From<protobuf::ConnectionRequest> for ConnectionRequest {
         }
 
         let inflight_requests_limit = none_if_zero(value.inflight_requests_limit);
+        let recovery_requests_queue_size = value.recovery_requests_queue_size;
         let lazy_connect = value.lazy_connect;
         let refresh_topology_from_initial_nodes = value.refresh_topology_from_initial_nodes;
         let root_certs = value
@@ -310,6 +447,42 @@ impl From<protobuf::ConnectionRequest> for ConnectionRequest {
 
         let client_cert = value.client_cert.to_vec();
         let client_key = value.client_key.to_vec();
+        let client_cert_path = value
+            .client_cert_path
+            .as_ref()
+            .filter(|p| !p.is_empty())
+            .map(|p| p.to_string());
+        let client_key_path = value
+            .client_key_path
+            .as_ref()
+            .filter(|p| !p.is_empty())
+            .map(|p| p.to_string());
+        let cert_reload = value
+            .cert_reload
+            .as_ref()
+            .map(|proto_reload| CertReloadConfig {
+                enabled: proto_reload.enabled,
+                interval_seconds: proto_reload.interval_seconds.filter(|&s| s != 0),
+            });
+
+        // Convert protobuf client-side cache config to internal client-side cache config
+        let client_side_cache = value
+            .client_side_cache
+            .0
+            .map(|proto_cache| ClientSideCache {
+                cache_id: chars_to_string_option(&proto_cache.cache_id).unwrap_or_default(),
+                max_cache_kb: proto_cache.max_cache_kb,
+                entry_ttl_ms: proto_cache.entry_ttl_ms,
+                eviction_policy: proto_cache
+                    .eviction_policy
+                    .and_then(|enum_or_unknown| enum_or_unknown.enum_value().ok())
+                    .map(|val| match val {
+                        protobuf::EvictionPolicy::LRU => EvictionPolicy::Lru,
+                        protobuf::EvictionPolicy::LFU => EvictionPolicy::Lfu,
+                    }),
+                enable_metrics: proto_cache.enable_metrics,
+                server_assisted: proto_cache.server_assisted,
+            });
 
         // Convert protobuf compression config to internal compression config
         let compression_config = value.compression_config.as_ref().map(|proto_config| {
@@ -333,17 +506,37 @@ impl From<protobuf::ConnectionRequest> for ConnectionRequest {
                 backend,
                 compression_level: proto_config.compression_level,
                 min_compression_size: proto_config.min_compression_size as usize,
+                // Handle optional max_decompressed_size:
+                // - None (not set) = use default (512MB)
+                // - Some(n) = use n as the limit
+                max_decompressed_size: proto_config
+                    .max_decompressed_size
+                    .map(|size| size as usize)
+                    .or(Some(crate::compression::DEFAULT_MAX_DECOMPRESSED_SIZE)),
             }
         });
 
         let tcp_nodelay = value.tcp_nodelay.unwrap_or(true);
         let pubsub_reconciliation_interval_ms =
             value.pubsub_reconciliation_interval_ms.filter(|&v| v != 0);
+        let read_only = value.read_only.unwrap_or(false);
+
+        let node_discovery_mode = value
+            .node_discovery_mode
+            .enum_value()
+            .ok()
+            .map(|val| match val {
+                protobuf::NodeDiscoveryMode::Standard => NodeDiscoveryMode::Standard,
+                protobuf::NodeDiscoveryMode::Static => NodeDiscoveryMode::Static,
+                protobuf::NodeDiscoveryMode::DiscoverAll => NodeDiscoveryMode::DiscoverAll,
+            })
+            .unwrap_or_default();
 
         ConnectionRequest {
             read_from,
             client_name,
             lib_name,
+            lib_ver: None, // Protobuf-based clients set library version via `GLIDE_VERSION`.
             authentication_info,
             database_id,
             protocol,
@@ -356,25 +549,60 @@ impl From<protobuf::ConnectionRequest> for ConnectionRequest {
             periodic_checks,
             pubsub_subscriptions,
             inflight_requests_limit,
+            recovery_requests_queue_size,
             lazy_connect,
             refresh_topology_from_initial_nodes,
             root_certs,
+            client_side_cache,
             client_cert,
             client_key,
+            client_cert_path,
+            client_key_path,
+            cert_reload,
             compression_config,
             tcp_nodelay,
             pubsub_reconciliation_interval_ms,
+            read_only,
+            node_discovery_mode,
+            // Address resolver is not set from protobuf - it's set programmatically
+            address_resolver: None,
+            client_circuit_breaker: value.client_circuit_breaker.into_option().map(|cb| {
+                ClientCircuitBreakerConfig {
+                    window_size_ms: cb.window_size_ms,
+                    failure_rate_threshold: cb.failure_rate_threshold,
+                    min_errors: cb.min_errors,
+                    open_timeout_ms: cb.open_timeout_ms,
+                    count_timeouts: cb.count_timeouts,
+                    consecutive_successes: cb.consecutive_successes,
+                }
+            }),
         }
     }
 }
 #[cfg(test)]
 mod tests {
-    #[cfg(feature = "proto")]
     mod protobuf_conversion_tests {
         use crate::ConnectionRequest;
         use crate::compression::CompressionBackendType;
         use crate::connection_request as protobuf;
         use ::protobuf::EnumOrUnknown;
+
+        #[test]
+        fn test_lib_name_and_ver() {
+            let mut proto_request = protobuf::ConnectionRequest::new();
+            proto_request.addresses.push(protobuf::NodeAddress {
+                host: "localhost".into(),
+                port: 6379,
+                ..Default::default()
+            });
+
+            let name = "LibraryName";
+            proto_request.lib_name = name.into();
+
+            let request: ConnectionRequest = proto_request.into();
+            assert_eq!(request.lib_name.as_deref(), Some(name));
+            assert_eq!(request.lib_ver, None);
+        }
 
         #[test]
         fn test_compression_config_conversion_none() {

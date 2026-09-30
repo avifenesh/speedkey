@@ -178,9 +178,10 @@ export class GlideBf {
         key: GlideString,
     ): Promise<BfInfoResult> {
         const args: GlideString[] = ["BF.INFO", key];
-        const result = await _handleCustomCommand<
-            (GlideString | number)[]
-        >(client, args);
+        const result = await _handleCustomCommand<(GlideString | number)[]>(
+            client,
+            args,
+        );
         return _parseBfInfoResult(result);
     }
 
@@ -292,29 +293,27 @@ export class GlideBf {
  * BF.INFO returns alternating key-value pairs:
  * ["Capacity", 10000, "Size", 7328, "Number of filters", 1, "Number of items inserted", 3, "Expansion rate", 2]
  */
-function _parseBfInfoResult(
-    result: (GlideString | number)[],
-): BfInfoResult {
+function _parseBfInfoResult(result: (GlideString | number)[]): BfInfoResult {
     const info: BfInfoResult = {
         capacity: 0,
         size: 0,
         numberOfFilters: 0,
         numberOfItems: 0,
-        expansionRate: 0,
+        expansionRate: null,
     };
 
     for (let i = 0; i < result.length; i += 2) {
         const key = String(result[i]).toLowerCase();
-        const value = result[i + 1] as number;
+        const value = result[i + 1] as number | null;
 
         if (key === "capacity") {
-            info.capacity = value;
+            info.capacity = value ?? 0;
         } else if (key === "size") {
-            info.size = value;
+            info.size = value ?? 0;
         } else if (key.includes("number of filters")) {
-            info.numberOfFilters = value;
+            info.numberOfFilters = value ?? 0;
         } else if (key.includes("number of items")) {
-            info.numberOfItems = value;
+            info.numberOfItems = value ?? 0;
         } else if (key.includes("expansion")) {
             info.expansionRate = value;
         }

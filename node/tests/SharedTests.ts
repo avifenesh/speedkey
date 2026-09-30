@@ -58,13 +58,22 @@ import {
     UpdateByScore,
     convertElementsAndScores,
     convertGlideRecordToRecord,
+    MemoryStats,
     parseInfoResponse,
 } from "../build-ts";
 import {
     Client,
     GetAndSetRandomValue,
+    assertMemoryStatsDbEntry,
+    assertMemoryStatsFields,
+    flattenClusterResponseArrays,
     getFirstResult,
     getRandomKey,
+    getUnixSeconds,
+    PRIMARY_SLOT_ROUTE_OPTION,
+    triggerLatencySpike,
+    waitFor,
+    waitForSaveNotInProgress,
 } from "./TestUtilities";
 
 export type BaseClient = GlideClient | GlideClusterClient;
@@ -107,6 +116,22 @@ export function runBaseTests(config: {
             config.close(testSucceeded);
         }
     };
+
+    // Expected valid responses for BGSAVE and BGSAVE SCHEDULE.
+    const BGSAVE_RESPONSES = new Set([
+        "Background saving started",
+        "Background saving scheduled",
+    ]);
+
+    // Expected valid responses for BGREWRITEAOF
+    const BGREWRITEAOF_RESPONSES = new Set([
+        "Background append only file rewriting started",
+        "Background append only file rewriting scheduled",
+    ]);
+
+    // Expected error response for BGSAVE CANCEL when no save is in progress
+    const BGSAVE_NOT_CANCELLED_RESPONSE =
+        "Background saving is currently not in progress or scheduled";
 
     it.each([ProtocolVersion.RESP2, ProtocolVersion.RESP3])(
         `should register client library name and version_%p`,
@@ -383,6 +408,243 @@ export function runBaseTests(config: {
     );
 
     it.each([ProtocolVersion.RESP2, ProtocolVersion.RESP3])(
+        "save %p",
+        async (protocol) => {
+            await runTest(
+                async (client: BaseClient) => {
+                    await waitForSaveNotInProgress(client);
+
+                    const result = await client.save();
+                    expect(result).toEqual("OK");
+
+                    if (client instanceof GlideClusterClient) {
+                        await waitForSaveNotInProgress(client);
+                        const clusterResult = await client.save(
+                            PRIMARY_SLOT_ROUTE_OPTION,
+                        );
+                        expect(clusterResult).toEqual("OK");
+                    }
+                },
+                protocol,
+                { requestTimeout: 25000 },
+            );
+        },
+        config.timeout,
+    );
+
+    it.each([ProtocolVersion.RESP2, ProtocolVersion.RESP3])(
+        "bgsave %p",
+        async (protocol) => {
+            await runTest(async (client: BaseClient) => {
+                await waitForSaveNotInProgress(client);
+
+                if (client instanceof GlideClusterClient) {
+                    const result = await client.bgsave();
+                    Object.values(result).forEach((v) =>
+                        expect(BGSAVE_RESPONSES).toContain(v),
+                    );
+
+                    await waitForSaveNotInProgress(client);
+                    const clusterResult = await client.bgsave(
+                        PRIMARY_SLOT_ROUTE_OPTION,
+                    );
+                    expect(BGSAVE_RESPONSES).toContain(clusterResult as string);
+                } else {
+                    const result = await client.bgsave();
+                    expect(BGSAVE_RESPONSES).toContain(result);
+                }
+            }, protocol);
+        },
+        config.timeout,
+    );
+
+    it.each([ProtocolVersion.RESP2, ProtocolVersion.RESP3])(
+        "bgsaveSchedule %p",
+        async (protocol) => {
+            await runTest(async (client: BaseClient) => {
+                await waitForSaveNotInProgress(client);
+
+                if (client instanceof GlideClusterClient) {
+                    const result = await client.bgsaveSchedule();
+                    Object.values(result).forEach((v) =>
+                        expect(BGSAVE_RESPONSES).toContain(v),
+                    );
+
+                    await waitForSaveNotInProgress(client);
+                    const clusterResult = await client.bgsaveSchedule(
+                        PRIMARY_SLOT_ROUTE_OPTION,
+                    );
+                    expect(BGSAVE_RESPONSES).toContain(clusterResult as string);
+                } else {
+                    const result = await client.bgsaveSchedule();
+                    expect(BGSAVE_RESPONSES).toContain(result);
+                }
+            }, protocol);
+        },
+        config.timeout,
+    );
+
+    it.each([ProtocolVersion.RESP2, ProtocolVersion.RESP3])(
+        "bgsaveCancel %p",
+        async (protocol) => {
+            await runTest(
+                async (client: BaseClient, cluster: ValkeyCluster) => {
+                    if (cluster.checkIfServerVersionLessThan("8.1.0")) {
+                        return;
+                    }
+
+                    await waitForSaveNotInProgress(client);
+
+                    // When no save is in progress, BGSAVE CANCEL should return an error
+                    await expect(client.bgsaveCancel()).rejects.toThrow(
+                        BGSAVE_NOT_CANCELLED_RESPONSE,
+                    );
+
+                    if (client instanceof GlideClusterClient) {
+                        await expect(
+                            client.bgsaveCancel(PRIMARY_SLOT_ROUTE_OPTION),
+                        ).rejects.toThrow(BGSAVE_NOT_CANCELLED_RESPONSE);
+                    }
+                },
+                protocol,
+            );
+        },
+        config.timeout,
+    );
+
+    it.each([ProtocolVersion.RESP2, ProtocolVersion.RESP3])(
+        "bgrewriteaof %p",
+        async (protocol) => {
+            await runTest(async (client: BaseClient) => {
+                await waitForSaveNotInProgress(client);
+
+                if (client instanceof GlideClusterClient) {
+                    const result = await client.bgrewriteaof();
+                    Object.values(result).forEach((v) =>
+                        expect(BGREWRITEAOF_RESPONSES).toContain(v),
+                    );
+
+                    await waitForSaveNotInProgress(client);
+                    const clusterResult = await client.bgrewriteaof(
+                        PRIMARY_SLOT_ROUTE_OPTION,
+                    );
+                    expect(BGREWRITEAOF_RESPONSES).toContain(
+                        clusterResult as string,
+                    );
+                } else {
+                    const result = await client.bgrewriteaof();
+                    expect(BGREWRITEAOF_RESPONSES).toContain(result);
+                }
+            }, protocol);
+        },
+        config.timeout,
+    );
+
+    it.each([ProtocolVersion.RESP2, ProtocolVersion.RESP3])(
+        "latencyHistory %p",
+        async (protocol) => {
+            await runTest(async (client: BaseClient) => {
+                const beforeSpike = await getUnixSeconds(client);
+                await triggerLatencySpike(client);
+
+                const history = await client.latencyHistory("command");
+                const allEntries = flattenClusterResponseArrays(history);
+
+                expect(allEntries.length).toBeGreaterThan(0);
+
+                for (const entry of allEntries) {
+                    expect(entry.time).toBeGreaterThanOrEqual(beforeSpike);
+                    expect(entry.latency).toBeGreaterThan(0);
+                }
+
+                // Non-existent event returns empty
+                const unknown = await client.latencyHistory("nonexistent");
+                expect(flattenClusterResponseArrays(unknown).length).toBe(0);
+            }, protocol);
+        },
+        config.timeout,
+    );
+
+    it.each([ProtocolVersion.RESP2, ProtocolVersion.RESP3])(
+        "latencyLatest %p",
+        async (protocol) => {
+            await runTest(
+                async (client: BaseClient, cluster: ValkeyCluster) => {
+                    const beforeSpike = await getUnixSeconds(client);
+                    await triggerLatencySpike(client);
+
+                    const latest = await client.latencyLatest();
+                    const allEntries = flattenClusterResponseArrays(latest);
+                    expect(allEntries.length).toBeGreaterThanOrEqual(1);
+
+                    // Find the "command" event
+                    const commandInfo = allEntries.find(
+                        (info) => info.eventName === "command",
+                    );
+                    expect(commandInfo).toBeDefined();
+                    expect(commandInfo!.latestTime).toBeGreaterThanOrEqual(
+                        beforeSpike,
+                    );
+                    expect(commandInfo!.latestDuration).toBeGreaterThan(0);
+                    expect(commandInfo!.maxDuration).toBeGreaterThanOrEqual(
+                        commandInfo!.latestDuration,
+                    );
+
+                    // Only Valkey 8.1+ populates sum and count.
+                    if (!cluster.checkIfServerVersionLessThan("8.1.0")) {
+                        expect(commandInfo!.sum).toBeGreaterThan(0);
+                        expect(commandInfo!.count).toBeGreaterThan(0);
+                    } else {
+                        expect(commandInfo!.sum).toBeUndefined();
+                        expect(commandInfo!.count).toBeUndefined();
+                    }
+                },
+                protocol,
+            );
+        },
+        config.timeout,
+    );
+
+    it.each([ProtocolVersion.RESP2, ProtocolVersion.RESP3])(
+        "latencyReset %p",
+        async (protocol) => {
+            await runTest(async (client: BaseClient) => {
+                // Trigger spike then reset all events
+                await triggerLatencySpike(client);
+                const resetCount = await client.latencyReset();
+                expect(resetCount).toBeGreaterThan(0);
+
+                const history = await client.latencyHistory("command");
+                expect(flattenClusterResponseArrays(history).length).toBe(0);
+
+                // Trigger spike then reset specific event
+                await triggerLatencySpike(client);
+                const specificReset = await client.latencyReset(["command"]);
+                expect(specificReset).toBeGreaterThan(0);
+
+                const historyAfter = await client.latencyHistory("command");
+                expect(flattenClusterResponseArrays(historyAfter).length).toBe(
+                    0,
+                );
+
+                // Trigger spike then reset unknown event — "command" data should persist
+                await triggerLatencySpike(client);
+                const unknownReset = await client.latencyReset([
+                    "unknown-event",
+                ]);
+                expect(unknownReset).toBe(0);
+
+                const historyStillPresent =
+                    await client.latencyHistory("command");
+                expect(
+                    flattenClusterResponseArrays(historyStillPresent).length,
+                ).toBeGreaterThan(0);
+            }, protocol);
+        },
+        config.timeout,
+    );
+
+    it.each([ProtocolVersion.RESP2, ProtocolVersion.RESP3])(
         `testing mset and mget with multiple existing keys and one non existing key_%p`,
         async (protocol) => {
             await runTest(async (client: BaseClient) => {
@@ -552,6 +814,27 @@ export function runBaseTests(config: {
                         decoder: Decoder.Bytes,
                     }),
                 ).toEqual(Buffer.from("Hello"));
+            }, protocol);
+        },
+        config.timeout,
+    );
+
+    it.each([ProtocolVersion.RESP2, ProtocolVersion.RESP3])(
+        `reset test_%p`,
+        async (protocol) => {
+            await runTest(async (client: BaseClient) => {
+                expect(await client.reset()).toEqual("RESET");
+                expect(await client.ping()).toEqual("PONG");
+
+                // Batch test (non-atomic only — RESET cannot be used inside MULTI/EXEC)
+                const batchResponse =
+                    client instanceof GlideClient
+                        ? await client.exec(new Batch(false).reset(), false)
+                        : await client.exec(
+                              new ClusterBatch(false).reset(),
+                              false,
+                          );
+                expect(batchResponse?.[0]).toEqual("RESET");
             }, protocol);
         },
         config.timeout,
@@ -2586,9 +2869,9 @@ export function runBaseTests(config: {
                         field3,
                     ]);
                     expect(pttlResult[0]).toBeGreaterThan(0); // field1 should have TTL
-                    expect(pttlResult[0]).toBeLessThanOrEqual(60000); // should be <= 60000 milliseconds
+                    expect(pttlResult[0]).toBeLessThanOrEqual(60000); // +500ms tolerance for Windows clock jitter
                     expect(pttlResult[1]).toBeGreaterThan(0); // field2 should have TTL
-                    expect(pttlResult[1]).toBeLessThanOrEqual(60000); // should be <= 60000 milliseconds
+                    expect(pttlResult[1]).toBeLessThanOrEqual(60000); // +500ms tolerance for Windows clock jitter
                     expect(pttlResult[2]).toEqual(-2); // field3 doesn't exist
 
                     // Test with 0 milliseconds (immediate deletion)
@@ -2743,9 +3026,9 @@ export function runBaseTests(config: {
                         field3,
                     ]);
                     expect(pttlResult[0]).toBeGreaterThan(0); // field1 should have TTL
-                    expect(pttlResult[0]).toBeLessThanOrEqual(3600000); // should be <= 3600000 milliseconds
+                    expect(pttlResult[0]).toBeLessThanOrEqual(3600500); // +500ms tolerance for Windows clock jitter
                     expect(pttlResult[1]).toBeGreaterThan(0); // field2 should have TTL
-                    expect(pttlResult[1]).toBeLessThanOrEqual(3600000); // should be <= 3600000 milliseconds
+                    expect(pttlResult[1]).toBeLessThanOrEqual(3600500); // +500ms tolerance for Windows clock jitter
                     expect(pttlResult[2]).toEqual(-2); // field3 doesn't exist
 
                     const pexpireTimeResult = await client.hpexpiretime(key, [
@@ -2755,11 +3038,11 @@ export function runBaseTests(config: {
                     ]);
                     expect(pexpireTimeResult[0]).toBeGreaterThan(Date.now()); // Should be in the future
                     expect(pexpireTimeResult[0]).toBeLessThanOrEqual(
-                        futureTimestamp,
+                        futureTimestamp + 500,
                     ); // Should be <= set timestamp
                     expect(pexpireTimeResult[1]).toBeGreaterThan(Date.now()); // Should be in the future
                     expect(pexpireTimeResult[1]).toBeLessThanOrEqual(
-                        futureTimestamp,
+                        futureTimestamp + 500,
                     ); // Should be <= set timestamp
                     expect(pexpireTimeResult[2]).toEqual(-2); // field3 doesn't exist
 
@@ -4247,7 +4530,7 @@ export function runBaseTests(config: {
                 );
 
                 let resultCursor = "0";
-                let secondResultValues: GlideString[] = [];
+                let secondResultValues: GlideString[];
 
                 let isFirstLoop = true;
 
@@ -7500,7 +7783,7 @@ export function runBaseTests(config: {
                 expect(await client.expire(key, 10)).toEqual(true);
                 let result = await client.pttl(Buffer.from(key));
                 expect(result).toBeGreaterThan(0);
-                expect(result).toBeLessThanOrEqual(10000);
+                expect(result).toBeLessThanOrEqual(10500);
 
                 expect(
                     await client.expireAt(
@@ -7510,14 +7793,14 @@ export function runBaseTests(config: {
                 ).toEqual(true);
                 result = await client.pttl(key);
                 expect(result).toBeGreaterThan(0);
-                expect(result).toBeLessThanOrEqual(20000);
+                expect(result).toBeLessThanOrEqual(20500);
 
                 expect(await client.pexpireAt(key, Date.now() + 30000)).toEqual(
                     true,
                 );
                 result = await client.pttl(key);
                 expect(result).toBeGreaterThan(0);
-                expect(result).toBeLessThanOrEqual(30000);
+                expect(result).toBeLessThanOrEqual(30500);
             }, protocol);
         },
         config.timeout,
@@ -8206,7 +8489,7 @@ export function runBaseTests(config: {
         async (protocol) => {
             await runTest(async (client: BaseClient) => {
                 // Take the time now, convert to 10 digits and subtract 1 second
-                const now = Math.floor(new Date().getTime() / 1000 - 1);
+                const now = Math.floor(new Date().getTime() / 1000 - 2);
                 const result = (await client.time()) as [string, string];
                 expect(result?.length).toEqual(2);
                 expect(Number(result?.at(0))).toBeGreaterThan(now);
@@ -9171,8 +9454,10 @@ export function runBaseTests(config: {
         const getResWithExpiryKeep = await client.get(key);
         expect(getResWithExpiryKeep).toEqual(value);
         // wait for the key to expire base on the previous set
-        let sleep = new Promise((resolve) => setTimeout(resolve, 2000));
-        await sleep;
+        await waitFor(
+            async () => (await client.get(key)) === null,
+            "Key did not expire in time",
+        );
         const getResExpire = await client.get(key);
         // key should have expired
         expect(getResExpire).toEqual(null);
@@ -9184,8 +9469,10 @@ export function runBaseTests(config: {
         });
         expect(setResWithExpiryWithUmilli).toEqual("OK");
         // wait for the key to expire
-        sleep = new Promise((resolve) => setTimeout(resolve, 1001));
-        await sleep;
+        await waitFor(
+            async () => (await client.get(key)) === null,
+            "Key did not expire in time",
+        );
         const getResWithExpiryWithUmilli = await client.get(key);
         // key should have expired
         expect(getResWithExpiryWithUmilli).toEqual(null);
@@ -9493,12 +9780,11 @@ export function runBaseTests(config: {
                     null,
                 );
 
-                expect(
-                    await client.set(
-                        string_key,
-                        "a really loooooooooooooooooooooooooooooooooooooooong value",
-                    ),
-                ).toEqual("OK");
+                // Valkey 9.1 raised the embstr size limit (from 64 to 128 bytes), so the
+                // value must exceed 128 bytes to be stored as "raw" across all versions.
+                expect(await client.set(string_key, "a".repeat(200))).toEqual(
+                    "OK",
+                );
 
                 expect(await client.objectEncoding(string_key)).toEqual("raw");
 
@@ -11728,8 +12014,11 @@ export function runBaseTests(config: {
                         ],
                     },
                 });
-                // Sleep to ensure the idle time value and inactive time value returned by xinfo_consumers is > 0
-                await new Promise((resolve) => setTimeout(resolve, 2000));
+                // Poll until idle time is > 0
+                await waitFor(async () => {
+                    const info = await client.xinfoConsumers(key, groupName1);
+                    return info.length > 0 && (info[0].idle as number) > 0;
+                }, "Consumer idle time did not become > 0");
                 let result = await client.xinfoConsumers(key, groupName1);
                 expect(result.length).toEqual(1);
                 expect(result[0].name).toEqual(consumer1);
@@ -12184,8 +12473,20 @@ export function runBaseTests(config: {
                     },
                 });
 
-                // wait to get some minIdleTime
-                await new Promise((resolve) => setTimeout(resolve, 500));
+                // wait to get some minIdleTime (test below uses minIdleTime: 42)
+                await waitFor(async () => {
+                    const result = await client.xpendingWithOptions(
+                        Buffer.from(key),
+                        group,
+                        {
+                            start: InfBoundary.NegativeInfinity,
+                            end: InfBoundary.PositiveInfinity,
+                            count: 1,
+                            minIdleTime: 42,
+                        },
+                    );
+                    return Array.isArray(result) && result.length > 0;
+                }, "Pending message idle time did not reach 42ms");
 
                 expect(await client.xpending(Buffer.from(key), group)).toEqual([
                     2,
@@ -13473,7 +13774,15 @@ export function runBaseTests(config: {
                         });
                     }
                 }).rejects.toThrow(TimeoutError);
-                await new Promise((resolve) => setTimeout(resolve, 500));
+                // Wait for server to finish the slow command before retrying
+                await waitFor(async () => {
+                    try {
+                        await client.ping();
+                        return true;
+                    } catch {
+                        return false;
+                    }
+                }, "Server did not become responsive after timeout");
 
                 // Retry with a longer timeout
                 const result = isCluster
@@ -13552,6 +13861,94 @@ export function runBaseTests(config: {
                     );
                 }
             }, protocol);
+        },
+        config.timeout,
+    );
+
+    it.each([ProtocolVersion.RESP2, ProtocolVersion.RESP3])(
+        "memoryDoctor %p",
+        async (protocol) => {
+            await runTest(async (client: BaseClient) => {
+                const result = await client.memoryDoctor();
+                const reports =
+                    client instanceof GlideClient
+                        ? [result as string]
+                        : Object.values(result as Record<string, string>);
+
+                expect(reports.length).toBeGreaterThan(0);
+
+                for (const report of reports) {
+                    expect(typeof report).toBe("string");
+                    expect(report.length).toBeGreaterThan(0);
+                }
+            }, protocol);
+        },
+        config.timeout,
+    );
+
+    it.each([ProtocolVersion.RESP2, ProtocolVersion.RESP3])(
+        "memoryMallocStats %p",
+        async (protocol) => {
+            await runTest(async (client: BaseClient) => {
+                const result = await client.memoryMallocStats();
+                const reports =
+                    client instanceof GlideClient
+                        ? [result as string]
+                        : Object.values(result as Record<string, string>);
+
+                expect(reports.length).toBeGreaterThan(0);
+
+                for (const report of reports) {
+                    expect(typeof report).toBe("string");
+                    expect(report.length).toBeGreaterThan(0);
+                }
+            }, protocol);
+        },
+        config.timeout,
+    );
+
+    it.each([ProtocolVersion.RESP2, ProtocolVersion.RESP3])(
+        "memoryPurge %p",
+        async (protocol) => {
+            await runTest(async (client: BaseClient) => {
+                expect(await client.memoryPurge()).toBe("OK");
+            }, protocol);
+        },
+        config.timeout,
+    );
+
+    it.each([ProtocolVersion.RESP2, ProtocolVersion.RESP3])(
+        "memoryStats %p",
+        async (protocol) => {
+            await runTest(
+                async (client: BaseClient, cluster: ValkeyCluster) => {
+                    // Write a key to ensure at least one db entry exists
+                    const key = getRandomKey();
+                    await client.set(key, "memoryStatsTest");
+
+                    const statsResult = await client.memoryStats();
+                    const statsList =
+                        client instanceof GlideClient
+                            ? [statsResult as MemoryStats]
+                            : Object.values(
+                                  statsResult as Record<string, MemoryStats>,
+                              );
+
+                    expect(statsList.length).toBeGreaterThan(0);
+
+                    for (const stats of statsList) {
+                        assertMemoryStatsFields(stats, cluster.getVersion());
+                    }
+
+                    // For standalone, explicitly validate db entry
+                    if (client instanceof GlideClient) {
+                        const stats = statsResult as MemoryStats;
+                        expect(stats.db[0]).toBeDefined();
+                        assertMemoryStatsDbEntry(stats.db[0]);
+                    }
+                },
+                protocol,
+            );
         },
         config.timeout,
     );

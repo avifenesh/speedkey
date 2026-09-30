@@ -10,6 +10,8 @@ on:
             - node/package.json
             - node/npm/**
             - glide-core/**/Cargo.toml
+            - glide-logger/**/Cargo.toml
+            - glide-telemetry/**/Cargo.toml
             - node/rust-client/Cargo.lock
             - node/rust-client/Cargo.toml
             - node/rust-client/src/**
@@ -425,7 +427,7 @@ jobs:
               run: |
                   echo "Setting version in base package using sed..."
                   cd ./npm/glide
-                  sed -i 's/"version": "0\.0\.0"/"version": "'"${NAPI_RS_VERSION_FROM_TAG}"'"/' package.json
+                  sed -i 's/"version": "[^"]*"/"version": "'"${NAPI_RS_VERSION_FROM_TAG}"'"/' package.json
                   echo "Base package version is now: $(jq -r .version package.json)"
 
             - name: Install NAPI-RS CLI
@@ -444,7 +446,7 @@ jobs:
                       platform=$(basename "$dir")
                       echo "Setting version ${VERSION} in ${platform}"
                       cd "$dir"
-                      sed -i 's/"version": "0\.0\.0"/"version": "'"${VERSION}"'"/' package.json
+                      sed -i 's/"version": "[^"]*"/"version": "'"${VERSION}"'"/' package.json
                       echo "  Version: $(jq -r .version package.json)"
                       cd ../..
                     fi

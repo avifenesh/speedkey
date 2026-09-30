@@ -18,10 +18,13 @@ import {
     GlideString,
     PubSubMsg,
     convertGlideRecordToRecord,
+    isGlideRecord,
 } from "./BaseClient";
 import { RequestError } from "./Errors";
 import { ClusterBatch } from "./Batch";
 import {
+    ClientPauseMode,
+    ClientTrackingInfo,
     ClusterBatchOptions,
     ClusterScanOptions,
     FlushMode,
@@ -30,9 +33,15 @@ import {
     FunctionRestorePolicy,
     FunctionStatsSingleResponse,
     InfoOptions,
+    LatencyEntry,
+    LatencyEventInfo,
     LolwutOptions,
+    MemoryStats,
     createClientGetName,
     createClientId,
+    createClientPause,
+    createClientTrackingInfo,
+    createClientUnpause,
     createConfigGet,
     createConfigResetStat,
     createConfigRewrite,
@@ -52,9 +61,23 @@ import {
     createFunctionLoad,
     createFunctionRestore,
     createFunctionStats,
+    createGetSubscriptions,
     createInfo,
     createLastSave,
+    createLatencyHistory,
+    createLatencyLatest,
+    createLatencyReset,
     createLolwut,
+    createMemoryDoctor,
+    createMemoryMallocStats,
+    createMemoryPurge,
+    createMemoryStats,
+    parseLatencyHistoryResponse,
+    parseLatencyLatestResponse,
+    parseMemoryStatsResponse,
+    createSave,
+    createBgSave,
+    createBgRewriteAof,
     createPing,
     createPubSubShardNumSub,
     createPublish,
@@ -63,9 +86,26 @@ import {
     createScriptExists,
     createScriptFlush,
     createScriptKill,
+    createSSubscribeLazy,
+    createSSubscribe,
+    createSUnsubscribeLazy,
+    createSUnsubscribe,
     createTime,
     createUnWatch,
+    parseClientTrackingInfoResponse,
 } from "./Commands";
+
+/**
+ * Constant representing all sharded channels.
+ * Use this to unsubscribe from all sharded channel subscriptions at once..
+ *
+ * @example
+ * ```typescript
+ * await client.sunsubscribeLazy(ALL_SHARDED_CHANNELS);
+ * ```
+ */
+export const ALL_SHARDED_CHANNELS = null;
+
 /** An extension to command option types with {@link Routes}. */
 export interface RouteOption {
     /**
@@ -146,6 +186,51 @@ export namespace GlideClusterClientConfiguration {
         context?: any;
     }
 }
+
+/**
+ * Represents the subscription state for a cluster client.
+ *
+ * @remarks
+ * This interface provides information about the current PubSub subscriptions for a cluster client.
+ * It includes both the desired subscriptions (what the client wants to maintain) and the actual
+ * subscriptions (what is currently established on the server).
+ *
+ * The subscriptions are organized by channel mode:
+ * - {@link GlideClusterClientConfiguration.PubSubChannelModes.Exact | Exact}: Exact channel names
+ * - {@link GlideClusterClientConfiguration.PubSubChannelModes.Pattern | Pattern}: Channel patterns using glob-style matching
+ * - {@link GlideClusterClientConfiguration.PubSubChannelModes.Sharded | Sharded}: Sharded channels (available since Valkey 7.0)
+ *
+ * @example
+ * ```typescript
+ * const state = await clusterClient.getSubscriptions();
+ * console.log("Desired exact channels:", state.desiredSubscriptions[GlideClusterClientConfiguration.PubSubChannelModes.Exact]);
+ * console.log("Actual sharded channels:", state.actualSubscriptions[GlideClusterClientConfiguration.PubSubChannelModes.Sharded]);
+ * ```
+ */
+export interface ClusterPubSubState {
+    /**
+     * Desired subscriptions organized by channel mode.
+     * These are the subscriptions the client wants to maintain.
+     */
+    desiredSubscriptions: Partial<
+        Record<
+            GlideClusterClientConfiguration.PubSubChannelModes,
+            Set<GlideString>
+        >
+    >;
+
+    /**
+     * Actual subscriptions currently active on the server.
+     * These are the subscriptions that are actually established.
+     */
+    actualSubscriptions: Partial<
+        Record<
+            GlideClusterClientConfiguration.PubSubChannelModes,
+            Set<GlideString>
+        >
+    >;
+}
+
 /**
  * Configuration options for creating a {@link GlideClusterClient | GlideClusterClient}.
  *
@@ -159,6 +244,7 @@ export namespace GlideClusterClientConfiguration {
  *   - `"enabledDefaultConfigs"`: Enables periodic checks with default configurations.
  *   - `"disabled"`: Disables periodic topology checks.
  *   - `{ duration_in_sec: number }`: Manually configure the interval for periodic checks.
+ * - **Client-Side Caching**: Use `clientSideCache` (inherited from BaseClientConfiguration) to enable local caching for improved performance.
  * - **Pub/Sub Subscriptions**: Predefine Pub/Sub channels and patterns to subscribe to upon connection establishment.
  *   - Supports exact channels, patterns, and sharded channels (available since Valkey version 7.0).
  *
@@ -170,6 +256,7 @@ export namespace GlideClusterClientConfiguration {
  *     { host: 'cluster-node-2.example.com', port: 6379 },
  *   ],
  *   databaseId: 5, // Connect to database 5 (requires Valkey 9.0+ with multi-database cluster mode)
+ *   clientSideCache: ClientSideCache.create(2048, 0), // Enable 2MB client-side cache, no TTL
  *   periodicChecks: {
  *     duration_in_sec: 30, // Perform periodic checks every 30 seconds
  *   },
@@ -192,6 +279,15 @@ export type GlideClusterClientConfiguration = BaseClientConfiguration & {
      * If not set, `enabledDefaultConfigs` will be used.
      */
     periodicChecks?: PeriodicChecks;
+
+    /**
+     * The maximum number of requests to buffer in the recovery queue when a cluster
+     * reconnect is in progress. Buffered requests are retried transparently after
+     * reconnection. Requests beyond this limit are failed immediately to provide
+     * bounded memory usage. If not set, a default value of 1000 will be used.
+     * Set to 0 to disable the recovery queue and use fail-fast behavior.
+     */
+    recoveryRequestsQueueSize?: number;
 
     /**
      * PubSub subscriptions to be used for the client.
@@ -248,6 +344,26 @@ type ClusterGlideRecord<T> = GlideRecord<T> | T;
 
 /**
  * @internal
+ * Determines whether a command response is from a single node based on routing.
+ *
+ * @param isRoutedToSingleNodeByDefault - Whether the command defaults to a single node.
+ * @param route - The route option provided by the caller.
+ * @returns `true` if the response is from a single node.
+ */
+function isSingleNodeRoute(
+    isRoutedToSingleNodeByDefault: boolean,
+    route?: Routes,
+): boolean {
+    return (
+        // route not given and command is routed by default to a random node
+        (!route && isRoutedToSingleNodeByDefault) ||
+        // or route is given and it is a single node route
+        (Boolean(route) && route !== "allPrimaries" && route !== "allNodes")
+    );
+}
+
+/**
+ * @internal
  * Convert {@link ClusterGlideRecord} to {@link ClusterResponse}.
  *
  * @param res - Value received from Glide core.
@@ -260,16 +376,41 @@ function convertClusterGlideRecord<T>(
     isRoutedToSingleNodeByDefault: boolean,
     route?: Routes,
 ): ClusterResponse<T> {
-    const isSingleNodeResponse =
-        // route not given and command is routed by default to a random node
-        (!route && isRoutedToSingleNodeByDefault) ||
-        // or route is given and it is a single node route
-        (Boolean(route) && route !== "allPrimaries" && route !== "allNodes");
-
-    return isSingleNodeResponse
+    return isSingleNodeRoute(isRoutedToSingleNodeByDefault, route)
         ? (res as T)
         : convertGlideRecordToRecord(res as GlideRecord<T>);
 }
+
+/**
+ * Converts a cluster response by applying a transform function to each node's raw value.
+ * Handles both single-node and multi-node routing automatically.
+ *
+ * @param res - Raw response from Glide core.
+ * @param isSingleNode - Whether the response is from a single node.
+ * @param transform - A function that transforms the raw value into the desired type.
+ * @returns Transformed single value or a record mapping node addresses to transformed values.
+ */
+function convertAndParseClusterResponse<TRaw, TParsed>(
+    res: ClusterGlideRecord<TRaw>,
+    isSingleNode: boolean,
+    transform: (raw: TRaw) => TParsed,
+): ClusterResponse<TParsed> {
+    if (isSingleNode) {
+        return transform(res as TRaw);
+    }
+
+    const record = convertGlideRecordToRecord(
+        res as GlideRecord<TRaw>,
+    ) as Record<string, TRaw>;
+    const result: Record<string, TParsed> = {};
+
+    for (const [node, raw] of Object.entries(record)) {
+        result[node] = transform(raw);
+    }
+
+    return result;
+}
+
 /**
  * Routing configuration for commands based on a specific slot ID in a Valkey cluster.
  *
@@ -517,7 +658,7 @@ export type SingleNodeRoute =
  * Client used for connection to cluster servers.
  * Use {@link createClient} to request a client.
  *
- * @see For full documentation refer to {@link https://github.com/valkey-io/valkey-glide/wiki/NodeJS-wrapper#cluster | Valkey Glide Wiki}.
+ * @see For full documentation refer to {@link https://glide.valkey.io/how-to/client-initialization/#cluster | Valkey GLIDE Documentation}.
  */
 export class GlideClusterClient extends BaseClient {
     /**
@@ -546,6 +687,11 @@ export class GlideClusterClient extends BaseClient {
         }
 
         this.configurePubsub(options, configuration);
+
+        if (options.recoveryRequestsQueueSize !== undefined) {
+            configuration.recoveryRequestsQueueSize =
+                options.recoveryRequestsQueueSize;
+        }
 
         if (options.advancedConfiguration) {
             this.configureAdvancedConfigurationBase(
@@ -579,7 +725,7 @@ export class GlideClusterClient extends BaseClient {
      * @example
      * ```typescript
      * // Connecting to a Cluster
-     * import { GlideClusterClient, GlideClusterClientConfiguration } from '@valkey/valkey-glide';
+     * import { GlideClusterClient, GlideClusterClientConfiguration } from '@glidemq/speedkey';
      *
      * const client = await GlideClusterClient.createClient({
      *   addresses: [
@@ -630,6 +776,52 @@ export class GlideClusterClient extends BaseClient {
             options,
             (options?: GlideClusterClientConfiguration) =>
                 new GlideClusterClient(options),
+        );
+    }
+
+    /**
+     * Acquire a pool client by ID and wrap it as a GlideClusterClient.
+     *
+     * Called by {@link ClientPool} after a successful `poolTryAcquire` or
+     * `poolAcquireBlocking`. Spins up a fresh worker thread for the
+     * already-connected pool client and returns a fully operational instance.
+     *
+     * @internal - intended for use by ClientPool only.
+     */
+    public static async fromPoolClientId(
+        clientId: number,
+        options: GlideClusterClientConfiguration,
+    ): Promise<GlideClusterClient> {
+        const { poolBuildHandle } = await import("../build-ts/native");
+        // Create the client instance whose handleResponsesAvailable will be stored
+        // as the Rust TSFN wake callback. The same instance must be the one that
+        // receives the handle — arrow functions bind `this` at construction, so
+        // the callback and the client handle MUST live on the same object.
+        const client = new GlideClusterClient(options);
+        const handle = await poolBuildHandle(
+            clientId,
+            (client as unknown as { handleResponsesAvailable: () => void })
+                .handleResponsesAvailable,
+        );
+        // Inject the handle into the SAME instance whose callback was registered.
+        (client as unknown as { clientHandle: typeof handle }).clientHandle =
+            handle;
+        return client;
+    }
+
+    /**
+     * @internal
+     * Serialise a {@link GlideClusterClientConfiguration} into the protobuf
+     * bytes used by the pool Rust APIs.  Does not open a network connection.
+     */
+    public static serializeConfig(options: GlideClusterClientConfiguration): {
+        bytes: Uint8Array;
+        resolverKey: string | undefined;
+    } {
+        return super.serializeConnectionRequest(
+            options,
+            (opts?: BaseClientConfiguration) =>
+                new GlideClusterClient(opts as GlideClusterClientConfiguration),
         );
     }
 
@@ -711,7 +903,7 @@ export class GlideClusterClient extends BaseClient {
      * Using the same cursor object for multiple iterations may result in unexpected behavior.
      *
      * For more information about the Cluster Scan implementation, see
-     * {@link https://github.com/valkey-io/valkey-glide/wiki/General-Concepts#cluster-scan | Cluster Scan}.
+     * {@link https://glide.valkey.io/concepts/client-features/cluster-scan/ | Cluster Scan}.
      *
      * This method can iterate over all keys in the database from the start of the scan until it ends.
      * The same key may be returned in multiple scan iterations.
@@ -776,7 +968,7 @@ export class GlideClusterClient extends BaseClient {
      *
      * Note: An error will occur if the string decoder is used with commands that return only bytes as a response.
      *
-     * @see {@link https://github.com/valkey-io/valkey-glide/wiki/General-Concepts#custom-command|Glide for Valkey Wiki} for details on the restrictions and limitations of the custom command API.
+     * @see {@link https://glide.valkey.io/concepts/client-features/custom-commands/|Glide for Valkey Wiki} for details on the restrictions and limitations of the custom command API.
      *
      * @param args - A list including the command name and arguments for the custom command.
      * @param options - (Optional) See {@link RouteOption} and {@link DecoderOption}
@@ -811,7 +1003,7 @@ export class GlideClusterClient extends BaseClient {
      *
      * - **Atomic Batches (Transactions):** All key-based commands must map to the same hash slot. If keys span different slots, the transaction will fail. If the transaction fails due to a `WATCH` command, `exec` will return `null`.
      *
-     * @see {@link https://github.com/valkey-io/valkey-glide/wiki/NodeJS-wrapper#transaction|Valkey Glide Wiki} for details on Valkey Transactions.
+     * @see {@link https://github.com/valkey-io/valkey-glide/wiki/NodeJS-wrapper#transaction|Valkey GLIDE Documentation} for details on Valkey Transactions.
      *
      * **Retry and Redirection:**
      *
@@ -1052,6 +1244,56 @@ export class GlideClusterClient extends BaseClient {
             createClientId(),
             options,
         ).then((res) => convertClusterGlideRecord(res, true, options?.route));
+    }
+
+    /**
+     * Returns information about the current client connection's use
+     * of the server assisted client side caching feature.
+     *
+     * The command will be routed to a random node, unless `route` is provided.
+     *
+     * @see {@link https://valkey.io/commands/client-trackinginfo/|valkey.io} for details.
+     *
+     * @param options - (Optional) See {@link RouteOption}.
+     * @returns A {@link ClusterResponse} containing tracking info(s) for the client.
+     *
+     * @example
+     * ```typescript
+     * const info = await client.clientTrackingInfo();
+     * console.log(info.flags); // Set { "off" }
+     * console.log(info.redirect); // -1
+     * ```
+     *
+     * @example
+     * ```typescript
+     * const info = await client.clientTrackingInfo({ route: "allNodes" });
+     * // info is Record<string, ClientTrackingInfo>
+     * ```
+     */
+    public async clientTrackingInfo(
+        options?: RouteOption,
+    ): Promise<ClusterResponse<ClientTrackingInfo>> {
+        return this.createWritePromise<GlideRecord<unknown>>(
+            createClientTrackingInfo(),
+            options,
+        ).then((res) => {
+            if (isSingleNodeRoute(true, options?.route)) {
+                return parseClientTrackingInfoResponse(
+                    convertGlideRecordToRecord(res) as Record<string, unknown>,
+                );
+            }
+
+            const record = convertGlideRecordToRecord(
+                res as GlideRecord<unknown>,
+            ) as Record<string, Record<string, unknown>>;
+            const result: Record<string, ClientTrackingInfo> = {};
+
+            for (const [node, entry] of Object.entries(record)) {
+                result[node] = parseClientTrackingInfoResponse(entry);
+            }
+
+            return result;
+        });
     }
 
     /**
@@ -1766,6 +2008,232 @@ export class GlideClusterClient extends BaseClient {
     }
 
     /**
+     * Returns the latency spike time series for the specified event.
+     *
+     * The command will be routed to all primary nodes, unless `route` is provided.
+     *
+     * @see {@link https://valkey.io/commands/latency-history/|valkey.io} for details.
+     *
+     * @param event - The name of the latency event (e.g., `"command"`).
+     * @param options - (Optional) See {@link RouteOption}.
+     * @returns A {@link ClusterResponse} containing array(s) of {@link LatencyEntry} for the event.
+     *
+     * @example
+     * ```typescript
+     * const history = await client.latencyHistory("command");
+     * // history is Record<string, LatencyEntry[]> (multi-node) or LatencyEntry[] (single-node)
+     * ```
+     */
+    public async latencyHistory(
+        event: GlideString,
+        options?: RouteOption,
+    ): Promise<ClusterResponse<LatencyEntry[]>> {
+        return this.createWritePromise<ClusterGlideRecord<unknown[]>>(
+            createLatencyHistory(event),
+            options,
+        ).then((res) =>
+            convertAndParseClusterResponse(
+                res,
+                isSingleNodeRoute(false, options?.route),
+                (raw) => parseLatencyHistoryResponse(raw as unknown[]),
+            ),
+        );
+    }
+
+    /**
+     * Reports the latest latency events logged by the server.
+     *
+     * The command will be routed to all primary nodes, unless `route` is provided.
+     *
+     * @see {@link https://valkey.io/commands/latency-latest/|valkey.io} for details.
+     *
+     * @param options - (Optional) See {@link RouteOption}.
+     * @returns A {@link ClusterResponse} containing array(s) of {@link LatencyEventInfo} for the latest latency events.
+     *
+     * @example
+     * ```typescript
+     * const latest = await client.latencyLatest();
+     * // latest is Record<string, LatencyEventInfo[]> (multi-node) or LatencyEventInfo[] (single-node)
+     * ```
+     */
+    public async latencyLatest(
+        options?: RouteOption,
+    ): Promise<ClusterResponse<LatencyEventInfo[]>> {
+        return this.createWritePromise<ClusterGlideRecord<unknown[]>>(
+            createLatencyLatest(),
+            options,
+        ).then((res) =>
+            convertAndParseClusterResponse(
+                res,
+                isSingleNodeRoute(false, options?.route),
+                (raw) => parseLatencyLatestResponse(raw as unknown[]),
+            ),
+        );
+    }
+
+    /**
+     * Resets the latency spike time series for all or specified events.
+     * If no events are provided, resets the latency spike time series for all events.
+     *
+     * The command will be routed to all primary nodes, unless `route` is provided.
+     *
+     * @see {@link https://valkey.io/commands/latency-reset/|valkey.io} for details.
+     *
+     * @param events - The event names to reset. If not provided, resets all events.
+     * @param options - (Optional) See {@link RouteOption}.
+     * @returns The total number of event time series that were reset across all nodes.
+     *
+     * @example
+     * ```typescript
+     * await client.latencyReset(); // Resets all events
+     * await client.latencyReset(["command"], { route: "allNodes" });
+     * ```
+     */
+    public async latencyReset(
+        events?: GlideString[],
+        options?: RouteOption,
+    ): Promise<number> {
+        return this.createWritePromise(createLatencyReset(events), options);
+    }
+
+    /**
+     * Synchronously saves the dataset to disk.
+     *
+     * The command will be routed to all primary nodes, unless `route` is provided.
+     *
+     * @see {@link https://valkey.io/commands/save/|valkey.io} for more details.
+     *
+     * @param options - (Optional) See {@link RouteOption}.
+     * @returns `"OK"`
+     *
+     * @example
+     * ```typescript
+     * const result = await client.save();
+     * console.log(result); // "OK"
+     * ```
+     */
+    public async save(options?: RouteOption): Promise<"OK"> {
+        return this.createWritePromise(createSave(), {
+            decoder: Decoder.String,
+            ...options,
+        });
+    }
+
+    /**
+     * Asynchronously saves the dataset to disk in the background.
+     *
+     * The command will be routed to all primary nodes, unless `route` is provided.
+     *
+     * @see {@link https://valkey.io/commands/bgsave/|valkey.io} for more details.
+     *
+     * @param options - (Optional) See {@link RouteOption}.
+     * @returns A non-empty status string.
+     *
+     * @example
+     * ```typescript
+     * const result = await client.bgsave();
+     * console.log(result); // "Background saving started"
+     * ```
+     */
+    public async bgsave(
+        options?: RouteOption,
+    ): Promise<ClusterResponse<string>> {
+        return this.createWritePromise<ClusterGlideRecord<string>>(
+            createBgSave(),
+            {
+                decoder: Decoder.String,
+                ...options,
+            },
+        ).then((res) => convertClusterGlideRecord(res, false, options?.route));
+    }
+
+    /**
+     * Schedules a background save of the database.
+     *
+     * The command will be routed to all primary nodes, unless `route` is provided.
+     *
+     * @see {@link https://valkey.io/commands/bgsave/|valkey.io} for more details.
+     *
+     * @param options - (Optional) See {@link RouteOption}.
+     * @returns A non-empty status string.
+     *
+     * @example
+     * ```typescript
+     * const result = await client.bgsaveSchedule();
+     * console.log(result); // "Background saving scheduled"
+     * ```
+     */
+    public async bgsaveSchedule(
+        options?: RouteOption,
+    ): Promise<ClusterResponse<string>> {
+        return this.createWritePromise<ClusterGlideRecord<string>>(
+            createBgSave(["SCHEDULE"]),
+            {
+                decoder: Decoder.String,
+                ...options,
+            },
+        ).then((res) => convertClusterGlideRecord(res, false, options?.route));
+    }
+
+    /**
+     * Aborts all in-progress and scheduled background saves.
+     *
+     * The command will be routed to all primary nodes, unless `route` is provided.
+     *
+     * @see {@link https://valkey.io/commands/bgsave/|valkey.io} for more details.
+     *
+     * @since Valkey 8.1
+     *
+     * @param options - (Optional) See {@link RouteOption}.
+     * @returns A non-empty status string.
+     *
+     * @example
+     * ```typescript
+     * const result = await client.bgsaveCancel();
+     * console.log(result); // "Background saving cancelled"
+     * ```
+     */
+    public async bgsaveCancel(
+        options?: RouteOption,
+    ): Promise<ClusterResponse<string>> {
+        return this.createWritePromise<ClusterGlideRecord<string>>(
+            createBgSave(["CANCEL"]),
+            {
+                decoder: Decoder.String,
+                ...options,
+            },
+        ).then((res) => convertClusterGlideRecord(res, false, options?.route));
+    }
+
+    /**
+     * Initiates a background rewrite of the append-only file (AOF).
+     *
+     * The command will be routed to all primary nodes, unless `route` is provided.
+     *
+     * @see {@link https://valkey.io/commands/bgrewriteaof/|valkey.io} for more details.
+     *
+     * @param options - (Optional) See {@link RouteOption}.
+     * @returns A non-empty status string.
+     *
+     * @example
+     * ```typescript
+     * const result = await client.bgrewriteaof();
+     * console.log(result); // "Background append only file rewriting started"
+     * ```
+     */
+    public async bgrewriteaof(
+        options?: RouteOption,
+    ): Promise<ClusterResponse<string>> {
+        return this.createWritePromise<ClusterGlideRecord<string>>(
+            createBgRewriteAof(),
+            {
+                decoder: Decoder.String,
+                ...options,
+            },
+        ).then((res) => convertClusterGlideRecord(res, false, options?.route));
+    }
+
+    /**
      * Returns a random existing key name.
      *
      * The command will be routed to all primary nodes, unless `route` is provided.
@@ -1793,7 +2261,7 @@ export class GlideClusterClient extends BaseClient {
      *
      * The command will be routed to all primary nodes, unless `route` is provided
      *
-     * @see {@link https://valkey.io/commands/unwatch/|valkey.io} and {@link https://valkey.io/topics/transactions/#cas|Valkey Glide Wiki} for more details.
+     * @see {@link https://valkey.io/commands/unwatch/|valkey.io} and {@link https://valkey.io/topics/transactions/#cas|Valkey GLIDE Documentation} for more details.
      *
      * @param options - (Optional) See {@link RouteOption}.
      * @returns A simple `"OK"` response.
@@ -1807,6 +2275,67 @@ export class GlideClusterClient extends BaseClient {
     public async unwatch(options?: RouteOption): Promise<"OK"> {
         return this.createWritePromise(createUnWatch(), {
             decoder: Decoder.String,
+            ...options,
+        });
+    }
+
+    /**
+     * Suspends all clients for the specified timeout.
+     *
+     * The command will be routed to all primary nodes, unless `route` is provided.
+     *
+     * @see {@link https://valkey.io/commands/client-pause/|valkey.io} for details.
+     *
+     * @param timeout - The time in milliseconds to pause clients.
+     * @param mode - (Optional) The pause mode to use.
+     *   + If not provided, all commands are paused.
+     * @param options - (Optional) See {@link RouteOption} and {@link DecoderOption}.
+     * @returns `"OK"` response on success.
+     *
+     * @example
+     * ```typescript
+     * const result = await client.clientPause(1000);
+     * console.log(result); // Output: 'OK'
+     * ```
+     *
+     * @example
+     * ```typescript
+     * const result = await client.clientPause(1000, ClientPauseMode.WRITE);
+     * console.log(result); // Output: 'OK'
+     * ```
+     */
+    public async clientPause(
+        timeout: number,
+        mode?: ClientPauseMode,
+        options?: RouteOption & DecoderOption,
+    ): Promise<"OK"> {
+        return this.createWritePromise(createClientPause(timeout, mode), {
+            route: "allPrimaries" as const,
+            ...options,
+        });
+    }
+
+    /**
+     * Resumes processing commands on all clients.
+     *
+     * The command will be routed to all primary nodes, unless `route` is provided.
+     *
+     * @see {@link https://valkey.io/commands/client-unpause/|valkey.io} for details.
+     *
+     * @param options - (Optional) See {@link RouteOption} and {@link DecoderOption}.
+     * @returns `"OK"` response on success.
+     *
+     * @example
+     * ```typescript
+     * const result = await client.clientUnpause();
+     * console.log(result); // Output: 'OK'
+     * ```
+     */
+    public async clientUnpause(
+        options?: RouteOption & DecoderOption,
+    ): Promise<"OK"> {
+        return this.createWritePromise(createClientUnpause(), {
+            route: "allPrimaries" as const,
             ...options,
         });
     }
@@ -1929,5 +2458,260 @@ export class GlideClusterClient extends BaseClient {
             decoder: Decoder.String,
             ...options,
         });
+    }
+
+    /**
+     * Subscribes the client to the specified sharded channels (non-blocking).
+     * Returns immediately without waiting for subscription confirmation.
+     * Available since Valkey 7.0.
+     *
+     * @see {@link https://valkey.io/commands/ssubscribe/|valkey.io} for details.
+     *
+     * @param channels - A collection of channel names to subscribe to.
+     * @param options - (Optional) See {@link DecoderOption}.
+     * @returns A promise that resolves immediately.
+     *
+     * @example
+     * ```typescript
+     * await clusterClient.ssubscribeLazy(new Set(["shard-channel-1"]));
+     * ```
+     */
+    public async ssubscribeLazy(
+        channels: Iterable<GlideString>,
+        options?: DecoderOption,
+    ): Promise<void> {
+        const channelsArray = Array.from(channels);
+        return this.createWritePromise(
+            createSSubscribeLazy(channelsArray),
+            options,
+        );
+    }
+
+    /**
+     * Subscribes the client to the specified sharded channels (blocking).
+     * Waits for subscription confirmation or until timeout.
+     * Available since Valkey 7.0.
+     *
+     * @see {@link https://valkey.io/commands/ssubscribe/|valkey.io} for details.
+     *
+     * @param channels - A collection of channel names to subscribe to.
+     * @param timeoutMs - Maximum time in milliseconds to wait. Use 0 for indefinite wait.
+     * @param options - (Optional) See {@link DecoderOption}.
+     * @returns A promise that resolves when subscription is confirmed or timeout occurs.
+     *
+     * @example
+     * ```typescript
+     * // Wait up to 5 seconds
+     * await clusterClient.ssubscribe(new Set(["shard-channel-1"]), 5000);
+     * // Wait indefinitely
+     * await clusterClient.ssubscribe(new Set(["shard-channel-1"]), 0);
+     * ```
+     */
+    public async ssubscribe(
+        channels: Iterable<GlideString>,
+        timeoutMs: number,
+        options?: DecoderOption,
+    ): Promise<void> {
+        const channelsArray = Array.from(channels);
+        return this.createWritePromise(
+            createSSubscribe(channelsArray, timeoutMs),
+            options,
+        );
+    }
+
+    /**
+     * Unsubscribes the client from the specified sharded channels (non-blocking).
+     * Pass null or ALL_CHANNELS to unsubscribe from all sharded channels.
+     * Available since Valkey 7.0.
+     *
+     * @see {@link https://valkey.io/commands/sunsubscribe/|valkey.io} for details.
+     *
+     * @param channels - Sharded channel names to unsubscribe from, or null for all channels.
+     * @param options - (Optional) See {@link DecoderOption}.
+     * @returns A promise that resolves immediately.
+     *
+     * @example
+     * ```typescript
+     * await clusterClient.sunsubscribeLazy(new Set(["shard-channel-1"]));
+     * // Unsubscribe from all sharded channels
+     * await clusterClient.sunsubscribeLazy(ALL_SHARDED_CHANNELS);
+     * ```
+     */
+    public async sunsubscribeLazy(
+        channels?: Iterable<GlideString> | null,
+        options?: DecoderOption,
+    ): Promise<void> {
+        const channelsArray = channels ? Array.from(channels) : undefined;
+        return this.createWritePromise(
+            createSUnsubscribeLazy(channelsArray),
+            options,
+        );
+    }
+
+    /**
+     * Unsubscribes the client from the specified sharded channels (blocking).
+     * Pass null or ALL_CHANNELS to unsubscribe from all sharded channels.
+     * Available since Valkey 7.0.
+     *
+     * @see {@link https://valkey.io/commands/sunsubscribe/|valkey.io} for details.
+     *
+     * @param channels - Sharded channel names to unsubscribe from, or null for all channels.
+     * @param timeoutMs - Maximum time in milliseconds to wait. Use 0 for indefinite wait.
+     * @param options - (Optional) See {@link DecoderOption}.
+     * @returns A promise that resolves when unsubscription is confirmed or timeout occurs.
+     *
+     * @example
+     * ```typescript
+     * await clusterClient.sunsubscribe(new Set(["shard-channel-1"]), 5000);
+     * // Unsubscribe from all sharded channels with timeout
+     * await clusterClient.sunsubscribe(ALL_SHARDED_CHANNELS, 5000);
+     * ```
+     */
+    public async sunsubscribe(
+        channels: Iterable<GlideString> | null,
+        timeoutMs: number,
+        options?: DecoderOption,
+    ): Promise<void> {
+        const channelsArray = channels ? Array.from(channels) : [];
+        return this.createWritePromise(
+            createSUnsubscribe(channelsArray, timeoutMs),
+            options,
+        );
+    }
+
+    /**
+     * Returns the current subscription state for the cluster client.
+     *
+     * @see {@link https://valkey.io/commands/pubsub/|valkey.io} for details.
+     *
+     * @returns A promise that resolves to the subscription state containing
+     *          desired and actual subscriptions organized by channel mode.
+     *
+     * @example
+     * ```typescript
+     * const state = await clusterClient.getSubscriptions();
+     * console.log("Desired exact channels:", state.desiredSubscriptions[GlideClusterClientConfiguration.PubSubChannelModes.Exact]);
+     * console.log("Actual sharded channels:", state.actualSubscriptions[GlideClusterClientConfiguration.PubSubChannelModes.Sharded]);
+     * ```
+     */
+    public async getSubscriptions(): Promise<ClusterPubSubState> {
+        const response = await this.createWritePromise<unknown[]>(
+            createGetSubscriptions(),
+        );
+        return this.parseGetSubscriptionsResponse<GlideClusterClientConfiguration.PubSubChannelModes>(
+            response,
+        );
+    }
+
+    // TODO #6166: move to shared base once server management refactor lands
+
+    /**
+     * Returns a report about memory problems detected by the server.
+     *
+     * The command will be routed to all primary nodes, unless `route` is provided.
+     *
+     * @see {@link https://valkey.io/commands/memory-doctor/|valkey.io} for details.
+     *
+     * @param options - (Optional) See {@link RouteOption} to specify the route to override the default.
+     * @returns A {@link ClusterResponse} containing the memory diagnostic report string(s).
+     *
+     * @example
+     * ```typescript
+     * const report = await client.memoryDoctor();
+     * // report is Record<string, string> (multi-node) or string (single-node)
+     * ```
+     */
+    public async memoryDoctor(
+        options?: RouteOption,
+    ): Promise<ClusterResponse<string>> {
+        return this.createWritePromise<ClusterGlideRecord<string>>(
+            createMemoryDoctor(),
+            { decoder: Decoder.String, ...options },
+        ).then((res) => convertClusterGlideRecord(res, false, options?.route));
+    }
+
+    /**
+     * Returns the internal statistics of the memory allocator.
+     *
+     * The command will be routed to all primary nodes, unless `route` is provided.
+     *
+     * @see {@link https://valkey.io/commands/memory-malloc-stats/|valkey.io} for details.
+     *
+     * @param options - (Optional) See {@link RouteOption} to specify the route to override the default.
+     * @returns A {@link ClusterResponse} containing the memory allocator statistics string(s).
+     *
+     * @example
+     * ```typescript
+     * const stats = await client.memoryMallocStats();
+     * // stats is Record<string, string> (multi-node) or string (single-node)
+     * ```
+     */
+    public async memoryMallocStats(
+        options?: RouteOption,
+    ): Promise<ClusterResponse<string>> {
+        return this.createWritePromise<ClusterGlideRecord<string>>(
+            createMemoryMallocStats(),
+            { decoder: Decoder.String, ...options },
+        ).then((res) => convertClusterGlideRecord(res, false, options?.route));
+    }
+
+    /**
+     * Asks the server to reclaim memory from the allocator back to the operating system.
+     *
+     * The command will be routed to all primary nodes, unless `route` is provided.
+     *
+     * @see {@link https://valkey.io/commands/memory-purge/|valkey.io} for details.
+     *
+     * @param options - (Optional) See {@link RouteOption} to specify the route to override the default.
+     * @returns `"OK"`.
+     *
+     * @example
+     * ```typescript
+     * const result = await client.memoryPurge();
+     * console.log(result); // Output: 'OK'
+     * ```
+     */
+    public async memoryPurge(options?: RouteOption): Promise<"OK"> {
+        return this.createWritePromise(createMemoryPurge(), {
+            decoder: Decoder.String,
+            ...options,
+        });
+    }
+
+    /**
+     * Returns detailed memory consumption statistics of the server.
+     *
+     * The command will be routed to all primary nodes, unless `route` is provided.
+     *
+     * @see {@link https://valkey.io/commands/memory-stats/|valkey.io} for details.
+     *
+     * @param options - (Optional) See {@link RouteOption} to specify the route to override the default.
+     * @returns A {@link ClusterResponse} containing {@link MemoryStats} object(s).
+     *
+     * @example
+     * ```typescript
+     * const stats = await client.memoryStats();
+     * // stats is Record<string, MemoryStats> (multi-node) or MemoryStats (single-node)
+     * ```
+     */
+    public async memoryStats(
+        options?: RouteOption,
+    ): Promise<ClusterResponse<MemoryStats>> {
+        return this.createWritePromise<
+            ClusterGlideRecord<Record<string, unknown>>
+        >(createMemoryStats(), options).then((res) =>
+            convertAndParseClusterResponse(
+                res,
+                isSingleNodeRoute(false, options?.route),
+                (raw) =>
+                    parseMemoryStatsResponse(
+                        isGlideRecord(raw)
+                            ? (convertGlideRecordToRecord(
+                                  raw as unknown as GlideRecord<unknown>,
+                              ) as Record<string, unknown>)
+                            : (raw as Record<string, unknown>),
+                    ),
+            ),
+        );
     }
 }

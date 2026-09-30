@@ -257,7 +257,7 @@ pub fn aggregate_array(values: Vec<Value>, op: ArrayAggregateOp) -> RedisResult<
 }
 /// Aggregate array responses into a single map.
 pub fn combine_map_results(values: Vec<Value>) -> RedisResult<Value> {
-    let mut map: HashMap<Vec<u8>, i64> = HashMap::new();
+    let mut map: HashMap<bytes::Bytes, i64> = HashMap::new();
 
     for value in values {
         match value {
@@ -549,7 +549,7 @@ where
                 {
                     // Last key reached; add the path argument index for each route and break
                     let path_idx = curr_arg_idx + 1;
-                    for (_, arg_indices) in routes.iter_mut() {
+                    for arg_indices in routes.values_mut() {
                         arg_indices.push(path_idx);
                     }
                     break;
@@ -586,8 +586,8 @@ impl ResponsePolicy {
         match cmd {
             b"SCRIPT EXISTS" => Some(ResponsePolicy::AggregateLogical(LogicalAggregateOp::And)),
 
-            b"DBSIZE" | b"DEL" | b"EXISTS" | b"SLOWLOG LEN" | b"TOUCH" | b"UNLINK"
-            | b"LATENCY RESET" | b"PUBSUB NUMPAT" => {
+            b"CLIENT KILL" | b"DBSIZE" | b"DEL" | b"EXISTS" | b"LATENCY RESET"
+            | b"PUBSUB NUMPAT" | b"SLOWLOG LEN" | b"TOUCH" | b"UNLINK" => {
                 Some(ResponsePolicy::Aggregate(AggregateOp::Sum))
             }
 
@@ -595,12 +595,13 @@ impl ResponsePolicy {
 
             b"WAITAOF" => Some(ResponsePolicy::AggregateArray(ArrayAggregateOp::Min)),
 
-            b"ACL SETUSER" | b"ACL DELUSER" | b"ACL SAVE" | b"CLIENT SETNAME"
-            | b"CLIENT SETINFO" | b"CONFIG SET" | b"CONFIG RESETSTAT" | b"CONFIG REWRITE"
-            | b"FLUSHALL" | b"FLUSHDB" | b"FUNCTION DELETE" | b"FUNCTION FLUSH"
-            | b"FUNCTION LOAD" | b"FUNCTION RESTORE" | b"MEMORY PURGE" | b"MSET" | b"JSON.MSET"
-            | b"PING" | b"SCRIPT FLUSH" | b"SCRIPT LOAD" | b"SELECT" | b"SLOWLOG RESET"
-            | b"UNWATCH" | b"WATCH" => Some(ResponsePolicy::AllSucceeded),
+            b"ACL SETUSER" | b"ACL DELUSER" | b"ACL SAVE" | b"AUTH" | b"CLIENT PAUSE"
+            | b"CLIENT REPLY" | b"CLIENT SETNAME" | b"CLIENT SETINFO" | b"CLIENT UNPAUSE"
+            | b"CONFIG SET" | b"CONFIG RESETSTAT" | b"CONFIG REWRITE" | b"FLUSHALL"
+            | b"FLUSHDB" | b"FUNCTION DELETE" | b"FUNCTION FLUSH" | b"FUNCTION LOAD"
+            | b"FUNCTION RESTORE" | b"MEMORY PURGE" | b"MSET" | b"JSON.MSET" | b"PING"
+            | b"SCRIPT FLUSH" | b"SCRIPT LOAD" | b"SELECT" | b"SLOWLOG RESET" | b"UNWATCH"
+            | b"WATCH" | b"RESET" | b"SAVE" => Some(ResponsePolicy::AllSucceeded),
 
             b"KEYS"
             | b"FT._ALIASLIST"
@@ -651,36 +652,37 @@ enum RouteBy {
 
 fn base_routing(cmd: &[u8]) -> RouteBy {
     match cmd {
-        b"ACL SETUSER"
-        | b"ACL DELUSER"
+        b"ACL DELUSER"
         | b"ACL SAVE"
-        | b"CLIENT SETNAME"
+        | b"ACL SETUSER"
+        | b"AUTH"
+        | b"CLIENT KILL"
         | b"CLIENT SETINFO"
-        | b"SELECT"
-        | b"SLOWLOG GET"
-        | b"SLOWLOG LEN"
-        | b"SLOWLOG RESET"
-        | b"CONFIG SET"
+        | b"CLIENT SETNAME"
         | b"CONFIG RESETSTAT"
         | b"CONFIG REWRITE"
-        | b"SCRIPT FLUSH"
-        | b"SCRIPT LOAD"
-        | b"LATENCY RESET"
-        | b"LATENCY GRAPH"
-        | b"LATENCY HISTOGRAM"
-        | b"LATENCY HISTORY"
-        | b"LATENCY DOCTOR"
-        | b"LATENCY LATEST"
-        | b"PUBSUB NUMPAT"
+        | b"CONFIG SET"
+        | b"FUNCTION KILL"
+        | b"FUNCTION STATS"
         | b"PUBSUB CHANNELS"
+        | b"PUBSUB NUMPAT"
         | b"PUBSUB NUMSUB"
         | b"PUBSUB SHARDCHANNELS"
         | b"PUBSUB SHARDNUMSUB"
+        | b"RESET"
+        | b"SCRIPT FLUSH"
         | b"SCRIPT KILL"
-        | b"FUNCTION KILL"
-        | b"FUNCTION STATS" => RouteBy::AllNodes,
+        | b"SCRIPT LOAD"
+        | b"SELECT"
+        | b"SLOWLOG GET"
+        | b"SLOWLOG LEN"
+        | b"SLOWLOG RESET" => RouteBy::AllNodes,
 
-        b"DBSIZE"
+        b"BGREWRITEAOF"
+        | b"BGSAVE"
+        | b"CLIENT PAUSE"
+        | b"CLIENT UNPAUSE"
+        | b"DBSIZE"
         | b"DEBUG"
         | b"FLUSHALL"
         | b"FLUSHDB"
@@ -692,15 +694,22 @@ fn base_routing(cmd: &[u8]) -> RouteBy {
         | b"FUNCTION RESTORE"
         | b"INFO"
         | b"KEYS"
+        | b"LATENCY DOCTOR"
+        | b"LATENCY GRAPH"
+        | b"LATENCY HISTOGRAM"
+        | b"LATENCY HISTORY"
+        | b"LATENCY LATEST"
+        | b"LATENCY RESET"
         | b"MEMORY DOCTOR"
         | b"MEMORY MALLOC-STATS"
         | b"MEMORY PURGE"
         | b"MEMORY STATS"
         | b"PING"
+        | b"RANDOMKEY"
+        | b"SAVE"
         | b"SCRIPT EXISTS"
         | b"UNWATCH"
         | b"WAIT"
-        | b"RANDOMKEY"
         | b"WAITAOF" => RouteBy::AllPrimaries,
 
         b"MGET" | b"DEL" | b"EXISTS" | b"UNLINK" | b"TOUCH" | b"WATCH" | b"SUBSCRIBE"
@@ -750,19 +759,14 @@ fn base_routing(cmd: &[u8]) -> RouteBy {
         | b"ACL LOG"
         | b"ACL USERS"
         | b"ACL WHOAMI"
-        | b"AUTH"
-        | b"BGSAVE"
         | b"CLIENT GETNAME"
         | b"CLIENT GETREDIR"
         | b"CLIENT ID"
         | b"CLIENT INFO"
-        | b"CLIENT KILL"
         | b"CLIENT LIST"
-        | b"CLIENT PAUSE"
         | b"CLIENT REPLY"
         | b"CLIENT TRACKINGINFO"
         | b"CLIENT UNBLOCK"
-        | b"CLIENT UNPAUSE"
         | b"CLUSTER COUNT-FAILURE-REPORTS"
         | b"CLUSTER INFO"
         | b"CLUSTER KEYSLOT"
@@ -789,7 +793,6 @@ fn base_routing(cmd: &[u8]) -> RouteBy {
         | b"MODULE UNLOAD"
         | b"READONLY"
         | b"READWRITE"
-        | b"SAVE"
         | b"SCRIPT SHOW"
         | b"TFCALL"
         | b"TFCALLASYNC"
@@ -917,6 +920,57 @@ impl RoutingInfo {
             },
 
             RouteBy::Undefined => None,
+        }
+    }
+
+    /// Returns the first key from a routable command, if one exists.
+    pub fn key_for_command<R>(r: &R) -> Option<&[u8]>
+    where
+        R: Routable + ?Sized,
+    {
+        let cmd = &r.command()?[..];
+        match base_routing(cmd) {
+            // These don't have specific keys
+            RouteBy::AllNodes
+            | RouteBy::AllPrimaries
+            | RouteBy::Random
+            | RouteBy::SecondArgSlot
+            | RouteBy::Undefined => None,
+
+            RouteBy::MultiShard(_) => None, //TODO: handle multi-shard commands
+
+            RouteBy::FirstKey => r.arg_idx(1),
+            RouteBy::SecondArg => r.arg_idx(2),
+            RouteBy::ThirdArg => r.arg_idx(3),
+
+            RouteBy::ThirdArgAfterKeyCount => {
+                let key_count = r
+                    .arg_idx(2)
+                    .and_then(|x| std::str::from_utf8(x).ok())
+                    .and_then(|x| x.parse::<u64>().ok())?;
+                if key_count == 0 {
+                    None
+                } else {
+                    r.arg_idx(3)
+                }
+            }
+
+            RouteBy::SecondArgAfterKeyCount => {
+                let key_count = r
+                    .arg_idx(1)
+                    .and_then(|x| std::str::from_utf8(x).ok())
+                    .and_then(|x| x.parse::<u64>().ok())?;
+                if key_count == 0 {
+                    None
+                } else {
+                    r.arg_idx(2)
+                }
+            }
+
+            RouteBy::StreamsIndex => {
+                let streams_position = r.position(b"STREAMS")?;
+                r.arg_idx(streams_position + 1)
+            }
         }
     }
 
@@ -1092,6 +1146,7 @@ pub fn is_readonly_cmd(cmd: &[u8]) -> bool {
             | b"PEXPIRETIME"
             | b"PFCOUNT"
             | b"PING"
+            | b"PSUBSCRIBE"
             | b"PTTL"
             | b"PUBLISH"
             | b"PUBSUB CHANNELS"
@@ -1100,6 +1155,7 @@ pub fn is_readonly_cmd(cmd: &[u8]) -> bool {
             | b"PUBSUB NUMSUB"
             | b"PUBSUB SHARDCHANNELS"
             | b"PUBSUB SHARDNUMSUB"
+            | b"PUNSUBSCRIBE"
             | b"RANDOMKEY"
             | b"REPLICAOF"
             | b"RESET"
@@ -1115,6 +1171,11 @@ pub fn is_readonly_cmd(cmd: &[u8]) -> bool {
             | b"SCRIPT SHOW"
             | b"SDIFF"
             | b"SELECT"
+            | b"SENTINEL GET-MASTER-ADDR-BY-NAME"
+            | b"SENTINEL MASTER"
+            | b"SENTINEL MASTERS"
+            | b"SENTINEL REPLICAS"
+            | b"SENTINEL CKQUORUM"
             | b"SHUTDOWN"
             | b"SINTER"
             | b"SINTERCARD"
@@ -1180,7 +1241,7 @@ pub trait Routable {
         let mut primary_command = match primary_command.as_slice() {
             b"XGROUP" | b"OBJECT" | b"SLOWLOG" | b"FUNCTION" | b"MODULE" | b"COMMAND"
             | b"PUBSUB" | b"CONFIG" | b"MEMORY" | b"XINFO" | b"CLIENT" | b"ACL" | b"SCRIPT"
-            | b"CLUSTER" | b"LATENCY" => primary_command,
+            | b"CLUSTER" | b"LATENCY" | b"SENTINEL" => primary_command,
             _ => {
                 return Some(primary_command);
             }
@@ -1494,7 +1555,7 @@ mod tests_routing {
         command_for_multi_slot_indices, AggregateOp, MultiSlotArgPattern, MultipleNodeRoutingInfo,
         ResponsePolicy, Route, RoutingInfo, ShardAddrs, SingleNodeRoutingInfo, SlotAddr,
     };
-    use crate::cluster_routing::ShardUpdateResult;
+    use crate::cluster_routing::{is_readonly, is_readonly_cmd, Routable, ShardUpdateResult};
     use crate::{cluster_topology::slot, cmd, parser::parse_redis_value, Value};
     use core::panic;
     use std::sync::{Arc, RwLock};
@@ -1617,7 +1678,7 @@ mod tests_routing {
             )))
         );
 
-        for cmd in vec![
+        for cmd in [
             cmd("SCAN"),
             cmd("SHUTDOWN"),
             cmd("SLAVEOF"),
@@ -1905,8 +1966,8 @@ mod tests_routing {
         // For example `MGET foo bar baz {baz}baz2 {bar}bar2 {foo}foo2`
         let res1 = Value::Array(vec![Value::Nil, Value::Okay]);
         let res2 = Value::Array(vec![
-            Value::BulkString("1".as_bytes().to_vec()),
-            Value::BulkString("4".as_bytes().to_vec()),
+            Value::BulkString("1".as_bytes().to_vec().into()),
+            Value::BulkString("4".as_bytes().to_vec().into()),
         ]);
         let res3 = Value::Array(vec![Value::SimpleString("2".to_string()), Value::Int(3)]);
         let results = super::combine_and_sort_array_results(
@@ -1923,10 +1984,10 @@ mod tests_routing {
             results.unwrap(),
             Value::Array(vec![
                 Value::SimpleString("2".to_string()),
-                Value::BulkString("1".as_bytes().to_vec()),
+                Value::BulkString("1".as_bytes().to_vec().into()),
                 Value::Nil,
                 Value::Okay,
-                Value::BulkString("4".as_bytes().to_vec()),
+                Value::BulkString("4".as_bytes().to_vec().into()),
                 Value::Int(3),
             ])
         );
@@ -1936,7 +1997,10 @@ mod tests_routing {
     fn test_combining_results_into_single_array_key_value_paires() {
         // For example `MSET foo bar foo2 bar2 {foo}foo3 bar3`
         let res1 = Value::Array(vec![Value::Okay]);
-        let res2 = Value::Array(vec![Value::BulkString("1".as_bytes().to_vec()), Value::Nil]);
+        let res2 = Value::Array(vec![
+            Value::BulkString("1".as_bytes().to_vec().into()),
+            Value::Nil,
+        ]);
         let results = super::combine_and_sort_array_results(
             vec![res1, res2],
             &[
@@ -1949,7 +2013,7 @@ mod tests_routing {
         assert_eq!(
             results.unwrap(),
             Value::Array(vec![
-                Value::BulkString("1".as_bytes().to_vec()),
+                Value::BulkString("1".as_bytes().to_vec().into()),
                 Value::Okay,
                 Value::Nil
             ])
@@ -1960,7 +2024,10 @@ mod tests_routing {
     fn test_combining_results_into_single_array_keys_and_path() {
         // For example `JSON.MGET foo bar {foo}foo2 $.a`
         let res1 = Value::Array(vec![Value::Okay]);
-        let res2 = Value::Array(vec![Value::BulkString("1".as_bytes().to_vec()), Value::Nil]);
+        let res2 = Value::Array(vec![
+            Value::BulkString("1".as_bytes().to_vec().into()),
+            Value::Nil,
+        ]);
         let results = super::combine_and_sort_array_results(
             vec![res1, res2],
             &[
@@ -1973,7 +2040,7 @@ mod tests_routing {
         assert_eq!(
             results.unwrap(),
             Value::Array(vec![
-                Value::BulkString("1".as_bytes().to_vec()),
+                Value::BulkString("1".as_bytes().to_vec().into()),
                 Value::Nil,
                 Value::Okay,
             ])
@@ -1984,7 +2051,10 @@ mod tests_routing {
     fn test_combining_results_into_single_array_key_with_two_arg_triples() {
         // For example `JSON.MSET foo $.a bar foo2 $.f.a bar2 {foo}foo3 $.f bar3`
         let res1 = Value::Array(vec![Value::Okay]);
-        let res2 = Value::Array(vec![Value::BulkString("1".as_bytes().to_vec()), Value::Nil]);
+        let res2 = Value::Array(vec![
+            Value::BulkString("1".as_bytes().to_vec().into()),
+            Value::Nil,
+        ]);
         let results = super::combine_and_sort_array_results(
             vec![res1, res2],
             &[
@@ -1997,7 +2067,7 @@ mod tests_routing {
         assert_eq!(
             results.unwrap(),
             Value::Array(vec![
-                Value::BulkString("1".as_bytes().to_vec()),
+                Value::BulkString("1".as_bytes().to_vec().into()),
                 Value::Okay,
                 Value::Nil
             ])
@@ -2012,23 +2082,23 @@ mod tests_routing {
 
         let input = vec![
             Value::Array(vec![
-                Value::BulkString(b"key1".to_vec()),
+                Value::BulkString(b"key1".to_vec().into()),
                 Value::Int(5),
-                Value::BulkString(b"key2".to_vec()),
+                Value::BulkString(b"key2".to_vec().into()),
                 Value::Int(10),
             ]),
             Value::Array(vec![
-                Value::BulkString(b"key1".to_vec()),
+                Value::BulkString(b"key1".to_vec().into()),
                 Value::Int(3),
-                Value::BulkString(b"key3".to_vec()),
+                Value::BulkString(b"key3".to_vec().into()),
                 Value::Int(15),
             ]),
         ];
         let result = super::combine_map_results(input).unwrap();
         let mut expected = vec![
-            (Value::BulkString(b"key1".to_vec()), Value::Int(8)),
-            (Value::BulkString(b"key2".to_vec()), Value::Int(10)),
-            (Value::BulkString(b"key3".to_vec()), Value::Int(15)),
+            (Value::BulkString(b"key1".to_vec().into()), Value::Int(8)),
+            (Value::BulkString(b"key2".to_vec().into()), Value::Int(10)),
+            (Value::BulkString(b"key3".to_vec().into()), Value::Int(15)),
         ];
         expected.sort_unstable_by(|a, b| match (&a.0, &b.0) {
             (Value::BulkString(a_bytes), Value::BulkString(b_bytes)) => a_bytes.cmp(b_bytes),
@@ -2099,5 +2169,39 @@ mod tests_routing {
             Some(RoutingInfo::SingleNode(SingleNodeRoutingInfo::Random)),
             "CLIENT LIST should be routed to a random node"
         );
+    }
+
+    #[test]
+    fn test_is_read_only() {
+        assert!(is_readonly_cmd(b"SENTINEL MASTERS"));
+        assert!(is_readonly_cmd(b"SENTINEL MASTER"));
+        assert!(is_readonly_cmd(b"SENTINEL REPLICAS"));
+        assert!(is_readonly_cmd(b"SENTINEL GET-MASTER-ADDR-BY-NAME"));
+        assert!(is_readonly_cmd(b"SENTINEL CKQUORUM"));
+        assert!(is_readonly_cmd(b"PSUBSCRIBE"));
+        assert!(is_readonly_cmd(b"PUNSUBSCRIBE"));
+
+        assert!(!is_readonly_cmd(b"SENTINEL FAILOVER"));
+
+        let mut test_cmd = cmd("SENTINEL");
+        test_cmd.arg("MASTERS").arg("my_service");
+        assert!(is_readonly(&test_cmd));
+        assert!(is_readonly_cmd(
+            Routable::command(&test_cmd).unwrap().as_slice()
+        ));
+
+        let mut test_cmd = cmd("SENTINEL");
+        test_cmd.arg("GET-MASTER-ADDR-BY-NAME").arg("my_service");
+        assert!(is_readonly(&test_cmd));
+        assert!(is_readonly_cmd(
+            Routable::command(&test_cmd).unwrap().as_slice()
+        ));
+
+        test_cmd = cmd("SENTINEL");
+        test_cmd.arg("FAILOVER").arg("my_service");
+        assert!(!is_readonly(&test_cmd));
+        assert!(!is_readonly_cmd(
+            Routable::command(&test_cmd).unwrap().as_slice()
+        ));
     }
 }

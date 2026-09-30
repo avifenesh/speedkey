@@ -129,7 +129,7 @@ pub fn get_shared_cluster_addresses(use_tls: bool) -> Vec<ConnectionAddr> {
     }
 }
 
-#[dtor::dtor(unsafe)]
+#[ctor::dtor]
 fn clean_shared_clusters() {
     if let Some(mutex) = SharedCluster::get(&SHARED_CLUSTER) {
         drop(mutex.lock().unwrap().take());
@@ -306,6 +306,10 @@ impl RedisCluster {
             .map(|server| ClusterType::build_addr(self.use_tls, &server.host, server.port as u16))
             .collect()
     }
+
+    pub fn all_server_pids(&self) -> Vec<u32> {
+        self.servers.iter().map(|s| s.pid).collect()
+    }
 }
 
 pub struct ClusterTestBasics {
@@ -334,7 +338,8 @@ pub async fn create_cluster_client(
         get_shared_cluster_addresses(configuration.use_tls)
     };
 
-    if let Some(redis_connection_info) = &configuration.connection_info
+    if !configuration.skip_acl_setup
+        && let Some(redis_connection_info) = &configuration.connection_info
         && redis_connection_info.password.is_some()
     {
         assert!(!configuration.shared_server);
@@ -391,14 +396,6 @@ pub async fn setup_cluster_with_replicas(
     ClusterTestBasics { cluster, client }
 }
 
-pub async fn setup_test_basics(use_tls: bool) -> ClusterTestBasics {
-    setup_test_basics_internal(TestConfiguration {
-        use_tls,
-        ..Default::default()
-    })
-    .await
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -431,12 +428,13 @@ CLUSTER_NODES=127.0.0.1:39163,127.0.0.1:23178,127.0.0.1:25186,127.0.0.1:52500,12
 }
 
 /// Holds all components needed for pubsub topology test setup.
-/// The `_client_holder` keeps the Arc alive so the weak reference in the synchronizer remains valid.
+/// The `client_holder` keeps the Arc alive so the weak reference in the synchronizer remains valid.
 #[cfg(not(feature = "mock-pubsub"))]
 pub struct PubSubTestSetup {
     pub connection: ClusterConnection,
     pub synchronizer: Arc<dyn PubSubSynchronizer>,
-    pub _client_holder: Arc<TokioRwLock<ClientWrapper>>,
+    pub client_holder: Arc<TokioRwLock<ClientWrapper>>,
+    pub glide_client: Client,
 }
 
 #[cfg(not(feature = "mock-pubsub"))]
@@ -480,13 +478,14 @@ impl PubSubTestSetup {
             .expect("Failed to build cluster client for topology test");
 
         let connection = client
-            .get_async_connection(None, Some(synchronizer.clone()))
+            .get_async_connection(None, Some(synchronizer.clone()), None, None)
             .await
             .expect("Failed to get async connection for topology test");
 
         // Create the real client wrapper
         let client_wrapper = ClientWrapper::Cluster {
             client: connection.clone(),
+            _cert_material_manager: None,
         };
         let client_arc = Arc::new(TokioRwLock::new(client_wrapper));
 
@@ -497,10 +496,16 @@ impl PubSubTestSetup {
             .expect("Expected GlidePubSubSynchronizer")
             .set_internal_client(Arc::downgrade(&client_arc));
 
+        // Create a glide Client for routing commands through Client::send_command
+        // (e.g. RESET, which calls handle_reset_command to clear desired subscriptions)
+        let glide_client =
+            glide_core::client::Client::new_for_test(client_arc.clone(), synchronizer.clone());
+
         Self {
             connection,
             synchronizer,
-            _client_holder: client_arc,
+            client_holder: client_arc,
+            glide_client,
         }
     }
 
@@ -528,7 +533,7 @@ impl PubSubTestSetup {
 macro_rules! skip_if_version_below {
     ($setup:expr, $version:expr) => {
         if !$setup.version_gte($version).await {
-            logger_core::log_info(
+            glide_logger::log_info(
                 "test_pubsub",
                 format!("Skipping test: requires server version >= {}", $version),
             );
@@ -558,18 +563,33 @@ pub struct ClusterNodeInfo {
 impl ClusterTopology {
     /// Get cluster topology from a connection.
     pub async fn from_connection(connection: &mut ClusterConnection) -> Self {
+        Self::try_from_connection(connection)
+            .await
+            .expect("Failed to get CLUSTER NODES")
+    }
+
+    /// Try to get cluster topology, returning an error instead of panicking.
+    /// Useful in retry loops where transient errors (e.g. connection recovery) are expected.
+    pub async fn try_from_connection(
+        connection: &mut ClusterConnection,
+    ) -> Result<Self, redis::RedisError> {
         let nodes_output = connection
             .route_command(
                 redis::cmd("CLUSTER").arg("NODES"),
                 RoutingInfo::SingleNode(SingleNodeRoutingInfo::Random),
             )
-            .await
-            .expect("Failed to get CLUSTER NODES");
+            .await?;
 
         let nodes_str = match nodes_output {
             Value::BulkString(b) => String::from_utf8_lossy(&b).to_string(),
             Value::VerbatimString { text, .. } => text,
-            _ => panic!("Unexpected CLUSTER NODES response type"),
+            other => {
+                return Err(redis::RedisError::from((
+                    redis::ErrorKind::TypeError,
+                    "Unexpected CLUSTER NODES response type",
+                    format!("{other:?}"),
+                )));
+            }
         };
 
         let nodes = Self::parse_cluster_nodes(&nodes_str);
@@ -577,11 +597,11 @@ impl ClusterTopology {
         let all_node_addresses: Vec<(String, u16)> =
             nodes.iter().map(|n| (n.host.clone(), n.port)).collect();
 
-        Self {
+        Ok(Self {
             nodes,
             primary_nodes,
             all_node_addresses,
-        }
+        })
     }
 
     /// Parse CLUSTER NODES output to extract node information.
@@ -688,7 +708,7 @@ pub async fn migrate_slot(
 
         match connection.route_command(&cmd, routing).await {
             Ok(_) => {
-                logger_core::log_debug(
+                glide_logger::log_debug(
                     "migrate_slot",
                     format!(
                         "CLUSTER SETSLOT {} NODE {} on {}:{} succeeded",
@@ -697,7 +717,7 @@ pub async fn migrate_slot(
                 );
             }
             Err(e) => {
-                logger_core::log_warn(
+                glide_logger::log_warn(
                     "migrate_slot",
                     format!("CLUSTER SETSLOT on {}:{} failed: {:?}", host, port, e),
                 );
@@ -714,7 +734,7 @@ pub async fn migrate_channel_to_different_node(
     slot: u16,
 ) -> Option<String> {
     let Some(owner) = topology.find_slot_owner(slot) else {
-        logger_core::log_warn(
+        glide_logger::log_warn(
             "migrate_channel",
             format!("No owner found for slot {}", slot),
         );
@@ -722,7 +742,7 @@ pub async fn migrate_channel_to_different_node(
     };
 
     let Some(target) = topology.find_different_primary(&owner.node_id) else {
-        logger_core::log_warn(
+        glide_logger::log_warn(
             "migrate_channel",
             format!(
                 "No different primary found for slot {} (owner: {})",
@@ -732,7 +752,7 @@ pub async fn migrate_channel_to_different_node(
         return None;
     };
 
-    logger_core::log_info(
+    glide_logger::log_info(
         "migrate_channel",
         format!(
             "Migrating slot {} from {} to {}",
@@ -765,7 +785,7 @@ pub async fn migrate_channels_to_different_nodes(
         match migrate_channel_to_different_node(connection, topology, *slot).await {
             Some(_) => {
                 migrated_count += 1;
-                logger_core::log_debug(
+                glide_logger::log_debug(
                     "migrate_channels",
                     format!(
                         "Successfully migrated slot {} for channel {:?}",
@@ -775,7 +795,7 @@ pub async fn migrate_channels_to_different_nodes(
                 );
             }
             None => {
-                logger_core::log_debug(
+                glide_logger::log_debug(
                     "migrate_channels",
                     format!("Skipped migration for slot {}", slot),
                 );
@@ -805,7 +825,7 @@ pub async fn trigger_failover(
 
     match connection.route_command(&cmd, routing).await {
         Ok(_) => {
-            logger_core::log_info(
+            glide_logger::log_info(
                 "trigger_failover",
                 format!(
                     "CLUSTER FAILOVER initiated on {}:{}",
@@ -815,7 +835,7 @@ pub async fn trigger_failover(
             true
         }
         Err(e) => {
-            logger_core::log_warn(
+            glide_logger::log_warn(
                 "trigger_failover",
                 format!(
                     "CLUSTER FAILOVER on {}:{} failed: {:?}",
@@ -836,12 +856,20 @@ pub async fn wait_for_node_to_become_primary(
     let start = std::time::Instant::now();
 
     while start.elapsed() < timeout {
-        let topology = ClusterTopology::from_connection(connection).await;
-
-        if let Some(node) = topology.nodes.iter().find(|n| n.node_id == node_id)
-            && node.is_primary
-        {
-            return true;
+        match ClusterTopology::try_from_connection(connection).await {
+            Ok(topology) => {
+                if let Some(node) = topology.nodes.iter().find(|n| n.node_id == node_id)
+                    && node.is_primary
+                {
+                    return true;
+                }
+            }
+            Err(e) => {
+                glide_logger::log_debug(
+                    "wait_for_node_to_become_primary",
+                    format!("CLUSTER NODES failed (retrying): {:?}", e),
+                );
+            }
         }
 
         tokio::time::sleep(Duration::from_millis(200)).await;
