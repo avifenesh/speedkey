@@ -591,9 +591,9 @@ pub(crate) struct InnerCore<C> {
     /// This prevents validation from removing connections that were just created
     /// during topology discovery but haven't been assigned slots yet.
     pub(crate) topology_refresh_lock: tokio::sync::Mutex<()>,
-    /// Set by [`ClusterConnection::kill`]. Reconnect and topology refresh tasks check it before
-    /// adding a connection to the container, so a connection opened while the client is being
-    /// killed is closed instead of kept.
+    /// Set by [`ClusterConnection::kill`]. Reconnect and topology refresh tasks check it, under
+    /// the container lock, before adding connections to the container, so a connection opened
+    /// while the client is being killed is closed instead of kept.
     killed: AtomicBool,
 }
 
@@ -2694,12 +2694,15 @@ where
                             "topology_refresh",
                             format!("Slot refresh retry {} failed: {:?}", curr_retry, err)
                         );
-                        if matches!(
-                            err.kind(),
-                            ErrorKind::AllConnectionsUnavailable
-                                | ErrorKind::PermissionDenied
-                                | ErrorKind::AuthenticationFailed
-                        ) {
+                        // A killed client must not retry: each attempt opens connections.
+                        if inner.is_killed()
+                            || matches!(
+                                err.kind(),
+                                ErrorKind::AllConnectionsUnavailable
+                                    | ErrorKind::PermissionDenied
+                                    | ErrorKind::AuthenticationFailed
+                            )
+                        {
                             RetryError::permanent(err)
                         } else {
                             RetryError::transient(err)
@@ -2952,6 +2955,17 @@ where
 
         // Reset the current slot map and connection vector with the new ones
         let mut write_guard = inner.conn_lock.write();
+        // A kill() that landed while this refresh was connecting has already closed every
+        // connection in the container; do not install the ones opened here.
+        if inner.is_killed() {
+            for node in new_connections.0.iter() {
+                kill_cluster_node(node.value());
+            }
+            return Err(RedisError::from((
+                ErrorKind::ClientError,
+                "Connection killed, discarding the refreshed connections",
+            )));
+        }
         let old_topology_hash = write_guard.get_current_topology_hash();
         // Clear the refresh tasks of the prev instance
         // TODO - Maybe we can take the running refresh tasks and use them instead of running new connection creation
