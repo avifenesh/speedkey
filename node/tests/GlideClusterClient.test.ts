@@ -18,6 +18,7 @@ import {
     ClientPauseMode,
     ClientSideCache,
     ClientTrackingInfo,
+    ClosingError,
     ClusterBatch,
     ConfigurationError,
     Decoder,
@@ -4176,6 +4177,141 @@ describe("GlideClusterClient", () => {
             const info =
                 (await client.clientTrackingInfo()) as ClientTrackingInfo;
             assertClientTrackingInfo(info, true);
+        },
+        TIMEOUT,
+    );
+
+    it.each([false, true])(
+        "close detaches a client with a blocked command from the server (lazyConnect: %p)",
+        async (lazyConnect) => {
+            const config = getClientConfigurationOption(
+                cluster.getAddresses(),
+                ProtocolVersion.RESP3,
+            );
+            const observer = await GlideClusterClient.createClient(config);
+            // A lazy client has no server-side id until it connects, and other test
+            // files may have their own XREADGROUP blocked on a shared cluster, so
+            // identify the blocked client by a unique name.
+            const blockedName = `blocked_close_${lazyConnect}_${getRandomKey()}`;
+            const blocked = await GlideClusterClient.createClient({
+                ...config,
+                lazyConnect,
+                clientName: blockedName,
+            });
+            const key = getRandomKey();
+            const group = getRandomKey();
+            const consumer = getRandomKey();
+
+            // CLIENT LIST lines for the blocked client, across every node. A RESP3
+            // multi-node reply is a GlideRecord, RESP2 gives a Record.
+            const blockedClientLines = async () => {
+                const response = (await observer.customCommand(
+                    ["CLIENT", "LIST"],
+                    { route: "allNodes" },
+                )) as GlideRecord<string> | Record<string, string>;
+                const perNode = Array.isArray(response)
+                    ? convertGlideRecordToRecord(response)
+                    : response;
+                return Object.values(perNode)
+                    .flatMap((list) => list.split("\n"))
+                    .filter((line) => line.includes(`name=${blockedName} `));
+            };
+
+            const isAttached = async () =>
+                (await blockedClientLines()).length > 0;
+
+            const isBlocked = async () =>
+                (await blockedClientLines()).some((line) =>
+                    / flags=\S*b/.test(line),
+                );
+
+            // Resolves true as soon as the predicate holds, false at the deadline.
+            const poll = async (
+                predicate: () => Promise<boolean>,
+                deadlineMs: number,
+            ) => {
+                const deadline = Date.now() + deadlineMs;
+
+                while (Date.now() < deadline) {
+                    if (await predicate()) return true;
+                    await sleep(5);
+                }
+
+                return predicate();
+            };
+
+            // Resolves true once the predicate has held at every poll for `holdMs`,
+            // false if that does not happen before the deadline.
+            const pollStable = async (
+                predicate: () => Promise<boolean>,
+                holdMs: number,
+                deadlineMs: number,
+            ) => {
+                const deadline = Date.now() + deadlineMs;
+                let heldSince: number | undefined;
+
+                while (Date.now() < deadline) {
+                    if (await predicate()) {
+                        heldSince ??= Date.now();
+                        if (Date.now() - heldSince >= holdMs) return true;
+                    } else {
+                        heldSince = undefined;
+                    }
+
+                    await sleep(5);
+                }
+
+                return false;
+            };
+
+            try {
+                expect(
+                    await observer.xgroupCreate(key, group, "$", {
+                        mkStream: true,
+                    }),
+                ).toEqual("OK");
+
+                const pending = blocked.xreadgroup(
+                    group,
+                    consumer,
+                    { [key]: ">" },
+                    { block: 30000 },
+                );
+
+                if (lazyConnect) {
+                    // Close before the lazy connection is established. The queued
+                    // command must not stay connected and blocked after close().
+                    blocked.close();
+                } else {
+                    expect(await poll(isBlocked, 2000)).toBe(true);
+                    blocked.close();
+                }
+
+                await expect(pending).rejects.toThrow(ClosingError);
+
+                // The server must drop the connection promptly, not when BLOCK expires.
+                const isDetached = async () => !(await isAttached());
+
+                if (lazyConnect) {
+                    // The client is not attached before its handshake either, and
+                    // close() may land while that handshake is in progress: the
+                    // connections then show up and are killed as soon as the cluster
+                    // client is built. Require the client to be gone and stay gone.
+                    expect(await pollStable(isDetached, 500, 5000)).toBe(true);
+                } else {
+                    expect(await poll(isDetached, 1000)).toBe(true);
+                }
+
+                // An entry added now must not be claimed by the closed consumer.
+                expect(
+                    await observer.xadd(key, [["field", "value"]]),
+                ).not.toBeNull();
+                const [pendingCount] = await observer.xpending(key, group);
+                expect(pendingCount).toEqual(0);
+            } finally {
+                await observer.del([key]);
+                observer.close();
+            }
         },
         TIMEOUT,
     );
