@@ -62,7 +62,7 @@ use std::{
     net::{IpAddr, SocketAddr},
     pin::Pin,
     sync::{
-        atomic::{self, AtomicIsize, AtomicUsize, Ordering},
+        atomic::{self, AtomicBool, AtomicIsize, AtomicUsize, Ordering},
         Arc,
     },
     task::{self, Poll},
@@ -92,7 +92,7 @@ use crate::{
     Value,
 };
 use futures::{
-    future::Shared,
+    future::{AbortHandle, Abortable, Shared},
     stream::{FuturesUnordered, StreamExt},
 };
 use std::time::Duration;
@@ -198,6 +198,8 @@ pub struct ClusterConnection<C = MultiplexedConnection> {
     /// Used by isolated execution to determine which node
     /// to open a scoped connection to.
     inner_core: Arc<InnerCore<C>>,
+    /// Aborts the request loop task that owns the [`ClusterConnInner`]. See [`ClusterConnection::kill`].
+    abort_handle: AbortHandle,
 }
 
 impl<C> ClusterConnection<C>
@@ -230,13 +232,38 @@ where
                     .forward(inner)
                     .await;
             };
+            let (abort_handle, abort_registration) = AbortHandle::new_pair();
+            let stream = Abortable::new(stream, abort_registration).map(|_| ());
             #[cfg(feature = "tokio-comp")]
             tokio::spawn(stream);
             ClusterConnection {
                 sender: tx,
                 inner_core,
+                abort_handle,
             }
         })
+    }
+
+    /// Closes every node connection immediately, without waiting for in-flight requests.
+    ///
+    /// Dropping the connection only closes the sockets once every in-flight request has been
+    /// answered, so a blocking command (`XREADGROUP ... BLOCK`, `BLPOP`, ...) keeps its node
+    /// connection open, and the server keeps serving it, until the server replies. `kill`:
+    ///
+    /// 1. marks the core as killed, so reconnect and topology refresh tasks that are still
+    ///    running do not add new connections;
+    /// 2. aborts every reconnect task and calls [`Connect::kill`] on every user and management
+    ///    connection held by the connections container, closing the sockets right away;
+    /// 3. aborts the request loop task, which drops the in-flight requests (their callers get
+    ///    a `BrokenPipe` error) and runs [`Dispose`] for the periodic tasks and recovery queue.
+    ///
+    /// The server sees the TCP close and discards any command blocked on those connections.
+    /// Requests sent after `kill` fail with a `BrokenPipe` error. Calling `kill` more than once,
+    /// or dropping the connection after it, is harmless.
+    pub fn kill(&self) {
+        self.inner_core.killed.store(true, Ordering::Release);
+        self.inner_core.kill_connections();
+        self.abort_handle.abort();
     }
 
     /// Special handling for `SCAN` command, using `cluster_scan_with_pattern`.
@@ -564,9 +591,41 @@ pub(crate) struct InnerCore<C> {
     /// This prevents validation from removing connections that were just created
     /// during topology discovery but haven't been assigned slots yet.
     pub(crate) topology_refresh_lock: tokio::sync::Mutex<()>,
+    /// Set by [`ClusterConnection::kill`]. Reconnect and topology refresh tasks check it, under
+    /// the container lock, before adding connections to the container, so a connection opened
+    /// while the client is being killed is closed instead of kept.
+    killed: AtomicBool,
 }
 
 pub(crate) type Core<C> = Arc<InnerCore<C>>;
+
+/// Closes the user and management connections of a cluster node.
+fn kill_cluster_node<C>(node: &connections_container::ClusterNode<ConnectionFuture<C>>)
+where
+    C: Connect + Clone + Send + Sync + 'static,
+{
+    kill_connection_future(&node.user_connection.conn);
+    if let Some(management) = &node.management_connection {
+        kill_connection_future(&management.conn);
+    }
+}
+
+/// Closes the connection a [`ConnectionFuture`] resolves to. If the future is still connecting,
+/// the connection is closed as soon as it is established.
+fn kill_connection_future<C>(conn: &ConnectionFuture<C>)
+where
+    C: Connect + Clone + Send + Sync + 'static,
+{
+    if let Some(conn) = conn.peek() {
+        conn.kill();
+        return;
+    }
+    #[cfg(feature = "tokio-comp")]
+    {
+        let conn = conn.clone();
+        tokio::spawn(async move { conn.await.kill() });
+    }
+}
 
 impl<C> InnerCore<C>
 where
@@ -585,6 +644,26 @@ where
         F: FnOnce(&mut ClusterParams),
     {
         f(&mut self.cluster_params.write());
+    }
+
+    fn is_killed(&self) -> bool {
+        self.killed.load(Ordering::Acquire)
+    }
+
+    /// Aborts every reconnect task and closes every connection in the container. Takes the
+    /// write lock so this is ordered against the reconnect tasks' check-then-insert (see
+    /// `trigger_refresh_connection_tasks`): a connection is either seen here or it is
+    /// killed by the task that opened it.
+    fn kill_connections(&self) {
+        let mut conn_lock = self.conn_lock.write();
+        // Dropping a `RefreshTaskState` aborts its task.
+        conn_lock
+            .refresh_conn_state
+            .refresh_address_in_progress
+            .clear();
+        for node in conn_lock.connection_map().iter() {
+            kill_cluster_node(node.value());
+        }
     }
 
     // return epoch of node
@@ -1160,6 +1239,7 @@ mod iam_token_refresh_tests {
             initial_nodes: Vec::new(),
             glide_connection_options: options_with_provider(provider),
             topology_refresh_lock: tokio::sync::Mutex::new(()),
+            killed: AtomicBool::new(false),
         })
     }
 
@@ -1620,6 +1700,7 @@ where
             initial_nodes: initial_nodes.to_vec(),
             glide_connection_options,
             topology_refresh_lock: tokio::sync::Mutex::new(()),
+            killed: AtomicBool::new(false),
         });
         let mut connection = ClusterConnInner {
             inner,
@@ -1837,10 +1918,16 @@ where
                     return;
                 }
             };
-            inner
-                .conn_lock
-                .write()
-                .extend_connection_map(connection_map);
+            {
+                let mut conn_lock = inner.conn_lock.write();
+                if inner.is_killed() {
+                    for node in connection_map.0.iter() {
+                        kill_cluster_node(node.value());
+                    }
+                    return;
+                }
+                conn_lock.extend_connection_map(connection_map);
+            }
             if let Err(err) = Self::refresh_slots_and_subscriptions_with_retries(
                 inner.clone(),
                 &RefreshPolicy::NotThrottable,
@@ -2079,10 +2166,17 @@ where
                                 address_clone_for_task
                             )
                         );
-                        inner_clone
-                            .conn_lock
-                            .read()
-                            .replace_or_add_connection_for_address(&address_clone_for_task, node);
+                        // Check and insert under the same read lock: `kill_connections` takes
+                        // the write lock, so it either sees this node or we see `killed`.
+                        let conn_lock = inner_clone.conn_lock.read();
+                        if inner_clone.is_killed() {
+                            kill_cluster_node(&node);
+                        } else {
+                            conn_lock.replace_or_add_connection_for_address(
+                                &address_clone_for_task,
+                                node,
+                            );
+                        }
                     }
                     Err(err) => {
                         log_warn_lazy!(
@@ -2518,6 +2612,12 @@ where
         trigger: SlotRefreshTrigger,
     ) -> RedisResult<()> {
         let _guard = inner.topology_refresh_lock.lock().await;
+        if inner.is_killed() {
+            return Err(RedisError::from((
+                ErrorKind::ClientError,
+                "Connection killed, skipping slot refresh",
+            )));
+        }
         Self::refresh_slots_and_subscriptions_with_retries_inner(inner.clone(), policy, trigger)
             .await
     }
@@ -2594,12 +2694,15 @@ where
                             "topology_refresh",
                             format!("Slot refresh retry {} failed: {:?}", curr_retry, err)
                         );
-                        if matches!(
-                            err.kind(),
-                            ErrorKind::AllConnectionsUnavailable
-                                | ErrorKind::PermissionDenied
-                                | ErrorKind::AuthenticationFailed
-                        ) {
+                        // A killed client must not retry: each attempt opens connections.
+                        if inner.is_killed()
+                            || matches!(
+                                err.kind(),
+                                ErrorKind::AllConnectionsUnavailable
+                                    | ErrorKind::PermissionDenied
+                                    | ErrorKind::AuthenticationFailed
+                            )
+                        {
                             RetryError::permanent(err)
                         } else {
                             RetryError::transient(err)
@@ -2852,6 +2955,17 @@ where
 
         // Reset the current slot map and connection vector with the new ones
         let mut write_guard = inner.conn_lock.write();
+        // A kill() that landed while this refresh was connecting has already closed every
+        // connection in the container; do not install the ones opened here.
+        if inner.is_killed() {
+            for node in new_connections.0.iter() {
+                kill_cluster_node(node.value());
+            }
+            return Err(RedisError::from((
+                ErrorKind::ClientError,
+                "Connection killed, discarding the refreshed connections",
+            )));
+        }
         let old_topology_hash = write_guard.get_current_topology_hash();
         // Clear the refresh tasks of the prev instance
         // TODO - Maybe we can take the running refresh tasks and use them instead of running new connection creation
@@ -4713,9 +4827,18 @@ pub trait Connect: Sized {
     ) -> RedisFuture<'a, (Self, Option<IpAddr>)>
     where
         T: IntoConnectionInfo + Send + 'a;
+
+    /// Closes the connection immediately, without waiting for in-flight requests. Used by
+    /// [`ClusterConnection::kill`]. Connection types with no background driver task, which
+    /// close as soon as they are dropped, keep the default no-op.
+    fn kill(&self) {}
 }
 
 impl Connect for MultiplexedConnection {
+    fn kill(&self) {
+        MultiplexedConnection::kill(self);
+    }
+
     fn connect<'a, T>(
         info: T,
         response_timeout: Duration,

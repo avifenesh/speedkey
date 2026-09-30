@@ -13,7 +13,7 @@ mod cluster_client_tests {
     use crate::utilities::{
         cluster::{
             LONG_CLUSTER_TEST_TIMEOUT, RedisCluster, SHORT_CLUSTER_TEST_TIMEOUT,
-            setup_cluster_with_replicas, setup_test_basics_internal,
+            create_cluster_client, setup_cluster_with_replicas, setup_test_basics_internal,
         },
         *,
     };
@@ -941,6 +941,175 @@ mod cluster_client_tests {
                 WINDOW_MS,
                 CONNECTION_TIMEOUT_MS,
             );
+        });
+    }
+
+    /// Lines of `CLIENT LIST`, across all cluster nodes, that belong to the named client.
+    async fn client_list_lines_for_name(observer: &mut Client, name: &str) -> Vec<String> {
+        let mut cmd = redis::cmd("CLIENT");
+        cmd.arg("LIST");
+        let result = observer
+            .send_command(
+                &mut cmd,
+                Some(RoutingInfo::MultiNode((
+                    MultipleNodeRoutingInfo::AllNodes,
+                    None,
+                ))),
+            )
+            .await
+            .expect("CLIENT LIST failed");
+        let per_node: HashMap<String, String> =
+            redis::from_owned_redis_value(result).expect("CLIENT LIST returned unexpected type");
+        let needle = format!("name={name} ");
+        per_node
+            .values()
+            .flat_map(|list| list.lines())
+            .filter(|line| line.contains(&needle))
+            .map(str::to_owned)
+            .collect()
+    }
+
+    /// Polls `CLIENT LIST` every 5 ms until `predicate` holds for the named client's lines or
+    /// `deadline` passes.
+    async fn poll_client_lines(
+        observer: &mut Client,
+        name: &str,
+        deadline: Duration,
+        predicate: impl Fn(&[String]) -> bool,
+    ) -> bool {
+        let start = std::time::Instant::now();
+        while start.elapsed() < deadline {
+            if predicate(&client_list_lines_for_name(observer, name).await) {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        predicate(&client_list_lines_for_name(observer, name).await)
+    }
+
+    /// `kill()` must close a node connection that has a blocking command in flight. Dropping
+    /// the cluster client waits for every in-flight request to be answered, so before the fix
+    /// an `XREADGROUP ... BLOCK` kept its connection attached to the server until BLOCK expired
+    /// and the server kept delivering stream entries to the closed consumer.
+    #[rstest]
+    #[serial_test::serial]
+    #[timeout(SHORT_CLUSTER_TEST_TIMEOUT)]
+    fn test_kill_detaches_blocked_connection() {
+        block_on_all(async move {
+            let blocked_name = format!("blocked_kill_{}", generate_random_string(10));
+            let mut observer = create_cluster_client(
+                None,
+                TestConfiguration {
+                    shared_server: true,
+                    ..Default::default()
+                },
+            )
+            .await;
+            let blocked = create_cluster_client(
+                None,
+                TestConfiguration {
+                    shared_server: true,
+                    client_name: Some(blocked_name.clone()),
+                    ..Default::default()
+                },
+            )
+            .await;
+
+            let key = generate_random_string(10);
+            let group = generate_random_string(10);
+            let mut xgroup_create = redis::cmd("XGROUP");
+            xgroup_create
+                .arg("CREATE")
+                .arg(&key)
+                .arg(&group)
+                .arg("$")
+                .arg("MKSTREAM");
+            observer
+                .send_command(&mut xgroup_create, None)
+                .await
+                .expect("XGROUP CREATE failed");
+
+            let mut blocked_clone = blocked.clone();
+            let key_clone = key.clone();
+            let group_clone = group.clone();
+            let pending = tokio::spawn(async move {
+                let mut xreadgroup = redis::cmd("XREADGROUP");
+                xreadgroup
+                    .arg("GROUP")
+                    .arg(&group_clone)
+                    .arg("consumer")
+                    .arg("BLOCK")
+                    .arg("30000")
+                    .arg("STREAMS")
+                    .arg(&key_clone)
+                    .arg(">");
+                blocked_clone.send_command(&mut xreadgroup, None).await
+            });
+
+            let is_blocked = |lines: &[String]| {
+                lines.iter().any(|line| {
+                    line.split_whitespace()
+                        .any(|field| field.starts_with("flags=") && field.contains('b'))
+                })
+            };
+            assert!(
+                poll_client_lines(
+                    &mut observer,
+                    &blocked_name,
+                    Duration::from_secs(2),
+                    is_blocked
+                )
+                .await,
+                "the XREADGROUP must be blocked on the server before kill()"
+            );
+
+            let killed_at = std::time::Instant::now();
+            blocked.kill().await;
+
+            let result = tokio::time::timeout(Duration::from_secs(2), pending)
+                .await
+                .expect("blocked request must fail promptly after kill()")
+                .expect("blocked task panicked");
+            assert!(
+                result.is_err(),
+                "expected an error after kill(), got {result:?}"
+            );
+
+            // The server must drop the connection promptly, not when BLOCK expires.
+            assert!(
+                poll_client_lines(
+                    &mut observer,
+                    &blocked_name,
+                    Duration::from_millis(500),
+                    <[String]>::is_empty
+                )
+                .await,
+                "the killed client is still attached to the server {:?} after kill()",
+                killed_at.elapsed()
+            );
+
+            // An entry added now must not be claimed by the killed consumer.
+            let mut xadd = redis::cmd("XADD");
+            xadd.arg(&key).arg("*").arg("field").arg("value");
+            observer
+                .send_command(&mut xadd, None)
+                .await
+                .expect("XADD failed");
+            let mut xpending = redis::cmd("XPENDING");
+            xpending.arg(&key).arg(&group);
+            let pending_summary = observer
+                .send_command(&mut xpending, None)
+                .await
+                .expect("XPENDING failed");
+            let pending_count = match &pending_summary {
+                Value::Array(items) => items.first().cloned(),
+                other => panic!("unexpected XPENDING reply: {other:?}"),
+            };
+            assert_eq!(pending_count, Some(Value::Int(0)));
+
+            let mut del = redis::cmd("DEL");
+            del.arg(&key);
+            let _ = observer.send_command(&mut del, None).await;
         });
     }
 }
