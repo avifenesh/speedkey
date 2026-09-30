@@ -1,241 +1,118 @@
+# Dependabot for speedkey (Node client + Rust core only; no java/python/go trees).
+# One weekly PR per ecosystem and directory: every update type is grouped, so a
+# Monday brings at most one PR per entry below instead of one PR per dependency.
+# Each PR still runs the Node matrix; npm-cd.yml skips dependabot PRs.
 version: 2
-
 updates:
-    # Enable version updates for npm (TypeScript/Node)
     - package-ecosystem: "npm"
       directory: "/"
       schedule:
           interval: "weekly"
           day: "monday"
           time: "09:00"
-      open-pull-requests-limit: 10
+      cooldown:
+          default-days: 7
+      open-pull-requests-limit: 2
       groups:
-          patch-updates:
-              update-types:
-                  - "patch"
-          minor-updates:
-              update-types:
-                  - "minor"
+          npm-root:
+              patterns:
+                  - "*"
       labels:
           - "dependencies"
           - "npm"
-
-    # Enable version updates for npm (Node client)
     - package-ecosystem: "npm"
       directory: "/node"
       schedule:
           interval: "weekly"
           day: "monday"
           time: "09:00"
-      open-pull-requests-limit: 10
+      cooldown:
+          default-days: 7
+      open-pull-requests-limit: 2
       groups:
-          patch-updates:
-              update-types:
-                  - "patch"
-          minor-updates:
-              update-types:
-                  - "minor"
+          npm-node:
+              patterns:
+                  - "*"
       labels:
           - "dependencies"
           - "npm"
-          - "node"
-
-    # Enable version updates for Gradle (Java)
-    - package-ecosystem: "gradle"
-      directory: "/java"
-      schedule:
-          interval: "weekly"
-          day: "monday"
-          time: "09:00"
-      open-pull-requests-limit: 10
-      groups:
-          patch-updates:
-              update-types:
-                  - "patch"
-          minor-updates:
-              update-types:
-                  - "minor"
-      labels:
-          - "dependencies"
-          - "gradle"
-          - "java"
-
-    # Enable version updates for Cargo (Rust - glide-core)
     - package-ecosystem: "cargo"
       directory: "/glide-core"
       schedule:
           interval: "weekly"
           day: "monday"
           time: "09:00"
-      open-pull-requests-limit: 10
+      cooldown:
+          default-days: 7
+      open-pull-requests-limit: 2
       groups:
-          patch-updates:
-              update-types:
-                  - "patch"
-          minor-updates:
-              update-types:
-                  - "minor"
+          cargo-glide-core:
+              patterns:
+                  - "*"
       labels:
           - "dependencies"
           - "cargo"
-          - "rust"
-
-    # Enable version updates for Cargo (glide-logger crate)
     - package-ecosystem: "cargo"
       directory: "/glide-logger"
       schedule:
           interval: "weekly"
           day: "monday"
           time: "09:00"
-      open-pull-requests-limit: 10
+      cooldown:
+          default-days: 7
+      open-pull-requests-limit: 2
       groups:
-          patch-updates:
-              update-types:
-                  - "patch"
-          minor-updates:
-              update-types:
-                  - "minor"
+          cargo-glide-logger:
+              patterns:
+                  - "*"
       labels:
           - "dependencies"
           - "cargo"
-          - "rust"
-
-    # Enable version updates for Cargo (glide-telemetry crate)
     - package-ecosystem: "cargo"
       directory: "/glide-telemetry"
       schedule:
           interval: "weekly"
           day: "monday"
           time: "09:00"
-      open-pull-requests-limit: 10
+      cooldown:
+          default-days: 7
+      open-pull-requests-limit: 2
       groups:
-          patch-updates:
-              update-types:
-                  - "patch"
-          minor-updates:
-              update-types:
-                  - "minor"
+          cargo-glide-telemetry:
+              patterns:
+                  - "*"
       labels:
           - "dependencies"
           - "cargo"
-          - "rust"
-
-    # Enable version updates for Cargo (node native client crate)
     - package-ecosystem: "cargo"
       directory: "/node/rust-client"
       schedule:
           interval: "weekly"
           day: "monday"
           time: "09:00"
-      open-pull-requests-limit: 10
+      cooldown:
+          default-days: 7
+      open-pull-requests-limit: 2
       groups:
-          patch-updates:
-              update-types:
-                  - "patch"
-          minor-updates:
-              update-types:
-                  - "minor"
+          cargo-node-rust-client:
+              patterns:
+                  - "*"
       labels:
           - "dependencies"
           - "cargo"
-          - "rust"
-
-    # Enable version updates for Cargo (Rust - Java wrapper)
-    - package-ecosystem: "cargo"
-      directory: "/java"
-      schedule:
-          interval: "weekly"
-          day: "monday"
-          time: "09:00"
-      open-pull-requests-limit: 10
-      groups:
-          patch-updates:
-              update-types:
-                  - "patch"
-          minor-updates:
-              update-types:
-                  - "minor"
-      labels:
-          - "dependencies"
-          - "cargo"
-          - "rust"
-          - "java"
-
-    # Enable version updates for Cargo (Rust - Python wrapper)
-    - package-ecosystem: "cargo"
-      directory: "/python"
-      schedule:
-          interval: "weekly"
-          day: "monday"
-          time: "09:00"
-      open-pull-requests-limit: 10
-      groups:
-          patch-updates:
-              update-types:
-                  - "patch"
-          minor-updates:
-              update-types:
-                  - "minor"
-      labels:
-          - "dependencies"
-          - "cargo"
-          - "rust"
-          - "python"
-
-    # Enable version updates for Go modules
-    - package-ecosystem: "gomod"
-      directory: "/go"
-      schedule:
-          interval: "weekly"
-          day: "monday"
-          time: "09:00"
-      open-pull-requests-limit: 10
-      groups:
-          patch-updates:
-              update-types:
-                  - "patch"
-          minor-updates:
-              update-types:
-                  - "minor"
-      labels:
-          - "dependencies"
-          - "go"
-
-    # Enable version updates for pip (Python)
-    - package-ecosystem: "pip"
-      directory: "/python"
-      schedule:
-          interval: "weekly"
-          day: "monday"
-          time: "09:00"
-      open-pull-requests-limit: 10
-      groups:
-          patch-updates:
-              update-types:
-                  - "patch"
-          minor-updates:
-              update-types:
-                  - "minor"
-      labels:
-          - "dependencies"
-          - "pip"
-          - "python"
-
-    # Enable version updates for GitHub Actions
     - package-ecosystem: "github-actions"
       directory: "/"
       schedule:
           interval: "weekly"
           day: "monday"
           time: "09:00"
-      open-pull-requests-limit: 5
+      cooldown:
+          default-days: 7
+      open-pull-requests-limit: 2
       groups:
-          patch-updates:
-              update-types:
-                  - "patch"
-          minor-updates:
-              update-types:
-                  - "minor"
+          github-actions-root:
+              patterns:
+                  - "*"
       labels:
           - "dependencies"
           - "github-actions"

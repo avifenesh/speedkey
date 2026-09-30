@@ -40,6 +40,10 @@ permissions:
 
 jobs:
     get-build-parameters:
+        # Every other job needs this one, so skipping it skips the whole run. Dependabot
+        # PRs bump Cargo.toml / package.json and would otherwise trigger the seven-target
+        # native build on every update, which starves the account's runner quota.
+        if: github.event_name != 'pull_request' || github.actor != 'dependabot[bot]'
         runs-on: ubuntu-latest
         outputs:
             release_version: ${{ steps.get-params.outputs.release_version }}
