@@ -452,7 +452,15 @@ jobs:
                     fi
                   done
 
-            # Step 2: Publish platform packages first
+            # Step 2: Publish platform packages first.
+            # Authentication is npm trusted publishing (GitHub Actions OIDC, `id-token: write`
+            # above), the same mechanism upstream valkey-glide uses. No NODE_AUTH_TOKEN: npm
+            # granular tokens expire after at most 90 days and the registry answers a dead
+            # token with E404 on PUT ("not found or you do not have permission"), which is how
+            # the v0.4.0 tag run failed. Each @glidemq package carries a trusted publisher for
+            # this repository and this workflow file.
+            # A platform that is already on npm at this version is skipped, so a re-run after a
+            # partial publish does not fail on E403 (cannot publish over existing version).
             - name: Publish platform packages
               if: ${{ needs.get-build-parameters.outputs.should_publish == 'true' }}
               shell: bash
@@ -460,14 +468,20 @@ jobs:
               env:
                   NPM_TAG: ${{ needs.get-build-parameters.outputs.npm_tag }}
                   NPM_CONFIG_PROVENANCE: true
-                  NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
               run: |
+                  set -euo pipefail
                   for dir in ./npm/*/; do
                     if [[ "$dir" != "./npm/glide/" ]]; then
                       platform=$(basename "$dir")
-                      echo "Publishing ${platform}..."
+                      pkg_name=$(jq -r .name "$dir/package.json")
+                      pkg_version=$(jq -r .version "$dir/package.json")
+                      if npm view "${pkg_name}@${pkg_version}" version >/dev/null 2>&1; then
+                        echo "${pkg_name}@${pkg_version} is already on npm, skipping"
+                        continue
+                      fi
+                      echo "Publishing ${pkg_name}@${pkg_version} (${platform})..."
                       cd "$dir"
-                      npm publish --tag ${NPM_TAG} --access public --provenance || echo "Warning: Failed to publish ${platform}"
+                      npm publish --tag ${NPM_TAG} --access public --provenance
                       cd ../..
                     fi
                   done
@@ -503,7 +517,6 @@ jobs:
               env:
                   NPM_TAG: ${{ needs.get-build-parameters.outputs.npm_tag }}
                   NPM_CONFIG_PROVENANCE: true
-                  NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
               run: |
                   package_name=$(cat package.json | jq -r .name)
                   version=$(cat package.json | jq -r .version)
