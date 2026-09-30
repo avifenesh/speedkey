@@ -532,6 +532,49 @@ jobs:
                   fi
                   echo "All packages published successfully"
 
+            # Step 5: npm processes a publish asynchronously ("may take a few minutes
+            # to become available"). The RC tests install from the registry, so wait
+            # until every platform package and the dist-tag resolve to this version.
+            - name: Wait for the registry to serve every package
+              if: ${{ needs.get-build-parameters.outputs.should_publish == 'true' }}
+              shell: bash
+              working-directory: ./node
+              env:
+                  VERSION: ${{ needs.get-build-parameters.outputs.release_version }}
+                  NPM_TAG: ${{ needs.get-build-parameters.outputs.npm_tag }}
+              run: |
+                  set -uo pipefail
+                  pending=()
+                  for dir in ./npm/*/; do
+                    pending+=("$(jq -r .name "$dir/package.json")")
+                  done
+                  deadline=$((SECONDS + 900))
+                  while (( ${#pending[@]} > 0 )); do
+                    still=()
+                    for pkg in "${pending[@]}"; do
+                      if [[ "$(npm view "${pkg}@${VERSION}" version 2>/dev/null)" == "$VERSION" ]]; then
+                        echo "${pkg}@${VERSION} is available"
+                      else
+                        still+=("$pkg")
+                      fi
+                    done
+                    pending=("${still[@]+"${still[@]}"}")
+                    (( ${#pending[@]} == 0 )) && break
+                    if (( SECONDS >= deadline )); then
+                      echo "::error::Not served by the registry after 15 minutes: ${pending[*]}"; exit 1
+                    fi
+                    echo "Waiting for: ${pending[*]}"
+                    sleep 15
+                  done
+                  until [[ "$(npm view "@glidemq/speedkey@${NPM_TAG}" version 2>/dev/null)" == "$VERSION" ]]; do
+                    if (( SECONDS >= deadline )); then
+                      echo "::error::dist-tag ${NPM_TAG} does not resolve to ${VERSION} after 15 minutes"; exit 1
+                    fi
+                    echo "Waiting for dist-tag ${NPM_TAG} -> ${VERSION}"
+                    sleep 15
+                  done
+                  echo "Registry serves every package at ${VERSION}"
+
               # Delete artifacts if not published
             - name: Delete artifacts
               if: always() && ${{ needs.get-build-parameters.outputs.should_publish == 'false' }}
@@ -666,8 +709,11 @@ jobs:
                   registry-url: "https://registry.npmjs.org"
 
             - name: Deprecate Published Packages
+              env:
+                  NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
               run: |
                   echo "Deprecating packages due to failure…"
+                  FAILED_FILE="$(mktemp)"
                   VERSION="${{ needs.get-build-parameters.outputs.release_version }}"
                   DEPRECATION_MESSAGE="This version (${VERSION}) was part of a failed release process and should not be used. It may be removed in the future."
 
@@ -693,7 +739,7 @@ jobs:
                   }
 
                   # Main package
-                  attempt_deprecate "@glidemq/speedkey@${VERSION}" "${DEPRECATION_MESSAGE}"
+                  attempt_deprecate "@glidemq/speedkey@${VERSION}" "${DEPRECATION_MESSAGE}" || echo "@glidemq/speedkey@${VERSION}" >> "$FAILED_FILE"
 
                   # Platform packages
                   MATRIX_JSON='${{ needs.get-build-parameters.outputs.platform_matrix }}'
@@ -727,9 +773,12 @@ jobs:
                       fi
                       
                       package_name="@glidemq/speedkey-${os}-${arch}${additional_suffix}"
-                      attempt_deprecate "${package_name}@${VERSION}" "${DEPRECATION_MESSAGE}"
+                      attempt_deprecate "${package_name}@${VERSION}" "${DEPRECATION_MESSAGE}" || echo "${package_name}@${VERSION}" >> "$FAILED_FILE"
                     else
                       echo "Warning: Incomplete data in matrix object, cannot form package name. Object: $target_json_line"
                     fi
                   done
                   echo "Finished deprecation attempts for platform packages."
+                  if [[ -s "$FAILED_FILE" ]]; then
+                    echo "::error::Could not deprecate: $(tr '\n' ' ' < "$FAILED_FILE")"; exit 1
+                  fi
