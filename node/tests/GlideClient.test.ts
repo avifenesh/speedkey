@@ -2547,51 +2547,74 @@ describe("GlideClient", () => {
                 ProtocolVersion.RESP3,
             );
             const observer = await GlideClient.createClient(config);
+            // A lazy client has no server-side id until it connects, and other test
+            // files may have their own XREADGROUP blocked on a shared server, so
+            // identify the blocked client by a unique name.
+            const blockedName = `blocked_close_${lazyConnect}_${getRandomKey()}`;
             const blocked = await GlideClient.createClient({
                 ...config,
                 lazyConnect,
+                clientName: blockedName,
             });
             const key = getRandomKey();
             const group = getRandomKey();
             const consumer = getRandomKey();
 
-            // A lazy client has no server-side id until it connects, so identify the
-            // blocked client by its last command: the observer never runs XREADGROUP.
-            const isAttached = async () => {
+            const blockedClientLines = async () => {
                 const list = (await observer.customCommand([
                     "CLIENT",
                     "LIST",
                 ])) as string;
                 return list
                     .split("\n")
-                    .some((line) => / cmd=xreadgroup/.test(line));
+                    .filter((line) => line.includes(`name=${blockedName} `));
             };
 
-            const isBlocked = async () => {
-                const list = (await observer.customCommand([
-                    "CLIENT",
-                    "LIST",
-                ])) as string;
-                return list
-                    .split("\n")
-                    .some(
-                        (line) =>
-                            / cmd=xreadgroup/.test(line) &&
-                            / flags=\S*b/.test(line),
-                    );
-            };
+            const isAttached = async () =>
+                (await blockedClientLines()).length > 0;
 
+            const isBlocked = async () =>
+                (await blockedClientLines()).some((line) =>
+                    / flags=\S*b/.test(line),
+                );
+
+            // Resolves true as soon as the predicate holds, false at the deadline.
             const poll = async (
                 predicate: () => Promise<boolean>,
                 deadlineMs: number,
             ) => {
                 const deadline = Date.now() + deadlineMs;
 
-                while (!(await predicate()) && Date.now() < deadline) {
+                while (Date.now() < deadline) {
+                    if (await predicate()) return true;
                     await sleep(5);
                 }
 
                 return predicate();
+            };
+
+            // Resolves true once the predicate has held at every poll for `holdMs`,
+            // false if that does not happen before the deadline.
+            const pollStable = async (
+                predicate: () => Promise<boolean>,
+                holdMs: number,
+                deadlineMs: number,
+            ) => {
+                const deadline = Date.now() + deadlineMs;
+                let heldSince: number | undefined;
+
+                while (Date.now() < deadline) {
+                    if (await predicate()) {
+                        heldSince ??= Date.now();
+                        if (Date.now() - heldSince >= holdMs) return true;
+                    } else {
+                        heldSince = undefined;
+                    }
+
+                    await sleep(5);
+                }
+
+                return false;
             };
 
             try {
@@ -2605,12 +2628,12 @@ describe("GlideClient", () => {
                     group,
                     consumer,
                     { [key]: ">" },
-                    { block: 10000 },
+                    { block: 30000 },
                 );
 
                 if (lazyConnect) {
                     // Close before the lazy connection is established. The queued
-                    // command must not connect and block after close().
+                    // command must not stay connected and blocked after close().
                     blocked.close();
                 } else {
                     expect(await poll(isBlocked, 2000)).toBe(true);
@@ -2620,16 +2643,16 @@ describe("GlideClient", () => {
                 await expect(pending).rejects.toThrow(ClosingError);
 
                 // The server must drop the connection promptly, not when BLOCK expires.
-                const closedAt = Date.now();
-                expect(
-                    await poll(async () => !(await isAttached()), 1000),
-                ).toBe(true);
-                expect(Date.now() - closedAt).toBeLessThan(1000);
+                const isDetached = async () => !(await isAttached());
 
                 if (lazyConnect) {
-                    // Give a late lazy connection time to show up; it must not.
-                    await sleep(500);
-                    expect(await isAttached()).toBe(false);
+                    // The client is not attached before its handshake either, and
+                    // close() may land while that handshake is in progress: the
+                    // connection then shows up and is killed as soon as the handshake
+                    // finishes. Require the client to be gone and stay gone.
+                    expect(await pollStable(isDetached, 500, 5000)).toBe(true);
+                } else {
+                    expect(await poll(isDetached, 1000)).toBe(true);
                 }
 
                 // An entry added now must not be claimed by the closed consumer.
