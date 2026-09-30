@@ -457,12 +457,10 @@ jobs:
                   done
 
             # Step 2: Publish platform packages first.
-            # Authentication is npm trusted publishing (GitHub Actions OIDC, `id-token: write`
-            # above), the same mechanism upstream valkey-glide uses. No NODE_AUTH_TOKEN: npm
-            # granular tokens expire after at most 90 days and the registry answers a dead
-            # token with E404 on PUT ("not found or you do not have permission"), which is how
-            # the v0.4.0 tag run failed. Each @glidemq package carries a trusted publisher for
-            # this repository and this workflow file.
+            # Authentication: the NPM_TOKEN repository secret (NODE_AUTH_TOKEN), published with
+            # provenance (`id-token: write` above). The previous token expired (npm granular
+            # tokens live at most 90 days) and the registry answered every PUT with E404, which
+            # is how the first v0.4.0 run failed; rotate the secret before it expires.
             # A platform that is already on npm at this version is skipped, so a re-run after a
             # partial publish does not fail on E403 (cannot publish over existing version).
             - name: Publish platform packages
@@ -470,6 +468,7 @@ jobs:
               shell: bash
               working-directory: ./node
               env:
+                  NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
                   NPM_TAG: ${{ needs.get-build-parameters.outputs.npm_tag }}
                   NPM_CONFIG_PROVENANCE: true
               run: |
@@ -519,6 +518,7 @@ jobs:
               shell: bash
               working-directory: ./node/npm/glide
               env:
+                  NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
                   NPM_TAG: ${{ needs.get-build-parameters.outputs.npm_tag }}
                   NPM_CONFIG_PROVENANCE: true
               run: |
