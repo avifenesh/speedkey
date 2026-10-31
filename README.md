@@ -22,7 +22,7 @@ docker run -d -p 6379:6379 valkey/valkey-bundle
 
 ## Module Support
 
-### Search (GlideFt) - 5 commands
+### Search (GlideFt) - 7 commands
 
 | Command | Method | Description |
 |---------|--------|-------------|
@@ -31,16 +31,18 @@ docker run -d -p 6379:6379 valkey/valkey-bundle
 | `FT.DROPINDEX` | `GlideFt.dropindex()` | Delete an index |
 | `FT.INFO` | `GlideFt.info()` | Get index metadata |
 | `FT._LIST` | `GlideFt.list()` | List all indexes |
+| `FT.AGGREGATE` | `GlideFt.aggregate()` | Run an aggregation pipeline (LOAD, FILTER, GROUPBY, SORTBY, APPLY, LIMIT) |
+| `FT.PROFILE` | `GlideFt.profileSearch()`, `GlideFt.profileAggregate()` | Profile a search or aggregate query |
 
 **Search 1.1/1.2 options supported:**
 
 FT.CREATE: `score`, `language`, `skipInitialScan`, `minStemSize`, `withOffsets`/`noOffsets`, `noStopWords`/`stopWords`, `punctuation`. Fields: `sortable`, `nostem`, `weight`, `withsuffixtrie`/`nosuffixtrie`.
 
-FT.SEARCH: `nocontent`, `dialect`, `verbatim`, `inorder`, `slop`, `sortby`, `scorer`.
+FT.SEARCH: `nocontent`, `dialect`, `verbatim`, `inorder`, `slop`, `sortby`, `withsortkeys`, `shardScope`, `consistency`.
 
-**Not available in valkey-search:** FT.AGGREGATE, FT.EXPLAIN, FT.EXPLAINCLI, FT.PROFILE, FT.ALIASADD, FT.ALIASDEL, FT.ALIASUPDATE, FT._ALIASLIST. These are Redis Search (redis-stack) only.
+**Not available in valkey-search:** FT.EXPLAIN, FT.EXPLAINCLI, FT.ALIASADD, FT.ALIASDEL, FT.ALIASUPDATE, FT._ALIASLIST. `GlideFt` exports methods for them, but valkey-search does not implement these commands yet.
 
-### JSON (GlideJson) - 22 commands
+### JSON (GlideJson) - 23 commands
 
 Full JSON document manipulation: `SET`, `GET`, `MGET`, `MSET`, `DEL`, `FORGET`, `TYPE`, `CLEAR`, `TOGGLE`, `STRLEN`, `STRAPPEND`, `ARRAPPEND`, `ARRINSERT`, `ARRLEN`, `ARRPOP`, `ARRTRIM`, `ARRINDEX`, `NUMINCRBY`, `NUMMULTBY`, `OBJLEN`, `OBJKEYS`, `RESP`, `DEBUG`.
 
@@ -56,7 +58,7 @@ Full JSON document manipulation: `SET`, `GET`, `MGET`, `MSET`, `DEL`, `FORGET`, 
 | `BF.INFO` | `GlideBf.info()` | Get filter metadata |
 | `BF.INSERT` | `GlideBf.insert()` | Add items with auto-create options |
 | `BF.CARD` | `GlideBf.card()` | Get item count |
-| `BF.LOAD` | `GlideBf.load()` | Restore a serialized filter |
+| `BF.LOADCHUNK` | `GlideBf.load()` | Restore a serialized filter |
 
 ## Usage
 

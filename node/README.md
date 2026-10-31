@@ -6,8 +6,8 @@ Interim package - will be replaced by the official valkey-glide Node.js client o
 
 ## Modules
 
-- **Search** (GlideFt): 5 commands - CREATE, DROPINDEX, _LIST, INFO, SEARCH
-- **JSON** (GlideJson): 22 commands - full JSON manipulation
+- **Search** (GlideFt): 7 commands - CREATE, DROPINDEX, _LIST, INFO, SEARCH, AGGREGATE, PROFILE
+- **JSON** (GlideJson): 23 commands - full JSON manipulation
 - **Bloom Filter** (GlideBf): 9 commands - RESERVE, ADD, MADD, EXISTS, MEXISTS, INFO, INSERT, CARD, LOADCHUNK
 
 See [github.com/avifenesh/speedkey](https://github.com/avifenesh/speedkey) for full documentation.
