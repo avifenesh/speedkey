@@ -6,7 +6,7 @@ Interim package - will be replaced by the official valkey-glide Node.js client o
 
 ## Modules
 
-- **Search** (GlideFt): 7 commands - CREATE, DROPINDEX, _LIST, INFO, SEARCH, AGGREGATE, PROFILE
+- **Search** (GlideFt): 6 commands - CREATE, DROPINDEX, _LIST, INFO, SEARCH, AGGREGATE
 - **JSON** (GlideJson): 23 commands - full JSON manipulation
 - **Bloom Filter** (GlideBf): 9 commands - RESERVE, ADD, MADD, EXISTS, MEXISTS, INFO, INSERT, CARD, LOADCHUNK
 

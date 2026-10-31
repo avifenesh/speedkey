@@ -22,7 +22,7 @@ docker run -d -p 6379:6379 valkey/valkey-bundle
 
 ## Module Support
 
-### Search (GlideFt) - 7 commands
+### Search (GlideFt) - 6 commands
 
 | Command | Method | Description |
 |---------|--------|-------------|
@@ -32,7 +32,6 @@ docker run -d -p 6379:6379 valkey/valkey-bundle
 | `FT.INFO` | `GlideFt.info()` | Get index metadata |
 | `FT._LIST` | `GlideFt.list()` | List all indexes |
 | `FT.AGGREGATE` | `GlideFt.aggregate()` | Run an aggregation pipeline (LOAD, FILTER, GROUPBY, SORTBY, APPLY, LIMIT) |
-| `FT.PROFILE` | `GlideFt.profileSearch()`, `GlideFt.profileAggregate()` | Profile a search or aggregate query |
 
 **Search 1.1/1.2 options supported:**
 
@@ -40,7 +39,7 @@ FT.CREATE: `score`, `language`, `skipInitialScan`, `minStemSize`, `withOffsets`/
 
 FT.SEARCH: `nocontent`, `dialect`, `verbatim`, `inorder`, `slop`, `sortby`, `withsortkeys`, `shardScope`, `consistency`.
 
-**Not available in valkey-search:** FT.EXPLAIN, FT.EXPLAINCLI, FT.ALIASADD, FT.ALIASDEL, FT.ALIASUPDATE, FT._ALIASLIST. `GlideFt` exports methods for them, but valkey-search does not implement these commands yet.
+**Not available in valkey-search:** FT.EXPLAIN, FT.EXPLAINCLI, FT.PROFILE, FT.ALIASADD, FT.ALIASDEL, FT.ALIASUPDATE, FT._ALIASLIST. `GlideFt` exports methods for them, but valkey-search does not implement these commands yet.
 
 ### JSON (GlideJson) - 23 commands
 
