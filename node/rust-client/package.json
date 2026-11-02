@@ -16,7 +16,7 @@
     "devDependencies": {
         "@napi-rs/cli": "^3.5.1",
         "prettier": "3",
-        "shx": "0.3"
+        "shx": "0.4"
     },
     "overrides": {
         "js-yaml@<4.3.2": "^4.3.2"
