@@ -2375,9 +2375,9 @@ dependencies = [
 
 [[package]]
 name = "rustls"
-version = "0.23.45"
+version = "0.23.46"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0d41d731c7d2f962d1ccc364cec258de3c0e93b38c2fb3ba97ac74513048d634"
+checksum = "48e13bd8c0e9365c43cfa5c9e8f9ad49d3c8444926c9aac819e0e4dc503c8fdf"
 dependencies = [
  "aws-lc-rs",
  "log",
@@ -2640,6 +2640,32 @@ checksum = "3a766e1110788c36f4fa1c2b71b387a7815aa65f88ce0229841826633d93723e"
 dependencies = [
  "libc",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "speedkey"
+version = "0.1.0"
+dependencies = [
+ "byteorder",
+ "bytes",
+ "dashmap",
+ "glide-core",
+ "glide-core-engine",
+ "glide-logger",
+ "glide-telemetry",
+ "napi",
+ "napi-build",
+ "napi-derive",
+ "num-bigint",
+ "num-traits",
+ "num_cpus",
+ "parking_lot",
+ "protobuf",
+ "tikv-jemallocator",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "uuid",
 ]
 
 [[package]]
@@ -3160,32 +3186,6 @@ dependencies = [
  "js-sys",
  "rand 0.10.1",
  "wasm-bindgen",
-]
-
-[[package]]
-name = "speedkey"
-version = "0.1.0"
-dependencies = [
- "byteorder",
- "bytes",
- "dashmap",
- "glide-core",
- "glide-core-engine",
- "glide-logger",
- "glide-telemetry",
- "napi",
- "napi-build",
- "napi-derive",
- "num-bigint",
- "num-traits",
- "num_cpus",
- "parking_lot",
- "protobuf",
- "tikv-jemallocator",
- "tokio",
- "tokio-util",
- "tracing",
- "uuid",
 ]
 
 [[package]]
