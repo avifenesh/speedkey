@@ -9,7 +9,7 @@
         "sourceMap": true,
         "inlineSourceMap": false,
         "esModuleInterop": true,
-        "moduleResolution": "node",
+        "moduleResolution": "bundler",
         "allowSyntheticDefaultImports": true,
         "allowJs": true,
         "resolveJsonModule": true,
