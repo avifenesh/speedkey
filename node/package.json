@@ -121,7 +121,7 @@
     "overrides": {
         "minimatch@>=7.0.0 <11.0.1": "11.0.1",
         "typedoc": {
-            "minimatch": "10.2.5"
+            "minimatch": "11.0.1"
         },
         "replace": {
             "minimatch": "3.1.5"

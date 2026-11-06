@@ -1,4 +1,7 @@
 #!/bin/bash -e
+# typedoc 0.28.x is incompatible with minimatch >= 11 (GHSA-g3hv-75wg-m249
+# override in package.json): apply the compatibility patch first. Idempotent.
+node ./scripts/apply-typedoc-minimatch11-patch.mjs
 typedoc src/BaseClient.ts                   \
         src/Batch.ts                  \
         src/GlideClient.ts                  \
