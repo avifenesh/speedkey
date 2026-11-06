@@ -36,6 +36,11 @@ wildcards = "allow"
 
 [advisories]
 yanked = "warn"
+ignore = [
+  # pin-utils is unmaintained (RUSTSEC-2026-0441). Transitive via futures-util;
+  # informational advisory, no vulnerability, no maintained replacement.
+  "RUSTSEC-2026-0441",
+]
 
 [sources]
 unknown-registry = "deny"
